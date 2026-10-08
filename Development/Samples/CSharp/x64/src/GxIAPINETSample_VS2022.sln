@@ -1,0 +1,61 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.9.34728.123
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxSimpleGrab_VS2022", "GxSimpleGrab\GxSimpleGrab_VS2022.csproj", "{D507F7FF-7E83-4A76-B7E4-A9587C24A286}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxUpdateDeviceGetImage_VS2022", "GxUpdateDeviceGetImage\GxUpdateDeviceGetImage_VS2022.csproj", "{1FCC53D7-D1C5-4250-9017-933DF7F429F3}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxActionCommand_VS2022", "GxActionCommand\GxActionCommand_VS2022.csproj", "{33CBCA57-615A-4CE8-A87A-8374859D0AD2}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxAutoReconnect_VS2022", "GxAutoReconnect\GxAutoReconnect_VS2022.csproj", "{9A19103F-16F7-4668-BE54-9A1E7A4F7556}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxFlatFieldCorrection_VS2022", "GxFlatFieldCorrection\GxFlatFieldCorrection_VS2022.csproj", "{36F6CCF4-9A4F-49F9-A772-FAFB4A70CB00}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxChunkData_VS2022", "GxChunkData\GxChunkData_VS2022.csproj", "{4736145C-2CFE-499A-A7CC-9915F03EA230}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GxDecompression_VS2022", "GxDecompression\GxDecompression_VS2022.csproj", "{46CC7DA6-5AC6-4A49-AFFD-D32A46DCDA31}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D507F7FF-7E83-4A76-B7E4-A9587C24A286}.Debug|x64.ActiveCfg = Debug|x64
+		{D507F7FF-7E83-4A76-B7E4-A9587C24A286}.Debug|x64.Build.0 = Debug|x64
+		{D507F7FF-7E83-4A76-B7E4-A9587C24A286}.Release|x64.ActiveCfg = Release|x64
+		{D507F7FF-7E83-4A76-B7E4-A9587C24A286}.Release|x64.Build.0 = Release|x64
+		{1FCC53D7-D1C5-4250-9017-933DF7F429F3}.Debug|x64.ActiveCfg = Debug|x64
+		{1FCC53D7-D1C5-4250-9017-933DF7F429F3}.Debug|x64.Build.0 = Debug|x64
+		{1FCC53D7-D1C5-4250-9017-933DF7F429F3}.Release|x64.ActiveCfg = Release|x64
+		{1FCC53D7-D1C5-4250-9017-933DF7F429F3}.Release|x64.Build.0 = Release|x64
+		{33CBCA57-615A-4CE8-A87A-8374859D0AD2}.Debug|x64.ActiveCfg = Debug|x64
+		{33CBCA57-615A-4CE8-A87A-8374859D0AD2}.Debug|x64.Build.0 = Debug|x64
+		{33CBCA57-615A-4CE8-A87A-8374859D0AD2}.Release|x64.ActiveCfg = Release|x64
+		{33CBCA57-615A-4CE8-A87A-8374859D0AD2}.Release|x64.Build.0 = Release|x64
+		{9A19103F-16F7-4668-BE54-9A1E7A4F7556}.Debug|x64.ActiveCfg = Debug|x64
+		{9A19103F-16F7-4668-BE54-9A1E7A4F7556}.Debug|x64.Build.0 = Debug|x64
+		{9A19103F-16F7-4668-BE54-9A1E7A4F7556}.Release|x64.ActiveCfg = Release|x64
+		{9A19103F-16F7-4668-BE54-9A1E7A4F7556}.Release|x64.Build.0 = Release|x64
+		{36F6CCF4-9A4F-49F9-A772-FAFB4A70CB00}.Debug|x64.ActiveCfg = Debug|x64
+		{36F6CCF4-9A4F-49F9-A772-FAFB4A70CB00}.Debug|x64.Build.0 = Debug|x64
+		{36F6CCF4-9A4F-49F9-A772-FAFB4A70CB00}.Release|x64.ActiveCfg = Release|x64
+		{36F6CCF4-9A4F-49F9-A772-FAFB4A70CB00}.Release|x64.Build.0 = Release|x64
+		{4736145C-2CFE-499A-A7CC-9915F03EA230}.Debug|x64.ActiveCfg = Debug|x64
+		{4736145C-2CFE-499A-A7CC-9915F03EA230}.Debug|x64.Build.0 = Debug|x64
+		{4736145C-2CFE-499A-A7CC-9915F03EA230}.Release|x64.ActiveCfg = Release|x64
+		{4736145C-2CFE-499A-A7CC-9915F03EA230}.Release|x64.Build.0 = Release|x64
+		{46CC7DA6-5AC6-4A49-AFFD-D32A46DCDA31}.Debug|x64.ActiveCfg = Debug|x64
+		{46CC7DA6-5AC6-4A49-AFFD-D32A46DCDA31}.Debug|x64.Build.0 = Debug|x64
+		{46CC7DA6-5AC6-4A49-AFFD-D32A46DCDA31}.Release|x64.ActiveCfg = Release|x64
+		{46CC7DA6-5AC6-4A49-AFFD-D32A46DCDA31}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {73E598BD-963B-494A-A324-EA9537B97844}
+	EndGlobalSection
+EndGlobal
