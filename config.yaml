@@ -1,0 +1,439 @@
+# ==================================================================
+# 集中配置文件
+# ------------------------------------------------------------------
+# 标有 [热更新] 的参数：改完保存即可，约 2 秒自动生效，无需重启服务。
+# 未标注的参数：需要重启服务才生效（它们决定线程池、模型、端口等
+# 对象如何创建，热改只会造成"看着改了、其实没生效"的错觉）。
+#
+# 改完可在日志里搜索 "[配置热更新]" 确认是否已应用。
+# 详见 docs/配置生效说明.md
+# ==================================================================
+
+# ------------------------------------------------------------------
+# 配置热更新
+# ------------------------------------------------------------------
+config_reload:
+  enabled: true              # 关掉则所有参数都回到"必须重启"的行为
+  check_interval: 2.0        # 检查文件变更的最小间隔（秒）
+  log_changes: true          # 变更时把 "旧值 -> 新值" 打进日志
+  # 后台监听线程：主动轮询配置文件。
+  # 关掉它会退化为"拉取式" —— 只有代码读到某个配置项时才检查，
+  # 于是没有疵点检出时改了配置既不生效、日志也没有任何提示。
+  watch_in_background: true
+
+# ------------------------------------------------------------------
+# 路径配置
+# ------------------------------------------------------------------
+paths:
+  detection_base_path: "D:\\yolo_detection_results"
+  detection_save_path: "D:\\yolo_detection_results"
+  machine_stop_path: "D:\\yolo_detection_results"
+
+# ------------------------------------------------------------------
+# 上传配置
+# ------------------------------------------------------------------
+upload:
+  api_host: "localhost"
+  api_port: 8890
+  api_base_path: "/api"   # 后端 API 前缀；全系统上报地址均由此三项拼出
+  normal_upload_workers: 3
+  normal_upload_queue_size: 256
+  normal_upload_timeout: 10
+  stop_upload_timeout: 3
+  max_retry: 5
+  retry_interval: 1.0
+
+# ------------------------------------------------------------------
+# PLC / 编码器触发（Modbus）
+# ------------------------------------------------------------------
+plc:
+  host: "192.168.123.70"
+  port: 502
+  wheel_diameter: 60.0          # 胶轮直径 mm
+  encoder_ppr: 2000             # 编码器分辨率 P/R
+  scaling_factor: 0.78651
+  trigger_distance_mm: 102      # 触发间距（会再乘以 scaling_factor）
+  read_interval_ms: 100
+  speed_threshold_ratio: 0.0
+  # 织机停机预览：速度低于阈值并持续确认时长后，转为软触发低频出图供前端查看
+  idle_speed_threshold: 0.5     # m/min
+  idle_confirm_duration: 3.0    # s
+  preview_interval: 1.0         # s，预览期间软触发间隔
+  fabric_upload_interval: 5.0   # s，布料尺寸上报(/v1/defect/log/size)节流间隔
+
+# ------------------------------------------------------------------
+# WebSocket 预览服务
+# ------------------------------------------------------------------
+websocket:
+  host: "0.0.0.0"
+  port: 8765
+  # 预览画质：只给人眼看，不必用采集分辨率与帧率。
+  # 编码在独立线程完成，绝不占用相机回调线程；调高会增加 CPU 占用。
+  preview_max_fps: 4.0      # 每台相机的预览推送上限
+  preview_max_width: 960    # 超过则等比缩放后再编码（2440->960 约省 85% 编码耗时）
+  jpeg_quality: 70
+
+# ------------------------------------------------------------------
+# 日志
+# ------------------------------------------------------------------
+logging:
+  file: "logs/app.log"
+  level: "DEBUG"
+  max_bytes: 5242880            # 5MB
+  backup_count: 3
+  # 卡死诊断：N 秒后把各线程栈转储到 logs/crash.log；<=0 表示关闭
+  faulthandler_dump_after: 0
+
+# ------------------------------------------------------------------
+# 尺寸转换常量
+# ------------------------------------------------------------------
+size_conversion:
+  real_width_cm: 23
+  image_width_px: 2440
+
+# ------------------------------------------------------------------
+# 分析模式
+# ------------------------------------------------------------------
+analysis:
+  stop_analysis_mode: "coarse"
+  valid_modes: ["coarse", "dinomaly", "none"]
+
+# ------------------------------------------------------------------
+# 粗粒度缺陷分析配置
+# ------------------------------------------------------------------
+coarse_detect:
+  blur_kernel_size: 9
+  blur_sigma: 2.5
+  bright_percentile: 85
+  dark_percentile: 15
+  morph_kernel_size: 11
+  close_iterations: 2
+  open_iterations: 1
+  min_area_pixels: 20
+
+class_detect:
+  经线毛球:
+    detect_dark: true
+    percentile: 15
+    min_area: 20
+  纬线杂质:
+    detect_dark: true
+    percentile: 15
+    min_area: 20
+  飘絮:
+    detect_dark: false
+    percentile: 90
+    min_area: 0.5
+  棉团:
+    detect_dark: false
+    percentile: 90
+    min_area: 0.5
+
+default_detect:
+  detect_dark: false
+  percentile: 85
+  min_area: 20
+
+# ------------------------------------------------------------------
+# 停机规则  [热更新]
+# 各类别的 min_confidence / min_area_mm2 / min_width_mm / min_height_mm
+# 以及 enabled、trigger_relay、save_to_folder 均可在线调整。
+# ------------------------------------------------------------------
+machine_stop_rules:
+  enabled: true
+  save_to_folder: true
+  trigger_relay: true
+  default_rule: null
+  rules:
+    飘絮:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 130
+    棉团:
+      enabled: true
+      min_confidence: 0.75
+      min_area_mm2: 69
+    纬线杂质:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 62
+    经线毛球:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 60
+    单根包不进:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_height_mm: 47.0
+    包边不良:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.90
+      min_width_mm: 10.0
+      min_height_mm: 10.0
+    捻接器接头:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    多股线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.70
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    油点线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 70.0
+      min_height_mm: 70.0
+    小尾巴:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 20.0
+      min_height_mm: 20.0
+    纬线不直:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    包边不重叠:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.56
+      min_width_mm: 50.0
+      min_height_mm: 50.0
+    短废纱线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.50
+      min_width_mm: 50.0
+      min_height_mm: 50.0
+    蚊虫小黑点:
+      enabled: false
+    稀缝:
+      enabled: false
+
+# ------------------------------------------------------------------
+# 热力图 / 掩膜配置
+# ------------------------------------------------------------------
+heatmap:
+  enabled: true
+  save_overlay: true
+  colormap: "jet"
+  overlay_alpha: 0.5
+  save_mask_overlay: true
+  mask_color: [0, 0, 255]
+  save_pure_heatmap: false
+
+# ------------------------------------------------------------------
+# 类别尺寸过滤（不纳入检测）  [热更新]
+# ------------------------------------------------------------------
+class_size_filter:
+  包边不重叠: {min_width: 170, min_height: 100}
+  小尾巴:     {min_width: 170}
+  单根包不进: {min_width: 100, min_height: 100}
+  纬线杂质:   {min_width: 70, min_height: 70}
+  油点线:     {min_height: 150}
+  飘絮: {min_width: 85, min_height: 85}
+
+# ------------------------------------------------------------------
+# 类别边缘距离过滤（洪泛切除区距离阈值，单位：像素）  [热更新]
+# ------------------------------------------------------------------
+class_edge_filter:
+  飘絮:       {max_distance_to_fabric: 150}
+  棉团:       {max_distance_to_fabric: 150}
+  单根包不进: {max_distance_to_fabric: 200}
+  短废纱线:   {max_distance_to_fabric: 200}
+  蚊虫小黑点: {max_distance_to_fabric: 150}
+
+
+# ------------------------------------------------------------------
+# 竖线误检过滤
+# [热更新] max_x_deviation / min_accumulate_count / time_window / target_*
+# [需重启] enabled —— 它决定过滤器对象是否被创建
+# ------------------------------------------------------------------
+vertical_line_filter:
+  enabled: false
+  target_cameras: ["camera1", "camera8"]
+  target_classes: ["纬线杂质", "飘絮"]
+  max_x_deviation: 50.0
+  min_accumulate_count: 3
+  time_window: 20.0
+
+# ------------------------------------------------------------------
+# YOLO 检测配置
+# ------------------------------------------------------------------
+yolo:
+  model_path: "./Modelfile/yolo_20260608.engine"
+  # 多模型切换：按布料是否含边缘选用不同模型；留空(null)则始终使用上面的 model_path
+  with_edge_model_path: null
+  without_edge_model_path: null
+  confidence: 0.1
+  image_size: 1280
+  iou_threshold: 0.5
+  patch_size: 640
+  num_workers: 5
+  # 采集队列长度。这是"缓冲"不是"性能"：队列越长，过载时端到端延迟越大。
+  # 派发线程会按相机去重只保留最新帧，因此不需要很长的队列。
+  queue_size: 32
+  dinomaly_use_fp16: true
+  use_cuda_stream: true
+  cuda_benchmark: true
+  pth_checkpoint: "./Modelfile/YoloDinomaly/best_acc.pth"
+  pth_device: "cuda:0"
+  pth_model_source_dir: "./Modelfile/YoloDinomaly"
+  mask_threshold: 0.7
+  # ★ 在途帧上限 —— 端到端延迟的决定性参数。
+  # 延迟 ≈ max_inflight_frames / 实际吞吐(帧/秒)。
+  # 原值 128：若吞吐为 20 帧/s，排队延迟就高达 6 秒，而且 128 帧 x 15MB
+  # 会占用近 2GB 内存。它的本意是内存保护，却被当成了性能参数。
+  # 实时场景应取 2~3 倍 num_workers：够填满流水线，又不至于堆积。
+  max_inflight_frames: 12
+  memory_high_watermark: 90
+  memory_critical_watermark: 95
+  post_workers: 6
+  upload_timeout: 10
+
+# ------------------------------------------------------------------
+# 并发与采样
+# ------------------------------------------------------------------
+# 说明：全局线程池的规模集中在这里，便于按现场 CPU/GPU 情况整体调参。
+# 叠加 yolo.num_workers 与 yolo.post_workers 后即为进程内工作线程总量，
+# 设置过大反而会加剧 GIL 争用与 GPU 显存竞争。
+concurrency:
+  warp_sample_interval: 2     # 每 N 帧提交一次经线分析（增大可降低 GPU 争用）
+  weft_sample_interval: 2     # 每 N 帧提交一次纬线分析
+  warp_workers: 2             # 经线分析线程数
+  weft_workers: 2             # 纬线分析线程数
+  save_workers: 2             # 经纬停机图落盘线程数
+  async_save_workers: 4       # 检测结果保存+上传线程数
+  infer_pool_workers: 2       # 管理器侧推理提交池
+  io_pool_workers: 4          # 管理器侧后处理 I/O 池
+  aux_io_workers: 2           # 主程序调试存图/推帧池
+
+# ------------------------------------------------------------------
+# 类别置信度阈值  [热更新]
+# ------------------------------------------------------------------
+class_confidence_thresholds:
+  多股线:     0.65
+  纬线杂质:   0.5
+  油点线:     0.85
+  包边不重叠: 0.7
+  飘絮:       0.5
+  单根包不进: 0.87
+  蚊虫小黑点: 0.95
+  包边不良:   0.5
+  纬线不直:   0.35
+  短废纱线:   0.5
+  经线毛球:   0.5
+
+default_class_confidence: 0.1
+
+# ------------------------------------------------------------------
+# 保存配置
+# ------------------------------------------------------------------
+save:
+  save_original: true
+  # 落盘格式：png 无损但慢（2440x2048 约 179ms/张、8MB），
+  # jpg 质量 95 约 16ms/张、1.1MB —— 编码快 11 倍、磁盘压力小 7 倍。
+  # 若下游要求无损取证，改回 "png"（会显著增加保存耗时与磁盘 IO）。
+  image_format: "png"
+  jpeg_quality: 100
+
+# ------------------------------------------------------------------
+# 继电器配置
+# ------------------------------------------------------------------
+# [需重启] 继电器参数在启动时读取一次，改完需重启程序。
+relay:
+  # 串口号，例如 "COM6"。
+  # 留空 ("") 表示按 CH340 的 VID/PID 自动识别；
+  # 现场接了多个 CH340 设备时必须在这里明确指定，程序不会去猜。
+  # 启动时会在日志里打印最终使用的端口，可据此核对。
+  port: "COM6"
+  baudrate: 9600
+  channel: 1              # 继电器通道，1 或 2
+  pulse_ms: 2            # 吸合时长（毫秒）
+  cooldown_seconds: 0     # 两次触发之间的最小间隔（秒）
+
+# ------------------------------------------------------------------
+# 模拟模式
+# ------------------------------------------------------------------
+simulation:
+  mode: false
+  folder: "D:\\DataFile\\dataset\\20260703"
+
+# ------------------------------------------------------------------
+# 布幅检测配置
+# ------------------------------------------------------------------
+fabric_width:
+  enabled: true
+  primary_cameras:
+    camera1: "right"
+    camera8: "left"
+  fallback_cameras:
+    camera2: "right"
+    camera7: "left"
+  camera8_right_edge: 31.0
+  camera8_left_edge: 0.6
+  camera7_right_edge: 53.4
+  camera7_left_edge: 19.0
+  camera2_left_edge: 139.0
+  camera2_right_edge: 168
+  camera1_left_edge: 157.0
+  camera1_right_edge: 178.6
+  seed_tol: 8
+  min_area: 50
+  blank_fg_ratio: 0.02
+  blank_threshold: 3
+  window_size: 20
+  report_interval: 10
+
+# ------------------------------------------------------------------
+# 经线密度均匀性
+# ------------------------------------------------------------------
+warp_density:
+  enable: true           # [需重启] 是否开启经线密度均匀性检测
+  trigger: false         # [热更新] 是否触发停机
+  stop_trigger: 0.45     # [热更新] 均匀度低于此值触发停机
+
+# ------------------------------------------------------------------
+# 纬线密度
+# ------------------------------------------------------------------
+weft_density:
+  enable: true                      # [需重启] 是否开启纬线检测
+  trigger: false                    # [热更新] 是否触发停机
+  stop_trigger: 260                 # [热更新] 最大纬线间距超过此值触发停机
+  lat_slope_angle_threshold: 5.0    # [热更新] 纬斜角度超过此值触发停机
+  save_weft: false
+  output_dir: "D:/yolo_detection_results/test"
+
+# 经纬密度触发停机保存地址
+warp_weft_output_dir: "D:/yolo_detection_results/test"
+
+# ------------------------------------------------------------------
+# 相机 SN -> 名称映射
+# ------------------------------------------------------------------
+cameras:
+  sn_map:
+    KBA26070032: "camera1"
+    KBA26070064: "camera2"
+    KBA26070030: "camera3"
+    KBA26070029: "camera4"
+    KBA26070057: "camera5"
+    KBA26070056: "camera6"
+    KBA26070061: "camera7"
+    KBA26070034: "camera8"
+
+# ------------------------------------------------------------------
+# 调试与原图保存配置
+# ------------------------------------------------------------------
+debug:
+  save_path: "D:/fabric_ex_data"
+  save_image: false
+  push_to_java: false

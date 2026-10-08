@@ -1,0 +1,46 @@
+<service>
+  <!-- 基本信息 -->
+  <id>MyPythonService</id>
+  <name>ty-python-service</name>
+  <description>Runs my Python script as a Windows Service</description>
+
+  <!-- 执行配置 -->
+  <executable>F:\mindversion-refactor\tfmisystem\.venv\Scripts\python.exe</executable>
+  <arguments>F:\mindversion-refactor\tfmisystem\main_yolo.py</arguments>
+
+  <!-- 工作目录：确保相对路径正确解析 -->
+  <workingdirectory>F:\mindversion-refactor\tfmisystem\</workingdirectory>
+
+  <env name="PYTHONIOENCODING" value="utf-8"/>
+  <env name="PYTHONUTF8" value="1"/>
+
+  <!-- 注意：这里的 PYTHONPATH 与上面的 workingdirectory 指向了两个不同的目录，
+       部署时请确认应当指向哪一个（通常应与 workingdirectory 一致）。 -->
+  <env name="PYTHONPATH" value="D:\tyhn\tfmisystem"/>
+
+  <!-- 配置文件定位：settings.py 会依次尝试 TFMI_CONFIG → exe/脚本所在目录 →
+       仓库根 → 当前工作目录，找不到就直接报错退出（不再静默使用默认值）。
+       以服务方式启动时工作目录未必可靠，建议显式指定： -->
+  <!-- <env name="TFMI_CONFIG" value="F:\mindversion-refactor\tfmisystem\config.yaml"/> -->
+
+  <!-- 启动类型：自动（开机自启） -->
+  <startmode>Automatic</startmode>
+  <!-- 日志存放目录 -->
+  <logpath>D:\Program Files\Java\service\python-service\user-management\workplace\logs</logpath>
+  <!-- ========== 日志配置：按时间+大小双重滚动 ========== -->
+  <!-- 配置日志按大小和时间双重滚动 -->
+  <log mode="roll-by-time">
+    <pattern>yyyyMMdd</pattern>
+  </log>
+
+  <!-- 启动模式 -->
+  <startmode>Automatic</startmode>
+
+  <!-- 服务失败后自动重启 -->
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="none"/>
+
+  <!-- 停止超时 -->
+  <stoptimeout>15 sec</stoptimeout>
+</service>

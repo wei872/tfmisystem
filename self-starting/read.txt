@@ -1,0 +1,4 @@
+MyService.exe install
+MyService.exe start
+MyService.exe stop
+MyService.exe uninstall
