@@ -356,9 +356,23 @@ class DetectionPipeline:
         # ── Step4: 创建SharedFrame并提交后台任务（异步，立即返回）──────
         # SharedFrame实现零拷贝共享，所有后台任务读取同一份图像数据
         shared = SharedFrame(image)
-        self._submit_analysis_tasks(shared, camera_name, filename, camera_sn)
-        # 主链路释放对SharedFrame的持有，后台任务各自维护引用计数
-        shared.owner_release()
+        try:
+            self._submit_analysis_tasks(shared, camera_name, filename, camera_sn)
+        finally:
+            # 主链路释放对 SharedFrame 的持有，后台任务各自维护引用计数。
+            #
+            # 必须放在 finally 里：_submit_analysis_tasks 内部先 shared.acquire()
+            # 再 executor.submit()，如果 acquire 之后抛异常（线程池已 shutdown、
+            # RuntimeError 等），下面这行就永远执行不到，_ref_count 停在 >=1，
+            # _image 不会被置空。
+            #
+            # 注意这不会造成永久泄漏——detect() 返回后 shared 随局部变量一起被
+            # GC（已用 weakref 实测确认）。真正的风险是异常传播路径：Python 的
+            # traceback 会持有帧的局部变量，只要异常对象被留存（日志 exc_info、
+            # sys.last_traceback、上层 except 里存了引用），这一帧的 14.3 MB
+            # 数组就会跟着 traceback 一起滞留。放在 finally 里可以确定性地断开
+            # SharedFrame 对数组的引用。
+            shared.owner_release()
 
         # ── Step5: 延迟初始化定时上报上下文 ──────────────────────────
         if self._report_ctx is None and camera_name:
