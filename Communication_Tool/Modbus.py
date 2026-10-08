@@ -90,6 +90,17 @@ class SystemConfig:
                                             # （防止减速/抖动瞬间误判）
     preview_interval: float = 1.0          # 秒，停机预览期间的软触发间隔（1fps足够看状态）
 
+    #  编码器合理性上限（m/min）。
+    #  PLC 的 HC0 计数器被复位、断电回零、或 32 位回绕时，
+    #  pulse_delta = hc0 - last_hc0 会瞬间变成一个巨大的正/负数，
+    #  算出来的 current_speed 是天文数字。后果有两个，都很难查：
+    #    1. current_speed 永远高于 idle_speed_threshold → is_idle 永远为 False
+    #       → 停机预览模式再也进不去，软触发预览彻底失效；
+    #    2. accumulated_distance 被灌进一个巨大的值，触发节拍彻底错乱。
+    #  超过这个上限的增量一律判为计数器突变，丢弃本拍并重新对齐基准。
+    #  默认 300 m/min：织机实际线速度远低于此，留足余量不会误杀。
+    max_plausible_speed_mpm: float = 300.0
+
     def __post_init__(self):
         """计算衍生参数"""
         # 胶轮周长(mm)
@@ -356,6 +367,44 @@ class MotionController:
 
         # 计算脉冲增量
         pulse_delta = hc0 - self.last_hc0
+
+        # ── 计数器突变防护 ──────────────────────────────────────────
+        # HC0 被复位/回零/32位回绕时，pulse_delta 会瞬间变成天文数字。
+        # 按本拍时长折算成速度，超过 max_plausible_speed_mpm 就判为突变：
+        # 丢弃本拍、重新对齐基准，避免污染速度和累计距离。
+        max_pulses = abs(
+            self.config.max_plausible_speed_mpm / 60.0 * 1000.0
+            * (dt / 1000.0) / self.config.pulse_equivalent
+        )
+        if abs(pulse_delta) > max_pulses:
+            self._glitch_count = getattr(self, "_glitch_count", 0) + 1
+            bogus_speed = abs(pulse_delta * self.config.pulse_equivalent / dt * 60)
+            warning(
+                f"[编码器] HC0 计数突变，已丢弃本拍："
+                f"last={self.last_hc0} -> now={hc0} (Δ={pulse_delta} 脉冲, "
+                f"折算速度 {bogus_speed:,.0f} m/min 超过上限 "
+                f"{self.config.max_plausible_speed_mpm:.0f} m/min)。"
+                f"通常是 PLC 计数器被复位或 32 位回绕。"
+                f"累计 {self._glitch_count} 次。")
+            self.last_hc0 = hc0
+            self.last_time = current_time
+            # 保持突变前的状态值，只把本拍的增量置零，
+            # 不让这个假速度渗进 is_idle / 累计距离 / 展示面板。
+            return False, {
+                'hc0': hc0,
+                'pulse_delta': 0,
+                'distance_delta': 0.0,
+                'accumulated_distance': self.accumulated_distance,
+                'cumulative_distance': self.cumulative_distance,
+                'current_speed': self.current_speed,
+                'average_speed': self.average_speed,
+                'is_forward': self.is_forward,
+                'is_running': self.is_running,
+                'trigger_count': self.trigger_count,
+                'is_idle': self.is_idle,
+                'is_defect_stopped': is_stopped,
+            }
+
         # 判断方向
         if pulse_delta > 0:
             self.is_forward = True

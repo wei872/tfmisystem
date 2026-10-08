@@ -33,6 +33,9 @@ import Communication_Tool.ThriftControl
 from Test_Tool.TestTool import press_any_key_exit
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from General_Tool.EnhancedLogger import init_logger, info, debug, error
+from General_Tool.HealthMonitor import (
+    init_health_monitor, shutdown_health_monitor,
+)
 from General_Tool.BackgroundTaskManager import BackgroundTaskManager
 from General_Tool.RunningSystemRegistry import get_running_system
 
@@ -61,20 +64,34 @@ from AnomalyDetection_Tool.services.WebSocketImageServer import (
 # gxipy 已随仓库放在 lib/gxipy。Camera_Tool.CameraOperation 在导入时会把
 # lib/ 挂到 sys.path，所以必须先导入它，再 import gxipy，路径才是就绪的。
 from Camera_Tool.CameraOperation import CameraOperation
+from Camera_Tool import CameraRegistry
 import gxipy as gx
 
 # ==================== 全局变量 ====================
 faulthandler.enable()
 
-# 卡死诊断：默认关闭。开启后 N 秒转储一次各线程栈到 logs/crash.log。
-# 原实现无条件 dump_traceback_later(30, ...) 并且永久持有一个文件句柄，
-# 属于调试残留，现改为由 config.yaml 的 logging.faulthandler_dump_after 控制。
+# 卡死诊断：由 config.yaml 的 logging.faulthandler_dump_after 控制（秒）。
+# dump_traceback_later 的转储线程跑在 C 层、自带定时器、**不需要 GIL**，
+# 所以即使所有 Python 线程都死锁在 GIL 上它照样能把栈打出来 —— 这正是
+# 排查"整机卡死"最需要的手段。卡死发生时，crash.log 里最后一次转储
+# 就是各线程当时的位置。
+#
+# 修掉两个问题：
+#   1. 原来 open() 的结果是个临时对象，没有任何引用，也没有 try 保护；
+#      文件打不开（磁盘满/权限/路径不存在）会直接掀掉整个进程启动。
+#   2. 句柄一直不关。现在存到模块级变量，退出时由 _shutdown_common 关闭。
 _dump_after = float(LOGGING_CONFIG.get("faulthandler_dump_after", 0) or 0)
+_dump_file = None
 if _dump_after > 0:
-    os.makedirs("logs", exist_ok=True)
-    faulthandler.dump_traceback_later(
-        _dump_after, repeat=True,
-        file=open(os.path.join("logs", "crash.log"), "w"))
+    try:
+        os.makedirs("logs", exist_ok=True)
+        _dump_file = open(os.path.join("logs", "crash.log"), "a", buffering=1)
+        faulthandler.dump_traceback_later(
+            _dump_after, repeat=True, file=_dump_file)
+        info(f"[卡死诊断] 已开启：每 {_dump_after:.0f}s 转储一次各线程栈到 logs/crash.log")
+    except Exception as e:
+        error(f"[卡死诊断] 开启失败（不影响主流程）: {e}")
+        _dump_file = None
 
 # SAVE_PATH, SEAVEIMAGE, PUSH 已从 settings (yaml) 导入
 
@@ -288,10 +305,10 @@ def on_camera_frame(image, frame_info):
     image_control()，因为停机预览帧必须绕过该标志才能推给前端，
     详见 image_control() 内的说明。
     """
-    debug(f"[原始回调] {frame_info.get('camera_name')} "
-          f"frame={frame_info.get('nFrameNum')} "
-          f"{frame_info.get('nWidth')}x{frame_info.get('nHeight')}")
-
+    # 这里原来每帧一条 debug(f"[原始回调] ...")。8 台相机 x 10Hz = 80 条/秒，
+    # 且跑在 SDK 采集线程上：即使级别是 INFO 被过滤掉，旧日志器也已经先付了
+    # 一次全栈回溯的钱。现在日志器加了级别预检，但热路径上仍然不该留每帧日志
+    # —— 需要看逐帧节拍时用 get_diag_info() 的计数器，不要开 DEBUG。
     try:
         image_control(image, frame_info, frame_info.get("camera_sn", ""))
     except Exception as e:
@@ -666,6 +683,45 @@ def _init_logging() -> None:
     )
 
 
+def _camera_diag_provider() -> dict:
+    """把各相机的帧数/丢帧数并进健康快照"""
+    out = {}
+    for name, cam_op in CameraRegistry.get_all_cameras().items():
+        try:
+            d = cam_op.get_diag_info()
+        except Exception:
+            continue
+        out[f"{name}.frames"] = d.get("frame_count", 0)
+        out[f"{name}.bad"] = d.get("bad_frame_count", 0)
+        lost = (d.get("stream") or {}).get("lost")
+        if lost is not None:
+            out[f"{name}.lost"] = lost
+    return out
+
+
+def _detection_diag_provider() -> dict:
+    """把检测队列深度并进健康快照 —— 顶满说明下游吞吐跟不上采集"""
+    if _detection_manager is None:
+        return {}
+    try:
+        pool = getattr(_detection_manager, "worker_pool", None)
+        if pool is None:
+            return {}
+        return {"infer_q": pool.qsize}
+    except Exception:
+        return {}
+
+
+def _init_health_monitor() -> None:
+    """启动健康心跳（卡死取证用，见 General_Tool/HealthMonitor.py）"""
+    init_health_monitor(
+        interval=float(LOGGING_CONFIG.get("health_interval", 30) or 0),
+        rss_warn_mb=float(LOGGING_CONFIG.get("health_rss_warn_mb", 0) or 0),
+        thread_warn=int(LOGGING_CONFIG.get("health_thread_warn", 0) or 0),
+        providers=[_camera_diag_provider, _detection_diag_provider],
+    )
+
+
 def _print_stop_rules() -> None:
     """打印当前生效的停机规则"""
     info("=" * 60)
@@ -704,10 +760,18 @@ def _print_stop_rules() -> None:
 
 def _shutdown_common() -> None:
     """两种模式共用的收尾流程"""
+    shutdown_health_monitor()
     shutdown_websocket_server()
     _fabric_executor.shutdown(wait=False)
     _aux_executor.shutdown(wait=False)
     Shutdown_yolo_detector()
+    # 关掉卡死诊断的转储文件（原来这个句柄一直不关）
+    if _dump_file is not None:
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            _dump_file.close()
+        except Exception:
+            pass
     info(f"退出: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
@@ -867,6 +931,8 @@ def main() -> int:
         preview_max_width=int(WEBSOCKET_CONFIG.get("preview_max_width", 960)),
         jpeg_quality=int(WEBSOCKET_CONFIG.get("jpeg_quality", 70)),
     )
+
+    _init_health_monitor()
 
     # 运行模式由 config.yaml 的 simulation.mode 决定
     if SIMULATION_MODE:

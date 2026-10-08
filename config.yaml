@@ -78,11 +78,27 @@ websocket:
 # ------------------------------------------------------------------
 logging:
   file: "logs/app.log"
-  level: "DEBUG"
+  # 生产环境用 INFO。DEBUG 会在相机采集线程上产生每秒上百条日志，
+  # 叠加同步落盘的 RotatingFileHandler，足以把采集线程拖到丢帧。
+  # 需要排查具体某条链路时再临时改成 DEBUG，查完改回来。
+  level: "INFO"
   max_bytes: 5242880            # 5MB
   backup_count: 3
-  # 卡死诊断：N 秒后把各线程栈转储到 logs/crash.log；<=0 表示关闭
-  faulthandler_dump_after: 0
+  # 健康心跳：每 N 秒往日志写一行快照（RSS/线程数/GC/队列深度/相机丢帧）。
+  # 整机卡死重启后，翻最后几行心跳就能看出是"内存一路涨"还是"突然断掉"。
+  # <=0 表示关闭。
+  health_interval: 30
+  # 进程 RSS 超过此值(MB)时心跳升级为 WARNING；0=不告警。
+  # 按现场物理内存的一半左右设置，留出 YOLO/TensorRT 的余量。
+  health_rss_warn_mb: 12288
+  # 线程数超过此值时升级为 WARNING；0=不告警。正常稳定在几十，
+  # 持续爬升说明有线程泄漏。
+  health_thread_warn: 200
+  # 卡死诊断：N 秒转储一次各线程栈到 logs/crash.log；<=0 表示关闭。
+  # 转储线程跑在 C 层、不需要 GIL，所以即使所有 Python 线程都死锁在 GIL 上
+  # 也照样能把栈打出来。现场卡死时，crash.log 里最后一次转储就是各线程
+  # 当时的位置 —— 这是排查"整机突然卡死"最直接的证据，务必保持开启。
+  faulthandler_dump_after: 60
 
 # ------------------------------------------------------------------
 # 尺寸转换常量
