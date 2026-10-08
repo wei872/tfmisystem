@@ -30,9 +30,8 @@ S7-200 SMART 编码器触发控制系统
 ========================================
 """
 import threading
-from General_Tool.RunningSystemRegistry import set_running_system, get_running_system
+from General_Tool.RunningSystemRegistry import set_running_system
 from Camera_Tool import CameraRegistry  #  新增：相机触发源统一调度
-import aiohttp
 import asyncio
 from pymodbus.client import ModbusTcpClient
 from dataclasses import dataclass

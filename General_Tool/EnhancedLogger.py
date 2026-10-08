@@ -2,8 +2,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
-from typing import Optional, Dict, Any, Union, List
-from datetime import datetime
+from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
 
@@ -330,27 +329,3 @@ def init_logger(log_file: Optional[Union[str, Path]] = None, level: int = loggin
     """
     return get_logger(log_file=log_file, level=level, **kwargs)
 
-
-# 使用示例
-if __name__ == "__main__":
-    # 初始化日志
-    logger = init_logger(
-        log_file="logs/app.log",
-        level=logging.DEBUG,
-        max_bytes=5 * 1024 * 1024,
-        backup_count=3
-    )
-
-    # 使用示例
-    debug("这是一条调试信息", extra={'user': 'john', 'action': 'login'})
-    info("程序启动成功", extra={'version': '1.0.0', 'timestamp': datetime.now()})
-    warning("磁盘空间不足", extra={'free_space': '1.2GB', 'threshold': '2GB'})
-
-    try:
-        # 模拟异常
-        raise ValueError("测试异常")
-    except ValueError as e:
-        error("处理数据时发生错误", extra={'data_id': 123})
-        exception("详细的异常信息")
-
-    critical("系统即将崩溃", extra={'reason': '内存溢出', 'pid': os.getpid()})

@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Optional
 
-from General_Tool.EnhancedLogger import info, error
+from General_Tool.EnhancedLogger import info
 
 if TYPE_CHECKING:
     # 仅用于 IDE 类型提示，运行时不执行，不产生循环导入

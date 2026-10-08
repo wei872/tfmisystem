@@ -333,8 +333,6 @@ def run_folder_simulation(folder_path: str, skip_fabric: bool = False, loop: boo
         skip_fabric: 是否跳过布幅检测
         loop: 是否循环检测（检测完再从头开始）
     """
-    import concurrent.futures
-
     name_to_sn = {v: k for k, v in CAMERA_SN_MAP.items()}
     sn_list = list(CAMERA_SN_MAP.keys())  # 所有8个 SN
     camera_names = list(CAMERA_SN_MAP.values())  # camera1 .. camera8

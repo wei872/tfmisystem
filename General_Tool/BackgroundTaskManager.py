@@ -1,13 +1,10 @@
 # General_Tool/BackgroundTaskManager.py
 
-import asyncio
 import concurrent.futures
 import time
-import threading
 from threading import Event, Lock
-from typing import List, Any, Optional
+from typing import List, Any
 import signal
-import os
 
 from General_Tool.EnhancedLogger import info, error, warning
 
@@ -66,23 +63,6 @@ class BackgroundTaskManager:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-    def simulation_software_trigger_task(self):
-        """可控制退出的相机触发任务"""
-        info("相机触发任务启动")
-        while not self.shutdown_event.is_set():
-            try:
-                for obj in self.obj_cam_operation:
-                    if self.shutdown_event.is_set():
-                        break
-                    ret = obj.Trigger_once()
-                    info(f"设备{obj.st_serial_number}被触发, code: {ret}")
-                    time.sleep(0.01)
-                time.sleep(0.4)
-            except Exception as e:
-                error(f"相机触发任务执行出错: {e}")
-                time.sleep(5)
-        info("相机触发任务已停止")
-
     def _run_modbus_server(self):
         """
         运行 Modbus 服务器（同步版本）
@@ -106,10 +86,6 @@ class BackgroundTaskManager:
     def start_all_tasks(self):
         """启动所有后台任务"""
         try:
-
-            # future1 = self.executor.submit(self.simulation_software_trigger_task)
-            # self._futures.append(future1)
-
             # 启动 Modbus 服务器
             if self.controller is not None:
                 future = self.executor.submit(self._run_modbus_server)
@@ -169,56 +145,3 @@ class BackgroundTaskManager:
     def __del__(self):
         if not self.shutdown_event.is_set():
             self.shutdown()
-
-
-# 主程序示例
-def main():
-    """主程序入口"""
-
-    # 模拟相机操作对象
-    class MockCamOperation:
-        def __init__(self, serial_number):
-            self.st_serial_number = serial_number
-
-        def Trigger_once(self):
-            return 0
-
-    # 创建任务管理器
-    cam_objects = [MockCamOperation(f"Cam{i}") for i in range(3)]
-    task_manager = BackgroundTaskManager(cam_objects)
-
-    try:
-        # 启动任务
-        task_manager.start_all_tasks()
-
-        info("主程序运行中，按 Ctrl+C 停止...")
-
-        # 主循环
-        while True:
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        info("收到键盘中断")
-    except Exception as e:
-        error(f"主程序错误: {e}")
-    finally:
-        # 首先尝试优雅关闭
-        if not task_manager.wait_for_shutdown():
-            warning("优雅关闭失败，使用强制关闭")
-
-        info("程序退出")
-
-
-if __name__ == "__main__":
-    # 设置全局异常处理
-    def global_exception_handler(exc_type, exc_value, exc_traceback):
-        error("未处理的异常:", exc_info=(exc_type, exc_value, exc_traceback))
-        os._exit(1)
-
-
-    import sys
-
-    sys.excepthook = global_exception_handler
-
-    # 运行主程序
-    main()
