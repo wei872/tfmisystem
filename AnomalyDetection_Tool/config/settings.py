@@ -22,7 +22,7 @@ import copy
 import time
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -792,11 +792,14 @@ WEFT_OUTPUT_DIR = _weft.get("output_dir", r"D:\yolo_detection_results\test")
 WARP_WEFT_OUTPUT_DIR = _get("warp_weft_output_dir", r"D:\yolo_detection_results\test")
 
 # ================================================================
-# 相机 SN -> 名称映射（从 yaml 读取）
+# 相机 SN -> 名称映射 / 采集参数（从 yaml 读取）
 # ================================================================
 
 _cameras = _get("cameras", {})
 CAMERA_SN_MAP: Dict[str, str] = _cameras.get("sn_map", {})
+
+# 大恒 Galaxy SDK 采集参数，含义见 config.yaml 的 cameras.acquisition 注释
+CAMERA_ACQ_CONFIG: Dict[str, Any] = _cameras.get("acquisition", {}) or {}
 
 
 # ================================================================

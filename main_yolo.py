@@ -3,7 +3,7 @@
 """
 ===============================================================================
 主程序 —— 相机采集 + YOLO 检测 + 布幅检测
-SDK: 海康威视 MvCamera SDK
+SDK: 大恒图像 Galaxy (GxIAPI / gxipy) SDK
 
 这是系统的**唯一入口**。此前 main_yolo.py / main_test.py 是两份复制粘贴的
 副本（716/729 行，仅差 99 行），修一处必漏另一处；现已合并，main_test.py
@@ -11,7 +11,7 @@ SDK: 海康威视 MvCamera SDK
 
 运行模式由 config.yaml 决定，不需要改代码：
   - simulation.mode: true   → 读取 simulation.folder 里的图片跑仿真
-  - simulation.mode: false  → 连接海康相机跑生产流程
+  - simulation.mode: false  → 连接大恒相机跑生产流程
 ===============================================================================
 """
 
@@ -20,14 +20,11 @@ import threading
 import time
 import os
 import sys
-import ctypes
 from concurrent.futures import ThreadPoolExecutor
-from ctypes import *
 from datetime import datetime
 from typing import Optional
 
 import cv2
-import numpy as np
 import faulthandler
 
 from Communication_Tool.Modbus import TriggerControlSystem, SystemConfig
@@ -44,7 +41,7 @@ from AnomalyDetection_Tool.config.settings import (
     YOLO_CONFIG, SAVE_CONFIG, MACHINE_STOP_RULES,
     CLASS_CONFIDENCE_THRESHOLDS, DEFAULT_CLASS_CONFIDENCE,
     SIMULATION_MODE, SIMULATION_FOLDER,
-    FABRIC_WIDTH_CONFIG, CAMERA_SN_MAP,
+    FABRIC_WIDTH_CONFIG, CAMERA_SN_MAP, CAMERA_ACQ_CONFIG,
     SAVE_PATH, SEAVEIMAGE, PUSH,
     PLC_CONFIG, WEBSOCKET_CONFIG, LOGGING_CONFIG, CONCURRENCY_CONFIG,
 )
@@ -60,15 +57,11 @@ from AnomalyDetection_Tool.services.WebSocketImageServer import (
     get_websocket_server,
     shutdown_websocket_server
 )
-# ==================== 海康威视 SDK 导入 ====================
-from lib.MvImport.MvCameraControl_class import *
-from Camera_Tool.CameraOperation import CameraOperation, Read_IntPtr_Value
-
-# ==================== 海康回调函数类型定义 ====================
-winfun_ctype = WINFUNCTYPE
-stFramInfo = POINTER(MV_FRAME_OUT_INFO_EX)
-pData = POINTER(c_ubyte)
-FrameInfoCallBack = winfun_ctype(None, pData, stFramInfo, c_void_p)
+# ==================== 大恒图像 Galaxy SDK 导入 ====================
+# gxipy 已随仓库放在 lib/gxipy。Camera_Tool.CameraOperation 在导入时会把
+# lib/ 挂到 sys.path，所以必须先导入它，再 import gxipy，路径才是就绪的。
+from Camera_Tool.CameraOperation import CameraOperation
+import gxipy as gx
 
 # ==================== 全局变量 ====================
 faulthandler.enable()
@@ -86,6 +79,8 @@ if _dump_after > 0:
 # SAVE_PATH, SEAVEIMAGE, PUSH 已从 settings (yaml) 导入
 
 obj_cam_operation = []
+# 全局唯一的 gxipy DeviceManager：构造即 gx_init_lib()，回收即 gx_close_lib()
+_device_manager = None
 lock = threading.RLock()
 java_client = None
 
@@ -101,7 +96,7 @@ _fabric_queue_lock = threading.Lock()
 _fabric_pending: dict = {}  # camera_name -> Future，防止同一相机积压
 
 # ── 辅助 I/O 线程池（调试存图 / 推帧给 Java）────────────────────────────
-# 这两件事原先直接跑在海康 SDK 的 C 回调线程上：
+# 这两件事原先直接跑在相机 SDK 的 C 回调线程上：
 #   cv2.imwrite() 落盘 + cv2.imencode() JPEG 编码 + Thrift 网络发送
 # 一旦现场把 debug.save_image / debug.push_to_java 打开，回调线程就会被
 # 磁盘和网络拖住，直接导致相机丢帧甚至 SDK 内部缓冲耗尽。
@@ -181,15 +176,18 @@ def _push_frame_to_java(image) -> None:
 # ==================================================================
 # 图像处理（接收已转换好的 BGR 图像）
 # ==================================================================
-def image_control(image, stFrameInfo, str_pUser=""):
+def image_control(image, frame_info, camera_sn=""):
     """
     图像处理函数。
 
-    ⚠ 本函数运行在海康 SDK 的 C 回调线程上，**任何阻塞都会造成相机丢帧**。
+    ⚠ 本函数运行在大恒 SDK 的采集线程上，**任何阻塞都会造成相机丢帧**。
     因此这里只做分发：布幅检测、调试落盘、Java 推帧全部投递到线程池，
     YOLO 检测本身由 DetectionWorkerPool 内部排队消化。
+
+    :param image:      BGR / uint8 / HxWx3 的独立副本（可以安全跨线程传递）
+    :param frame_info: CameraOperation 给出的帧信息 dict
+    :param camera_sn:  相机序列号
     """
-    camera_sn = str_pUser
     camera_name = CAMERA_SN_MAP.get(camera_sn)
     if camera_name is None:
         debug(f"[{camera_sn}] 未配置，跳过")
@@ -228,12 +226,13 @@ def image_control(image, stFrameInfo, str_pUser=""):
             _log_manual_stop_skip(camera_name)
         return
 
-    frame_number = stFrameInfo["nFrameNum"]
+    frame_number = frame_info["nFrameNum"]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     # ====== 布幅检测异步化 ======
     # 只传引用不做 image.copy()：整帧拷贝约 1.2ms(15MB)，同样不该占用回调线程。
-    # 该数组由 image_callback 每帧新建，布幅检测只读不写，共享是安全的。
+    # 该数组由 on_camera_frame 每帧新建、且已脱离 SDK 缓冲区，
+    # 布幅检测只读不写，共享是安全的。
     fabric_detector = get_fabric_detector()
     if fabric_detector is not None:
         with _fabric_queue_lock:
@@ -258,63 +257,47 @@ def image_control(image, stFrameInfo, str_pUser=""):
 
     # ====== 调试功能：一律异步，绝不阻塞采集线程 ======
     if SEAVEIMAGE:
-        _submit_aux(_save_debug_image, image.copy(), camera_sn, str_pUser)
+        # 第 3/4 个参数分别是文件名前缀和子目录，旧实现两处都传 SN，行为保持不变
+        _submit_aux(_save_debug_image, image.copy(), camera_sn, camera_sn)
 
     if PUSH and java_client is not None:
         _submit_aux(_push_frame_to_java, image.copy())
 
 
 # ==================================================================
-# 海康威视相机回调函数
+# 大恒相机图像回调
 # ==================================================================
-def image_callback(pData, pFrameInfo, pUser):
+def on_camera_frame(image, frame_info):
     """
-    海康相机图像回调函数（运行在 SDK 的 C 线程上）。
+    相机帧回调（运行在大恒 SDK 的采集线程上）。
+
+    image / frame_info 由 CameraOperation 准备好：
+      - image 已经是 BGR / uint8 / HxWx3 的**独立副本**，可安全跨线程传递；
+      - frame_info 含 nWidth / nHeight / nFrameNum / timestamp / camera_sn 等。
+
+    与旧的海康实现相比，这里不再手工做
+    ``ctypes.string_at(pData, w*h) -> frombuffer -> cvtColor(BAYER_GB2RGB)`` 那条链：
+      1. 旧的 buff_size 只按 w*h 算，等于假设每像素恒为 1 字节且不带 chunk data，
+         像素格式一变就欠读/越界读；
+      2. COLOR_BAYER_GB2RGB 是硬编码的，换一台 Bayer 相位不同的相机红蓝就反了；
+      3. 末尾那次 cv2.resize(..., (nWidth, nHeight)) 尺寸根本没变，纯属每帧白拷
+         一份 ~45MB，8 路相机下是实打实的内存与 GC 压力。
+    现在统一交给 CameraOperation._to_bgr()（大恒 DxImageProc 转换 + OpenCV 兜底）。
 
     注意：这里**不再**提前检查 getIsStop()。停机判断统一下沉到
     image_control()，因为停机预览帧必须绕过该标志才能推给前端，
     详见 image_control() 内的说明。
     """
-    debug(f"[原始回调] pUser={pUser is not None}")
-
-    str_pUser = Read_IntPtr_Value(pUser)
-
-    try:
-        stFrameInfo = cast(pFrameInfo, POINTER(MV_FRAME_OUT_INFO_EX)).contents
-        st_frame_info = {
-            "nWidth": stFrameInfo.nWidth,
-            "nHeight": stFrameInfo.nHeight,
-            "nFrameNum": stFrameInfo.nFrameNum,
-            "enPixelType": stFrameInfo.enPixelType,
-            "pUser": str_pUser,
-        }
-    except Exception as e:
-        error(f"回调解析帧信息失败: {e}")
-        return
+    debug(f"[原始回调] {frame_info.get('camera_name')} "
+          f"frame={frame_info.get('nFrameNum')} "
+          f"{frame_info.get('nWidth')}x{frame_info.get('nHeight')}")
 
     try:
-        buff_size = st_frame_info["nWidth"] * st_frame_info["nHeight"]
-        raw = ctypes.string_at(pData, buff_size)
-        arr = np.frombuffer(raw, dtype=np.uint8).copy()
-
-        # 海康相机 Bayer 格式转换为 BGR
-        arr = arr.reshape((st_frame_info["nHeight"], st_frame_info["nWidth"]))
-        image = cv2.cvtColor(arr, cv2.COLOR_BAYER_GB2RGB)
-        image = cv2.resize(
-            image,
-            (st_frame_info["nWidth"], st_frame_info["nHeight"]),
-            interpolation=cv2.INTER_AREA,
-        )
-
-        image_control(image, st_frame_info, str_pUser)
+        image_control(image, frame_info, frame_info.get("camera_sn", ""))
     except Exception as e:
         error(f"回调处理图像失败: {e}")
         import traceback
         traceback.print_exc()
-
-
-# 实例化回调函数对象（防止被 GC 回收）
-CALL_BACK_FUN = FrameInfoCallBack(image_callback)
 
 
 # ==================================================================
@@ -499,8 +482,16 @@ def _wait_if_stopped():
 
 
 # ==================================================================
-# 设备管理（海康 SDK）
+# 设备管理（大恒 Galaxy SDK）
 # ==================================================================
+def _release_device_manager() -> None:
+    """释放全局 DeviceManager。
+
+    gxipy 把 gx_init_lib()/gx_close_lib() 挂在 DeviceManager 的
+    __new__/__del__ 上，所以"反初始化"就是丢掉最后一个引用。
+    """
+    global _device_manager
+    _device_manager = None
 def Open_all_devices():
     global obj_cam_operation
     ok, fail = [], []
@@ -519,7 +510,7 @@ def Regist_callback_all_devices():
     global obj_cam_operation
     ok, fail = [], []
     for c in obj_cam_operation:
-        ret = c.Registration_callback(CALL_BACK_FUN)
+        ret = c.Registration_callback(on_camera_frame)
         (ok if ret == 0 else fail).append(c)
     if fail:
         error("以下设备回调注册失败:")
@@ -678,7 +669,7 @@ def _init_logging() -> None:
 def _print_stop_rules() -> None:
     """打印当前生效的停机规则"""
     info("=" * 60)
-    info("运行中（海康SDK）| 停机规则:")
+    info("运行中（大恒 Galaxy SDK）| 停机规则:")
     for cls, rule in MACHINE_STOP_RULES.get("rules", {}).items():
         # rule 为 None 表示该类别禁用
         if rule is None or not rule.get("enabled", True):
@@ -761,50 +752,63 @@ def run_simulation_mode() -> int:
 
 
 def run_production_mode() -> int:
-    """生产模式：连接海康相机，硬触发采图 + 检测。"""
-    info("\n系统启动（海康SDK + YOLO检测 + 布幅检测）")
+    """生产模式：连接大恒相机，硬触发采图 + 检测。"""
+    global _device_manager
 
-    # ==================== 海康 SDK 初始化 ====================
-    MvCamera.MV_CC_Initialize()
+    info("\n系统启动（大恒 Galaxy SDK + YOLO检测 + 布幅检测）")
 
-    deviceList = MV_CC_DEVICE_INFO_LIST()
-    tlayerType = MV_GIGE_DEVICE
-
-    ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
-    if ret != 0:
-        error(f"枚举设备失败! ret={ret}")
-        MvCamera.MV_CC_Finalize()
+    # ==================== 大恒 SDK 初始化 ====================
+    # DeviceManager 的构造里就会调用 gx_init_lib()（等价于海康的
+    # MV_CC_Initialize），所以不再需要单独的一次"初始化"调用；
+    # 对应的 gx_close_lib() 在最后一个 DeviceManager 被回收时执行，
+    # 见 _release_device_manager()。
+    try:
+        _device_manager = gx.DeviceManager()
+    except Exception as e:
+        error(f"大恒 GxIAPI 初始化失败: {e}\n"
+              f"请确认已安装大恒 Galaxy 相机驱动，且环境变量 "
+              f"GALAXY_GENICAM_ROOT 指向 SDK 安装目录。")
         Shutdown_yolo_detector()
         return 1
 
-    if deviceList.nDeviceNum == 0:
+    try:
+        enum_timeout = int(CAMERA_ACQ_CONFIG.get("enum_timeout_ms", 2000))
+        dev_num, dev_info_list = _device_manager.update_all_device_list(enum_timeout)
+    except Exception as e:
+        error(f"枚举设备失败: {e}")
+        _release_device_manager()
+        Shutdown_yolo_detector()
+        return 1
+
+    if not dev_num:
         error("未找到任何相机设备!")
-        MvCamera.MV_CC_Finalize()
+        _release_device_manager()
         Shutdown_yolo_detector()
         return 1
 
-    info(f"找到 {deviceList.nDeviceNum} 个设备")
+    info(f"找到 {dev_num} 个设备")
 
     # 创建目标相机操作对象
-    for i in range(deviceList.nDeviceNum):
-        mvcc_dev_info = cast(
-            deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)
-        ).contents
-        sn_bytes = mvcc_dev_info.SpecialInfo.stGigEInfo.chSerialNumber
-        strSN = "".join(chr(b) for b in sn_bytes if b != 0)
-
-        if strSN in TARGET_SERIALS:
-            camObj = MvCamera()
-            # 传入 camera_name，使 CameraOperation.Open_device() 注册到
-            # CameraRegistry 时用业务名(camera1/camera2...)而非退化用序列号
-            obj_cam_operation.append(
-                CameraOperation(camObj, deviceList, i,
-                                camera_name=CAMERA_SN_MAP[strSN]))
-            info(f"  添加相机 {strSN} -> {CAMERA_SN_MAP[strSN]}")
+    for dev_info in (dev_info_list or []):
+        strSN = str(dev_info.get("sn", "") or "")
+        if strSN not in TARGET_SERIALS:
+            continue
+        # 传入 camera_name，使 CameraOperation.Open_device() 注册到
+        # CameraRegistry 时用业务名(camera1/camera2...)而非退化用序列号
+        obj_cam_operation.append(CameraOperation(
+            _device_manager, dev_info,
+            camera_name=CAMERA_SN_MAP[strSN],
+            buffer_count=int(CAMERA_ACQ_CONFIG.get("buffer_count", 10)),
+            packet_size=int(CAMERA_ACQ_CONFIG.get("packet_size", 0)),
+            heartbeat_timeout_ms=int(CAMERA_ACQ_CONFIG.get("heartbeat_timeout_ms", 0)),
+            trigger_source=str(CAMERA_ACQ_CONFIG.get("trigger_source", "Line0")),
+        ))
+        info(f"  添加相机 {strSN} -> {CAMERA_SN_MAP[strSN]} "
+             f"({dev_info.get('model_name', '')} @ {dev_info.get('ip', '')})")
 
     if not obj_cam_operation:
         error("未找到目标相机设备")
-        MvCamera.MV_CC_Finalize()
+        _release_device_manager()
         Shutdown_yolo_detector()
         return 1
 
@@ -836,8 +840,8 @@ def run_production_mode() -> int:
     Stop_all_devices()
     Close_all_devices()  # 内部会自动从 CameraRegistry 注销所有相机
 
-    # 海康 SDK 清理
-    MvCamera.MV_CC_Finalize()
+    # 大恒 SDK 清理（最后一个 DeviceManager 被回收时执行 gx_close_lib）
+    _release_device_manager()
 
     _shutdown_common()
     return 0

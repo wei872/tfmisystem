@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行时产物
+logs/
+*.log
+
+# PyInstaller 打包输出
+build/
+dist/
+main_yolo/
+
+# IDE
+.idea/workspace.xml
+.idea/usage.statistics.xml

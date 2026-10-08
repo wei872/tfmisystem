@@ -7,6 +7,12 @@ from PyInstaller.utils.hooks import collect_submodules
 # 自动获取当前虚拟环境的 site-packages 路径
 sp_path = [p for p in sys.path if 'site-packages' in p and '.venv' in p][0]
 
+# 把 lib/ 挂到 sys.path，下面的 collect_submodules('gxipy') 才找得到大恒的包
+_project_root = os.path.dirname(os.path.abspath(SPEC)) if 'SPEC' in dir() else os.getcwd()
+_lib_dir = os.path.join(_project_root, 'lib')
+if _lib_dir not in sys.path:
+    sys.path.insert(0, _lib_dir)
+
 # 强制将 cupy 和 cupy_backends 整个文件夹打包进去
 extra_datas = []
 for pkg in ['cupy', 'cupy_backends']:
@@ -14,15 +20,14 @@ for pkg in ['cupy', 'cupy_backends']:
     if os.path.exists(pkg_path):
         extra_datas.append((pkg_path, pkg))
 
-import glob
-# 1. 尝试找系统默认安装路径下的海康 Win64 DLL
-mv_dll_dir = r'C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64'
-mv_dlls = glob.glob(os.path.join(mv_dll_dir, '*.dll'))
-
-# 2. 如果你的 DLL 不在默认路径，而是在你项目的 lib 文件夹里，用下面这行代替
-# mv_dlls = glob.glob('lib/**/*.dll', recursive=True)
-
-extra_binaries = [(dll, '.') for dll in mv_dlls]
+# ------------------------------------------------------------------
+# 大恒 Galaxy SDK 的原生 DLL **不**打包进 exe。
+# gxipy/gxwrapper.py 在运行时会读取环境变量 GALAXY_GENICAM_ROOT 并用
+# os.add_dll_directory() 把 GxIAPI.dll / DxImageProc.dll 所在目录挂进搜索路径，
+# 所以现场机器必须安装大恒 Galaxy 相机驱动（含 GenICam 运行时）。
+# 这里只需要把纯 Python 的 gxipy 包收进去（见下面的 pathex / hiddenimports）。
+# ------------------------------------------------------------------
+extra_binaries = []
 
 # 打包 config.yaml：settings.py 现在是 fail-fast 的（找不到配置直接报错），
 # 且优先在 exe 同级目录 / _MEIPASS 下查找，必须随包分发。
@@ -32,16 +37,16 @@ if os.path.exists('config.yaml'):
 
 a = Analysis(
     ['main_yolo.py'],
-    pathex=['lib/MvImport'],  # <-- 新增：告诉 PyInstaller 去这里找海康模块
+    # gxipy 放在 lib/ 下，内部用的是绝对导入(from gxipy.xxx import *)，
+    # 所以把 lib/ 作为搜索根，让 PyInstaller 能把它当顶层包分析
+    pathex=['lib'],
     binaries=extra_binaries,
     datas=extra_datas,
     hiddenimports=[
         *collect_submodules('fastrlock'),  # <-- 新增这一行收集 fastrlock
-        'CameraParams_const',
-        'CameraParams_header',
-        'PixelType_header',
-        'PixelType_const',
-        'MvErrorDefine_const',
+        # 大恒 gxipy：这些模块之间靠 `from gxipy.xxx import *` 互相引用，
+        # PyInstaller 的静态分析经常漏掉，显式全量收集最稳妥
+        *collect_submodules('gxipy'),
     ],
     hookspath=[],
     excludes=[
