@@ -698,14 +698,37 @@ def _camera_diag_provider() -> dict:
 
 
 def _detection_diag_provider() -> dict:
-    """把检测队列深度并进健康快照 —— 顶满说明下游吞吐跟不上采集"""
+    """
+    把检测侧的吞吐/丢帧指标并进健康快照。
+
+    只报 infer_q 是不够的：队列深度是"正在积压"的瞬时值，采样错开就看不到；
+    而 dropped / skipped 是累计计数，一旦非零就说明**已经真的漏检了**。
+    这两类必须一起报，否则现场无法回答"到底有没有漏检"。
+
+    各计数含义（见 DetectionWorkerPool._counters）：
+      dropped           总丢帧数 = memory_dropped + semaphore_dropped + 队列溢出
+      skipped           skip_old_frames 去重丢掉的同相机旧帧数
+      semaphore_dropped 在途帧数顶到 max_inflight_frames 而被拒 —— 吞吐不足的主因
+      memory_dropped    内存水位过高主动丢帧
+      submitted/processed 提交与完成数，两者长期背离即为积压
+    """
     if _detection_manager is None:
         return {}
     try:
         pool = getattr(_detection_manager, "worker_pool", None)
         if pool is None:
             return {}
-        return {"infer_q": pool.qsize}
+        snap = {"infer_q": pool.qsize}
+        try:
+            st = pool.get_stats()
+            for k in ("submitted", "processed", "dropped", "skipped",
+                      "semaphore_dropped", "memory_dropped"):
+                if k in st:
+                    snap[k] = st[k]
+        except Exception:
+            # 取不到计数不影响队列深度这一项
+            pass
+        return snap
     except Exception:
         return {}
 
