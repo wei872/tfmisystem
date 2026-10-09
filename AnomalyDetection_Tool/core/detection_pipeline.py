@@ -253,9 +253,11 @@ class DetectionPipeline:
             "warp_density_avg": 0.0,
             "warp_task_submitted": 0,
             "warp_task_skipped": 0,
+            "warp_task_submit_failed": 0,
             "weft_task_submitted": 0,
             "weft_task_skipped": 0,
             "weft_task_depth_dropped": 0,
+            "weft_task_submit_failed": 0,
             "stop_weft_count": 0,
             "stop_broken_weft_count": 0,
             "stop_warp_count": 0,
@@ -455,14 +457,42 @@ class DetectionPipeline:
         )
         if need_warp:
             if self._warp_cache.try_mark_inflight():
-                # 消费者获取SharedFrame引用（引用计数+1）
-                shared.acquire()
-                _warp_executor.submit(
-                    self._warp_task_shared,
-                    shared, camera_name, camera_sn,
-                )
-                with self._lock:
-                    self._stats["warp_task_submitted"] += 1
+                # try_mark_inflight() 已经把 in_flight 置成 True。从这里到
+                # executor.submit() 成功入队之间是一个"已预留、未移交"的窗口：
+                # shared.release() 和 reset_inflight() 都只写在任务体
+                # _warp_task_shared 的 finally 里，一旦 submit() 抛异常
+                # （线程池已 shutdown、BrokenThreadPool、起不了新线程），
+                # 任务体永远不会运行，in_flight 就永久停在 True —— 之后每一帧
+                # try_mark_inflight() 都返回 False，该 pipeline 的经线分析静默
+                # 停摆。这里没有任何超时看门狗能把它救回来，必须自己回滚。
+                acquired = False
+                try:
+                    # 消费者获取SharedFrame引用（引用计数+1）
+                    shared.acquire()
+                    acquired = True
+                    _warp_executor.submit(
+                        self._warp_task_shared,
+                        shared, camera_name, camera_sn,
+                    )
+                except BaseException as e:
+                    # acquire() 在 _image 为 None 时会在自增之前抛错，
+                    # 那种情况不能 release()，否则引用计数被扣穿。
+                    if acquired:
+                        shared.release()
+                    self._warp_cache.reset_inflight()
+                    with self._lock:
+                        self._stats["warp_task_submit_failed"] += 1
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    # 后台分析提交失败不该丢掉本帧已经算完的 YOLO 结果，
+                    # 记一笔计数和日志后继续走主链路。
+                    error(
+                        f"[经线密度] 任务提交失败 camera={camera_name}，"
+                        f"已回滚 in_flight: {e!r}"
+                    )
+                else:
+                    with self._lock:
+                        self._stats["warp_task_submitted"] += 1
             else:
                 # 上一帧的经线任务尚未完成，跳过本帧（避免堆积）
                 with self._lock:
@@ -488,13 +518,38 @@ class DetectionPipeline:
             _weft_queue_depth += 1
 
         if self._weft_cache.try_mark_inflight():
-            shared.acquire()
-            _weft_executor.submit(
-                self._weft_task_shared_guarded,
-                shared, filename, camera_name, camera_sn,
-            )
-            with self._lock:
-                self._stats["weft_task_submitted"] += 1
+            # 同经线，但这里预留的是两样东西：_weft_queue_depth（上面 +1）
+            # 和 _weft_cache.in_flight。两处的归还同样都只在任务体
+            # _weft_task_shared_guarded 的 finally 里，submit() 一抛异常就都
+            # 归还不了。后果比经线更严重：_weft_queue_depth 是模块级全局、
+            # 只有 WEFT_MAX_QUEUE_DEPTH(=4) 个槽位、8 台相机共用，所以泄漏满
+            # 4 次之后整个进程的纬线分析永久停摆；经线的 in_flight 只是每
+            # pipeline 一份。
+            acquired = False
+            try:
+                shared.acquire()
+                acquired = True
+                _weft_executor.submit(
+                    self._weft_task_shared_guarded,
+                    shared, filename, camera_name, camera_sn,
+                )
+            except BaseException as e:
+                if acquired:
+                    shared.release()
+                with _weft_queue_lock:
+                    _weft_queue_depth = max(0, _weft_queue_depth - 1)
+                self._weft_cache.reset_inflight()
+                with self._lock:
+                    self._stats["weft_task_submit_failed"] += 1
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                error(
+                    f"[纬线检测] 任务提交失败 file={filename}，"
+                    f"已回滚队列深度与 in_flight: {e!r}"
+                )
+            else:
+                with self._lock:
+                    self._stats["weft_task_submitted"] += 1
         else:
             # 归还队列深度计数（任务未实际提交）
             with _weft_queue_lock:
@@ -668,15 +723,23 @@ class DetectionPipeline:
             "weft_interval":        self._weft_interval,
             "warp_submitted":       stats["warp_task_submitted"],
             "warp_skipped":         stats["warp_task_skipped"],
+            "warp_submit_failed":   stats["warp_task_submit_failed"],
             "warp_cache_updates":   self._warp_cache.total,
             "warp_cache_hits":      self._warp_cache.hit,
             "weft_submitted":       stats["weft_task_submitted"],
             "weft_skipped":         stats["weft_task_skipped"],
             "weft_depth_dropped":   stats["weft_task_depth_dropped"],
+            "weft_submit_failed":   stats["weft_task_submit_failed"],
             "weft_cache_updates":   self._weft_cache.total,
             "weft_cache_hits":      self._weft_cache.hit,
             "weft_queue_depth_now": _weft_queue_depth,
             "weft_queue_depth_max": WEFT_MAX_QUEUE_DEPTH,
+            # 这两个是"卡死"的直接信号：正常情况下它们随任务提交/完成在
+            # True/False 之间跳。若某次心跳里为 True、且对应的 *_submitted
+            # 和 *_cache_updates 连续几轮都不再增长，说明任务体没有正常收尾
+            # （典型是 CUDA 卡住），分析已经停摆。
+            "warp_in_flight":       self._warp_cache.in_flight,
+            "weft_in_flight":       self._weft_cache.in_flight,
         }
 
         stats["stop_summary"] = {
