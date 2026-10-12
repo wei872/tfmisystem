@@ -743,6 +743,94 @@ def get_camera_default_confidence(camera_name):
         return None
 
 
+def effective_stop_gate(det_threshold, stop_min_conf):
+    """有效停机门槛 = max(检测阈值, 停机 min_confidence)。
+
+    为什么是 max：停机判定吃的是**过滤后**的框
+    （detection_manager 里 ``for box in result.boxes``，而 result.boxes 是
+    ``_filter_boxes`` 的输出），一个框要停机必须同时满足
+    ``conf >= 检测阈值`` 和 ``conf >= 停机阈值``，所以真正把关的是两者中较高的那个。
+
+    推论（很重要）：
+      * 检测阈值 **高于** 停机阈值时，检测阈值才是实际把关的那道 ——
+        降它会直接让停机变频繁；
+      * 检测阈值 **低于** 停机阈值时，由停机阈值把关 —— 再怎么降都不影响停机。
+
+    例：多股线 检测 0.65 / 停机 0.70 → 门槛 0.70，检测降到 0.2 门槛仍是 0.70。
+        油点线 检测 0.85 / 停机 0.50 → 门槛 0.85，检测降到 0.3 门槛掉到 0.50。
+    """
+    d = _safe_float(det_threshold)
+    s = _safe_float(stop_min_conf)
+    if d is None and s is None:
+        return None
+    if d is None:
+        return s
+    if s is None:
+        return d
+    return max(d, s)
+
+
+def _safe_float(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def check_camera_threshold_stop_impact(camera_names,
+                                       global_thresholds,
+                                       global_default,
+                                       stop_conf_lookup):
+    """检查按相机覆盖是否**改变了停机行为**。
+
+    :param camera_names:     要检查的相机名列表
+    :param global_thresholds: 全局按类阈值 dict
+    :param global_default:   全局默认阈值
+    :param stop_conf_lookup: ``class_name -> 停机 min_confidence 或 None`` 的
+                             可调用对象。用注入而不是直接 import
+                             StopMachineService，是为了避免 settings ↔
+                             services 的循环导入。
+    :return: list of dict，每项描述一处停机行为变化；空列表表示没有影响。
+
+    返回项字段：camera / class_name / det_before / det_after /
+                stop_conf / gate_before / gate_after / effect
+    """
+    global_thresholds = dict(global_thresholds or {})
+    out = []
+    for name in camera_names or []:
+        block = get_camera_threshold_override(name)
+        if not block:
+            continue
+        eff = describe_camera_thresholds(name, global_thresholds)
+        for cls, det_after in eff.items():
+            if cls == "<default>":
+                continue
+            try:
+                stop_conf = stop_conf_lookup(cls)
+            except Exception:
+                stop_conf = None
+            if stop_conf is None:
+                continue            # 该类没有停机规则，不影响停机
+            det_before = _safe_float(global_thresholds.get(cls, global_default))
+            gb = effective_stop_gate(det_before, stop_conf)
+            ga = effective_stop_gate(det_after, stop_conf)
+            if gb is None or ga is None or abs(ga - gb) < 1e-9:
+                continue
+            out.append({
+                "camera": name,
+                "class_name": cls,
+                "det_before": det_before,
+                "det_after": _safe_float(det_after),
+                "stop_conf": _safe_float(stop_conf),
+                "gate_before": gb,
+                "gate_after": ga,
+                "effect": "停机会变频繁" if ga < gb else "停机会变少",
+            })
+    return out
+
+
 def describe_camera_thresholds(camera_name, global_thresholds) -> Dict:
     """算出某台相机**实际生效**的阈值表，供启动时打印。
 

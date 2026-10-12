@@ -795,37 +795,82 @@ def _print_stop_rules() -> None:
 
 
 def _print_camera_thresholds() -> None:
-    """打印每台相机**实际生效**的置信度阈值。
+    """打印每台相机**实际生效**的检测阈值，并交叉校验停机行为是否被改变。
 
-    按相机覆盖有个容易踩的坑：相机级 ``default_class_confidence`` 会盖掉
-    全局的按类阈值（例如给 camera3 配 0.15，全局的「油点线: 0.85」在
-    camera3 上也变成 0.15）。所以启动时把生效值全部打出来，让配置意图和
-    实际行为能当场对上，而不是等现场漏检了才发现。
+    两件事必须在启动时就看清楚：
+
+    1. **相机级 default 会盖掉全局的按类阈值**。给 camera3 配 0.15，全局的
+       「油点线: 0.85」在 camera3 上也变成 0.15。
+    2. **降检测阈值可能连带改变停机行为**。停机判定吃的是过滤后的框
+       （detection_manager 里 `for box in result.boxes`，而 result.boxes 是
+       _filter_boxes 的输出），所以：
+
+           有效停机门槛 = max(该相机检测阈值, 该类停机 min_confidence)
+
+       检测阈值高于停机阈值时，它是实际把关的那道，降它就会让停机变频繁；
+       检测阈值低于停机阈值时，停机阈值把关，怎么降都不影响停机。
+       例：多股线 检测 0.65 / 停机 0.70 → 有效门槛 0.70，把检测降到 0.2
+       有效门槛仍是 0.70，停机行为不变。而油点线 检测 0.85 / 停机 0.50 →
+       有效门槛 0.85，把检测降到 0.3 会让有效门槛掉到 0.50，停机会变频繁。
     """
     from AnomalyDetection_Tool.config.settings import (
         CLASS_CONFIDENCE_THRESHOLDS, CAMERA_THRESHOLD_OVERRIDES,
         get_default_class_confidence, describe_camera_thresholds,
+        check_camera_threshold_stop_impact,
+    )
+    from AnomalyDetection_Tool.services.stop_machine_service import (
+        StopMachineService,
     )
 
     overrides = dict(CAMERA_THRESHOLD_OVERRIDES or {})
-    if not overrides:
-        info("[阈值] 未配置 camera_threshold_overrides，8 台相机全部使用全局阈值 "
-             f"(default={get_default_class_confidence()})")
-        return
+    global_det = dict(CLASS_CONFIDENCE_THRESHOLDS or {})
+    g_default = get_default_class_confidence()
+
+    def _stop_conf(cls):
+        rule = StopMachineService.get_stop_rule(cls)
+        if not rule or not rule.get("enabled"):
+            return None
+        return rule.get("min_confidence")
+
+    names = sorted(set(CAMERA_SN_MAP.values()))
 
     info("=" * 60)
-    info("[阈值] 按相机覆盖已启用，以下为各相机**实际生效**的阈值：")
-    names = sorted(set(CAMERA_SN_MAP.values()))
-    for name in names:
-        eff = describe_camera_thresholds(name, CLASS_CONFIDENCE_THRESHOLDS)
-        if name in overrides:
-            keys = ", ".join(
-                f"{k}={v}" for k, v in sorted(eff.items(), key=lambda x: str(x[0])))
-            info(f"  {name:<9} [已覆盖] {keys}")
-        else:
-            info(f"  {name:<9} [全局]   default={get_default_class_confidence()}")
-    info("  ⚠ 若某台显示 [已覆盖] 且带 <default>，说明该相机级默认值已盖掉"
-         "全局的按类阈值，请确认这是你的意图。")
+    if not overrides:
+        info("[阈值] 未配置 camera_threshold_overrides，"
+             f"8 台相机全部使用全局检测阈值 (default={g_default})")
+    else:
+        info("[阈值] 按相机覆盖已启用，以下为各相机**实际生效**的检测阈值：")
+        for name in names:
+            eff = describe_camera_thresholds(name, CLASS_CONFIDENCE_THRESHOLDS)
+            if name in overrides:
+                keys = ", ".join(f"{k}={v}" for k, v in
+                                 sorted(eff.items(), key=lambda x: str(x[0])))
+                info(f"  {name:<9} [已覆盖] {keys}")
+            else:
+                info(f"  {name:<9} [全局]   default={g_default}")
+        info("  ⚠ 若某台显示 [已覆盖] 且带 <default>，说明该相机级默认值已盖掉"
+             "全局的按类阈值，请确认这是你的意图。")
+
+    # ---- 交叉校验：有效停机门槛是否被改变 ----
+    # 有效停机门槛 = max(检测阈值, 停机 min_confidence)，因为停机判定吃的是
+    # 过滤后的框。只有这个 max 值变了，停机行为才会变。
+    changed = check_camera_threshold_stop_impact(
+        names, global_det, g_default, _stop_conf)
+
+    info("-" * 60)
+    if changed:
+        info("⚠ 以下覆盖**改变了停机行为**"
+             "（有效停机门槛 = max(检测阈值, 停机阈值)）：")
+        for c in changed:
+            info(f"  {c['camera']} / {c['class_name']}: "
+                 f"检测阈值 {c['det_before']}→{c['det_after']}, "
+                 f"停机阈值 {c['stop_conf']} → "
+                 f"有效门槛 {c['gate_before']}→{c['gate_after']}, {c['effect']}")
+        info("  若不希望影响停机，请把该类检测阈值保持在停机阈值之下"
+             "（此时由停机阈值把关），或同步调整 machine_stop_rules。")
+    else:
+        info("✓ 交叉校验：以上覆盖均未改变停机行为"
+             "（各类的有效停机门槛 max(检测阈值, 停机阈值) 保持不变）")
     info("=" * 60)
 
 

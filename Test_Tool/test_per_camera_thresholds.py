@@ -317,3 +317,131 @@ def test_describe_skips_bad_values(monkeypatch):
     assert eff["多股线"] == 0.65    # 配错的忽略，保留全局
     assert eff["纬线不直"] == 0.25  # 配对的生效
 
+
+# ======================================================================
+#  6. 停机交叉校验：降检测阈值会不会连带改变停机
+# ======================================================================
+#
+# 停机判定吃的是**过滤后**的框（detection_manager 里 for box in result.boxes，
+# 而 result.boxes 是 _filter_boxes 的输出）。所以一个框要停机必须同时满足
+# conf >= 检测阈值 且 conf >= 停机阈值 —— 真正把关的是 max(两者)。
+
+def test_effective_stop_gate_is_max():
+    import AnomalyDetection_Tool.config.settings as st
+
+    assert st.effective_stop_gate(0.65, 0.70) == 0.70
+    assert st.effective_stop_gate(0.85, 0.50) == 0.85
+    assert st.effective_stop_gate(0.50, 0.50) == 0.50
+
+
+def test_effective_stop_gate_handles_missing():
+    import AnomalyDetection_Tool.config.settings as st
+
+    assert st.effective_stop_gate(None, 0.7) == 0.7
+    assert st.effective_stop_gate(0.6, None) == 0.6
+    assert st.effective_stop_gate(None, None) is None
+    assert st.effective_stop_gate("坏值", 0.7) == 0.7
+
+
+def test_user_scenario_duoguoxian_stop_unchanged(monkeypatch):
+    """
+    **用户的确切场景**：camera1 多股线检测阈值改 0.6、camera2 改 0.2，
+    要求"停机阈值一样"。
+
+    多股线的停机 min_confidence 是 0.70，高于全局检测阈值 0.65，所以有效
+    停机门槛本来就是 0.70。把检测阈值降到 0.6 或 0.2，有效门槛仍是 0.70
+    —— **停机行为完全不变**。这条测试就是把用户的诉求钉住。
+    """
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera1": {"class_confidence_thresholds": {"多股线": 0.6}},
+        "camera2": {"class_confidence_thresholds": {"多股线": 0.2}},
+    })
+    stop = {"多股线": 0.70}          # 取自 config.yaml machine_stop_rules
+
+    changed = st.check_camera_threshold_stop_impact(
+        ["camera1", "camera2", "camera3"], GLOBAL, GLOBAL_DEFAULT,
+        lambda cls: stop.get(cls))
+
+    assert changed == [], (
+        f"多股线检测阈值降到 0.6/0.2 不应改变停机行为，但报告了变化: {changed}")
+
+
+def test_lowering_detection_below_stop_conf_changes_stop(monkeypatch):
+    """
+    反例：油点线 检测 0.85 / 停机 0.50。把检测降到 0.3，有效门槛从 0.85
+    掉到 0.50 —— 停机会变频繁。这正是用户说"停机阈值一样"时要避免的，
+    所以必须被检测出来并告警。
+    """
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera5": {"class_confidence_thresholds": {"油点线": 0.3}},
+    })
+    changed = st.check_camera_threshold_stop_impact(
+        ["camera5"], GLOBAL, GLOBAL_DEFAULT,
+        lambda cls: {"油点线": 0.50}.get(cls))
+
+    assert len(changed) == 1
+    c = changed[0]
+    assert c["camera"] == "camera5" and c["class_name"] == "油点线"
+    assert c["gate_before"] == 0.85 and c["gate_after"] == 0.50
+    assert c["effect"] == "停机会变频繁"
+
+
+def test_raising_detection_above_stop_conf_changes_stop(monkeypatch):
+    """反向：把检测阈值提到停机阈值之上，停机会变少"""
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera3": {"class_confidence_thresholds": {"多股线": 0.95}},
+    })
+    changed = st.check_camera_threshold_stop_impact(
+        ["camera3"], GLOBAL, GLOBAL_DEFAULT,
+        lambda cls: {"多股线": 0.70}.get(cls))
+
+    assert len(changed) == 1
+    assert changed[0]["gate_before"] == 0.70
+    assert changed[0]["gate_after"] == 0.95
+    assert changed[0]["effect"] == "停机会变少"
+
+
+def test_class_without_stop_rule_never_reported(monkeypatch):
+    """没有停机规则的类（如蚊虫小黑点）怎么改都不影响停机"""
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera3": {"class_confidence_thresholds": {"蚊虫小黑点": 0.01}},
+    })
+    changed = st.check_camera_threshold_stop_impact(
+        ["camera3"], GLOBAL, GLOBAL_DEFAULT, lambda cls: None)
+    assert changed == []
+
+
+def test_camera_without_override_never_reported(monkeypatch):
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera1": {"class_confidence_thresholds": {"多股线": 0.6}},
+    })
+    changed = st.check_camera_threshold_stop_impact(
+        ["camera2", "camera7"], GLOBAL, GLOBAL_DEFAULT,
+        lambda cls: {"多股线": 0.70}.get(cls))
+    assert changed == []
+
+
+def test_stop_lookup_raising_is_tolerated(monkeypatch):
+    """停机规则查询抛异常时按"没有停机规则"处理，不能把启动打印搞崩"""
+    import AnomalyDetection_Tool.config.settings as st
+
+    monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+        "camera3": {"class_confidence_thresholds": {"多股线": 0.6}},
+    })
+
+    def _boom(cls):
+        raise RuntimeError("rules exploded")
+
+    assert st.check_camera_threshold_stop_impact(
+        ["camera3"], GLOBAL, GLOBAL_DEFAULT, _boom) == []
+
