@@ -496,6 +496,635 @@ camera_threshold_overrides:
       经线毛球  : 0.5
 
 # ------------------------------------------------------------------
+# 按相机覆盖的停机规则  [热更新]
+# ------------------------------------------------------------------
+# 上面 machine_stop_rules 是按类别的**全局**停机规则。这一段允许逐台相机
+# 覆盖，语义是**逐键覆盖**：只写出来的键生效，没写的键沿用全局。
+# 例如只写 min_confidence，不会把 min_width_mm / min_height_mm 弄丢。
+#
+# 下面 8 台已全部展开，每台的初始值 = 上面 machine_stop_rules 的当前值，
+# 也就是**行为与不配置时完全一致**。要调哪台就改哪台的数，改完不用重启。
+#
+# ⚠️ 展开之后，改上面全局的 machine_stop_rules 对这 8 台**不再生效**。
+#    要改就改对应相机那一段，或者 8 段一起改。
+#
+# 可以覆盖的键（白名单，其余一律忽略并在日志告警）：
+#   enabled          true/false —— 该相机上这个类要不要停机
+#   min_confidence   停机置信度门槛
+#   trigger_mode     area（按面积）/ dimension（按框长宽）
+#   min_area_mm2     area 模式的面积下限
+#   min_width_mm     dimension 模式的宽度下限
+#   min_height_mm    dimension 模式的高度下限
+#   min_gradient_ratio
+#
+# 与检测阈值的关系：
+#   有效停机门槛 = max(该相机检测阈值, 该相机停机 min_confidence)
+#   两边现在都能按相机调，所以调任一边都要看这个 max 有没有变。
+#   启动日志会分别打印两处交叉校验结果。
+#
+camera_stop_rule_overrides:
+  camera1:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera2:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera3:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera4:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera5:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera6:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera7:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+  camera8:
+    rules:
+      飘絮:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 130
+      棉团:
+        enabled       : true
+        min_confidence: 0.75
+        min_area_mm2  : 69
+      纬线杂质:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 62
+      经线毛球:
+        enabled       : true
+        min_confidence: 0.1
+        min_area_mm2  : 60
+      单根包不进:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_height_mm : 47.0
+      包边不良:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.9
+        min_width_mm  : 10.0
+        min_height_mm : 10.0
+      捻接器接头:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      多股线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.7
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      油点线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 70.0
+        min_height_mm : 70.0
+      小尾巴:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 20.0
+        min_height_mm : 20.0
+      纬线不直:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 30.0
+        min_height_mm : 30.0
+      包边不重叠:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.56
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      短废纱线:
+        enabled       : true
+        trigger_mode  : dimension
+        min_confidence: 0.5
+        min_width_mm  : 50.0
+        min_height_mm : 50.0
+      蚊虫小黑点:
+        enabled: false
+      稀缝:
+        enabled: false
+
+# ------------------------------------------------------------------
 # 保存配置
 # ------------------------------------------------------------------
 save:

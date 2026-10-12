@@ -533,7 +533,10 @@ class YOLODetectionManager:
                 continue
 
             # ── 按 trigger_mode 路由到不同分析方法 ───────────────
-            rule = StopMachineService.get_stop_rule(box.class_name)
+            # 必须传 camera_name：trigger_mode / min_confidence 现在都能
+            # 按相机覆盖，路由要跟着生效的那份规则走。
+            rule = StopMachineService.get_stop_rule(box.class_name,
+                                                    camera_name)
             trigger_mode = (rule or {}).get("trigger_mode", "area")
 
             if trigger_mode == "dimension":

@@ -758,37 +758,82 @@ def _init_health_monitor() -> None:
     )
 
 
+def _format_stop_rule_parts(rule: dict) -> str:
+    """把一条停机规则渲染成 ``conf>=0.7 + 宽>=30mm + 高>=30mm`` 这样的串。
+
+    全局和按相机两段打印共用同一个渲染，保证"看到的"和"生效的"是同一套逻辑。
+    """
+    trigger_mode = rule.get("trigger_mode", "area")  # 默认按面积
+    conf = rule.get("min_confidence", 0.85)
+
+    if trigger_mode == "dimension":
+        min_w = rule.get("min_width_mm", 0)
+        min_h = rule.get("min_height_mm", 0)
+        parts = [f"conf>={conf}"]
+        if min_w > 0:
+            parts.append(f"宽>={min_w}mm")
+        if min_h > 0:
+            parts.append(f"高>={min_h}mm")
+    else:
+        parts = [
+            f"conf>={conf}",
+            f"area>={rule.get('min_area_mm2', 80)}mm²",
+        ]
+        gr = rule.get("min_gradient_ratio")
+        if gr:
+            parts.append(f"GR>={gr}")
+    return " + ".join(parts)
+
+
 def _print_stop_rules() -> None:
-    """打印当前生效的停机规则"""
+    """打印当前生效的停机规则，并把**与全局不同的那几台相机**单独列出来。
+
+    停机规则现在可以按相机覆盖（camera_stop_rule_overrides）。覆盖之后
+    "改全局"对已覆盖的相机不再生效，这个后果必须在启动时就看得见，
+    不能等到现场发现某台相机行为对不上。
+    """
+    from AnomalyDetection_Tool.config.settings import (
+        describe_camera_stop_rules, check_camera_stop_rule_impact,
+    )
+
     info("=" * 60)
     info("运行中（大恒 Galaxy SDK）| 停机规则:")
-    for cls, rule in MACHINE_STOP_RULES.get("rules", {}).items():
+
+    global_rules = MACHINE_STOP_RULES.get("rules", {}) or {}
+    for cls, rule in global_rules.items():
         # rule 为 None 表示该类别禁用
-        if rule is None or not rule.get("enabled", True):
+        if not isinstance(rule, dict) or not rule.get("enabled", True):
             info(f"  {cls}: 已禁用")
             continue
+        info(f"  {cls}: {_format_stop_rule_parts(rule)}")
 
-        trigger_mode = rule.get("trigger_mode", "area")  # 默认按面积
-        conf = rule.get("min_confidence", 0.85)
+    names = sorted(set(CAMERA_SN_MAP.values()))
+    changed = check_camera_stop_rule_impact(names)
 
-        if trigger_mode == "dimension":
-            min_w = rule.get("min_width_mm", 0)
-            min_h = rule.get("min_height_mm", 0)
-            parts = [f"conf>={conf}"]
-            if min_w > 0:
-                parts.append(f"宽>={min_w}mm")
-            if min_h > 0:
-                parts.append(f"高>={min_h}mm")
-        else:
-            parts = [
-                f"conf>={conf}",
-                f"area>={rule.get('min_area_mm2', 80)}mm²",
-            ]
-            gr = rule.get("min_gradient_ratio")
-            if gr:
-                parts.append(f"GR>={gr}")
-
-        info(f"  {cls}: {' + '.join(parts)}")
+    info("-" * 60)
+    if not changed:
+        info("✓ 按相机停机规则：8 台与全局完全一致"
+             "（未配置或与 machine_stop_rules 逐项相同）")
+    else:
+        info(f"⚠ 以下相机的停机规则**与全局不同**（共 {len(changed)} 处）：")
+        for c in changed:
+            info(f"  {c['camera']} / {c['class_name']} / {c['field']}: "
+                 f"{c['global_value']} → {c['camera_value']}，{c['effect']}")
+            # 必须同时报有效门槛：光看停机字段会误导。把停机 0.7 降到 0.5，
+            # 若该相机检测阈值是 0.65，真实门槛只从 0.7 掉到 0.65。
+            info(f"      ↳ {c['gate_effect']}"
+                 f"（该相机 {c['class_name']} 检测阈值 {c['det_threshold']}）")
+        # 只把真正被改过的相机整段打出来，避免 8 台全量刷屏
+        for name in sorted({c["camera"] for c in changed}):
+            info(f"  [{name}] 实际生效：")
+            for cls, eff in describe_camera_stop_rules(name).items():
+                if eff is None:
+                    info(f"    {cls}: 已禁用")
+                else:
+                    mark = "  ← 已覆盖" if eff.get("<camera_override>") else ""
+                    info(f"    {cls}: {_format_stop_rule_parts(eff)}{mark}")
+        info("  注意：已覆盖的项**不再跟随全局 machine_stop_rules 的修改**，"
+             "要改请改对应相机那一段。")
 
     info("按 'q' 退出")
     info("=" * 60)
@@ -816,7 +861,7 @@ def _print_camera_thresholds() -> None:
     from AnomalyDetection_Tool.config.settings import (
         CLASS_CONFIDENCE_THRESHOLDS, CAMERA_THRESHOLD_OVERRIDES,
         get_default_class_confidence, describe_camera_thresholds,
-        check_camera_threshold_stop_impact,
+        check_camera_threshold_stop_impact, stop_rule_min_confidence,
     )
     from AnomalyDetection_Tool.services.stop_machine_service import (
         StopMachineService,
@@ -826,11 +871,17 @@ def _print_camera_thresholds() -> None:
     global_det = dict(CLASS_CONFIDENCE_THRESHOLDS or {})
     g_default = get_default_class_confidence()
 
-    def _stop_conf(cls):
-        rule = StopMachineService.get_stop_rule(cls)
-        if not rule or not rule.get("enabled"):
+    def _stop_conf(cls, cam=None):
+        # 停机规则现在也能按相机覆盖，所以这里必须带相机名。
+        # 不带的话交叉校验会拿全局停机值去比，算出的有效门槛是错的。
+        # settings 里用 inspect 探测签名，两个参数才会被传进来。
+        rule = StopMachineService.get_stop_rule(cls, cam)
+        if not rule:
             return None
-        return rule.get("min_confidence")
+        # 用 stop_rule_min_confidence 而不是 .get("min_confidence")：
+        # 规则里没写 min_confidence 时后者返回 None，会被当成"没有停机规则"，
+        # 于是漏报。默认值 area 0.85 / dimension 0.5 由那个函数按 trigger_mode 补。
+        return stop_rule_min_confidence(rule)
 
     names = sorted(set(CAMERA_SN_MAP.values()))
 

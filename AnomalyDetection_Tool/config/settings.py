@@ -20,6 +20,7 @@ import os
 import sys
 import copy
 import time
+import inspect
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -620,6 +621,24 @@ DEFAULT_DETECT_CONFIG = _get("default_detect", {
 # 🔥 热更新：改 config.yaml 里的阈值后约 2 秒生效，无需重启
 MACHINE_STOP_RULES = _LiveDict("machine_stop_rules", {})
 
+# ----------------------------------------------------------------
+# 按相机覆盖的停机规则
+# ----------------------------------------------------------------
+# 结构（见 config.yaml 注释）：
+#   camera_stop_rule_overrides:
+#     camera1:
+#       rules:
+#         多股线:
+#           min_confidence: 0.7
+#           min_width_mm: 30.0
+#
+# 语义是**逐键覆盖**：只写出来的键生效，没写的键沿用全局
+# machine_stop_rules.rules.<类>。所以配了 min_confidence 不会把
+# min_width_mm 弄丢。
+#
+# 同样走 _LiveDict，改完 config.yaml 不用重启就生效。
+CAMERA_STOP_RULE_OVERRIDES = _LiveDict("camera_stop_rule_overrides", {})
+
 # ================================================================
 # 热力图 / 掩膜配置
 # ================================================================
@@ -779,6 +798,329 @@ def _safe_float(v):
         return None
 
 
+# ----------------------------------------------------------------
+# 按相机停机规则的解析
+# ----------------------------------------------------------------
+
+# 允许按相机覆盖的键。**白名单**：不在名单里的一律忽略并告警。
+# 停机规则写错是会真停机的，所以笔误必须被挡下来，不能悄悄生效。
+_STOP_RULE_NUMERIC_KEYS = (
+    "min_confidence", "min_area_mm2", "min_width_mm", "min_height_mm",
+    "min_gradient_ratio",
+)
+_STOP_RULE_BOOL_KEYS = ("enabled",)
+_STOP_RULE_STR_KEYS = ("trigger_mode",)
+
+
+def get_camera_stop_rule_override(camera_name, class_name) -> Optional[Dict]:
+    """🔥 热更新：取某台相机对某个类的停机规则覆盖块；没有则返回 None。
+
+    返回 None 的三种情况都当作"这台相机对该类没有覆盖"，一律回落全局：
+    没配这台相机 / 配了但 ``rules`` 不是 dict / 配了但该类那一项不是 dict。
+    （T16 的教训：YAML 少写一个冒号就会让整块变成字符串，且不报错。）
+    """
+    if not camera_name or not class_name:
+        return None
+    try:
+        cam = CAMERA_STOP_RULE_OVERRIDES.get(str(camera_name))
+    except Exception:
+        return None
+    if not isinstance(cam, dict):
+        return None
+    rules = cam.get("rules")
+    if not isinstance(rules, dict):
+        return None
+    block = rules.get(str(class_name))
+    return block if isinstance(block, dict) else None
+
+
+def _sanitise_stop_rule_block(block, where: str) -> Dict:
+    """剔除覆盖块里的非法值，并逐项告警。
+
+    非法项被**丢弃**（该项回落全局值），而不是让整个覆盖块失效——
+    否则一个笔误会让这台相机所有按相机停机配置静默消失，更难查。
+    """
+    out = {}
+    for k, v in (block or {}).items():
+        if k in _STOP_RULE_BOOL_KEYS:
+            out[k] = bool(v)
+        elif k in _STOP_RULE_NUMERIC_KEYS:
+            f = _safe_float(v)
+            if f is None:
+                warning(f"[配置] {where}.{k} = {v!r} 不是数字，已忽略该项")
+            else:
+                out[k] = f
+        elif k in _STOP_RULE_STR_KEYS:
+            out[k] = str(v)
+        else:
+            warning(f"[配置] {where}.{k} 不是可覆盖的停机规则字段，已忽略")
+    return out
+
+
+def effective_stop_rule(class_name, camera_name=None, stop_rules=None) -> Optional[Dict]:
+    """算出**某台相机上某个类实际生效**的停机规则。
+
+    合并顺序：全局 ``machine_stop_rules.rules.<类>`` → 按相机覆盖（逐键覆盖）。
+    返回的是**副本**，调用方改它不会污染配置本体。
+
+    返回 None 表示"这台相机上这个类不停机"，可能是：
+      * 总开关 ``machine_stop_rules.enabled`` 为 false（最高优先，
+        任何按相机覆盖都不能绕过它）；
+      * 该类既没有全局规则，也没有按相机规则；
+      * 全局或按相机把 ``enabled`` 置为 false。
+
+    :param class_name:  类别名
+    :param camera_name: 相机名。**传 None 时行为与改动前完全一致**
+                        （纯全局规则），这是向后兼容的关键。
+    :param stop_rules:  停机规则 dict，默认取 ``MACHINE_STOP_RULES``。
+                        测试时注入，免得依赖全局配置状态。
+    """
+    rules = MACHINE_STOP_RULES if stop_rules is None else stop_rules
+    try:
+        if not rules.get("enabled", False):
+            return None          # 总开关关着，谁也不能停
+        global_rules = rules.get("rules", {}) or {}
+        base_rule = global_rules.get(class_name)
+    except Exception:
+        warning(f"[停机规则] 读取 {class_name} 的全局规则失败，按不停机处理")
+        return None
+
+    if isinstance(base_rule, dict):
+        base = dict(base_rule)
+    elif base_rule is None:
+        base = {}
+    else:
+        # config.yaml 里写了 "某类:" 但下面没内容 → None 之外的怪值
+        warning(f"[停机规则] {class_name} 的全局规则不是字典"
+                f"（{type(base_rule).__name__}），已忽略")
+        base = {}
+
+    ovr = get_camera_stop_rule_override(camera_name, class_name)
+    if ovr:
+        base.update(_sanitise_stop_rule_block(
+            ovr, f"camera_stop_rule_overrides.{camera_name}.rules.{class_name}"))
+
+    if not base:
+        return None
+    if not base.get("enabled", True):
+        return None
+    return base
+
+
+def stop_rule_min_confidence(rule):
+    """取一条停机规则的置信度门槛，**含隐式默认值**。
+
+    必须与 StopMachineService 里的兜底保持一致：
+    ``rule.get("min_confidence", 0.85)``（area 模式）和
+    ``rule.get("min_confidence", 0.5)``（dimension 模式）。
+
+    为什么需要它：规则里没写 min_confidence 时，直接 ``.get()`` 会拿到 None，
+    于是被当成"没有停机规则"，算出来的有效门槛就是错的。当前 config.yaml
+    里 15 个类都显式写了，所以现在不会踩到；但这是隐患，不能靠"现在没写错"。
+    """
+    if not isinstance(rule, dict) or not rule:
+        # 空 dict 表示"根本没有规则"（例如该相机把这个类禁用了），
+        # 不能套用默认值——那会凭空算出一个 0.85 的门槛。
+        return None
+    v = _safe_float(rule.get("min_confidence"))
+    if v is not None:
+        return v
+    return 0.5 if rule.get("trigger_mode", "area") == "dimension" else 0.85
+
+
+def describe_camera_stop_rules(camera_name, stop_rules=None) -> Dict:
+    """算出某台相机**实际生效**的停机规则表，供启动时打印。
+
+    返回 ``{类名: 生效规则 dict 或 None}``；None 表示该类在这台相机上不停机。
+    覆盖过的类会带一个 ``"<camera_override>"`` 标记键，方便一眼看出哪台被改过。
+    """
+    rules = MACHINE_STOP_RULES if stop_rules is None else stop_rules
+    out = {}
+    classes = []
+    try:
+        classes = list((rules.get("rules", {}) or {}).keys())
+    except Exception:
+        classes = []
+    cam = None
+    try:
+        cam = CAMERA_STOP_RULE_OVERRIDES.get(str(camera_name)) if camera_name else None
+    except Exception:
+        cam = None
+    if isinstance(cam, dict) and isinstance(cam.get("rules"), dict):
+        for k in cam["rules"]:
+            if k not in classes:
+                classes.append(k)
+
+    for cls in classes:
+        eff = effective_stop_rule(cls, camera_name, stop_rules=rules)
+        if eff is None:
+            out[cls] = None
+            continue
+        if get_camera_stop_rule_override(camera_name, cls):
+            eff = dict(eff)
+            eff["<camera_override>"] = True
+        out[cls] = eff
+    return out
+
+
+def check_camera_stop_rule_impact(camera_names, stop_rules=None):
+    """列出**所有"按相机停机规则与全局不一致"的项**。
+
+    与 :func:`check_camera_threshold_stop_impact` 不同：那个检查的是
+    "改检测阈值会不会连带影响停机"，这个检查的是"停机规则本身被改了没有"。
+
+    比较的是**生效值**（``effective_stop_rule`` 的输出）而不是配置里的原始键。
+    这一点很关键：``trigger_mode`` 缺省时隐式为 "area"、``min_confidence``
+    缺省时 area 模式取 0.85 / dimension 模式取 0.5。直接比原始键会漏掉
+    "全局没写、按相机写了" 这种情况——而那恰恰是行为真的变了。
+
+    :return: list of dict，字段 camera / class_name / field /
+             global_value / camera_value / effect；空列表 = 与全局完全一致。
+    """
+    rules = MACHINE_STOP_RULES if stop_rules is None else stop_rules
+    out = []
+    for name in camera_names or []:
+        try:
+            cam = CAMERA_STOP_RULE_OVERRIDES.get(str(name))
+        except Exception:
+            cam = None
+        if not isinstance(cam, dict) or not isinstance(cam.get("rules"), dict):
+            continue
+        for cls, raw_block in cam["rules"].items():
+            if not isinstance(raw_block, dict):
+                continue
+            before = effective_stop_rule(cls, None, stop_rules=rules) or {}
+            after = effective_stop_rule(cls, name, stop_rules=rules) or {}
+
+            # 有效门槛 = max(检测阈值, 停机 min_confidence)。光看停机字段的变化
+            # 会误导：把停机 0.7 降到 0.5，若该相机检测阈值是 0.65，真实门槛
+            # 只从 0.7 掉到 0.65，不是掉到 0.5。所以两处都要报。
+            #
+            # 规则整体不存在时门槛记为 None——不能退化成"只剩检测阈值"，
+            # 那会报出一个根本不存在的停机门槛。
+            det = _camera_det_threshold(name, cls)
+            gate_b = (effective_stop_gate(det, stop_rule_min_confidence(before))
+                      if before else None)
+            gate_a = (effective_stop_gate(det, stop_rule_min_confidence(after))
+                      if after else None)
+
+            # 规则整体"有 → 无"或"无 → 有"，这是最要紧的变化，单独报一条
+            if bool(before) != bool(after):
+                gb, ga = bool(before), bool(after)
+                out.append({
+                    "camera": name, "class_name": cls, "field": "enabled",
+                    "global_value": gb, "camera_value": ga,
+                    "effect": _stop_change_effect("enabled", gb, ga),
+                    "det_threshold": det,
+                    "gate_before": gate_b, "gate_after": gate_a,
+                    "gate_effect": ("该类在这台相机上不再停机，无有效停机门槛"
+                                    if not after else
+                                    f"该类在这台相机上开始停机，有效门槛 {gate_a}"),
+                })
+                continue
+
+            gate_effect = _gate_effect(gate_b, gate_a)
+            for field in sorted(set(before) | set(after)):
+                bv, av = before.get(field), after.get(field)
+                if bv is None and av is None:
+                    continue
+                if _stop_values_equal(bv, av):
+                    continue
+                out.append({
+                    "camera": name,
+                    "class_name": cls,
+                    "field": field,
+                    "global_value": bv,
+                    "camera_value": av,
+                    "effect": _stop_change_effect(field, bv, av),
+                    "det_threshold": det,
+                    "gate_before": gate_b,
+                    "gate_after": gate_a,
+                    "gate_effect": gate_effect,
+                })
+    return out
+
+
+def _camera_det_threshold(camera_name, class_name):
+    """该相机上该类的**生效检测阈值**；取不到返回 None。
+
+    用于把停机规则的变化换算成有效停机门槛的变化。
+    """
+    try:
+        eff = describe_camera_thresholds(camera_name, CLASS_CONFIDENCE_THRESHOLDS)
+        return _safe_float(eff.get(class_name, get_default_class_confidence()))
+    except Exception:
+        return None
+
+
+def _gate_effect(gate_before, gate_after):
+    """把有效门槛的前后变化说成一句人话。"""
+    if gate_before is None or gate_after is None:
+        return "无法计算有效门槛（缺检测阈值或停机阈值）"
+    if abs(gate_after - gate_before) < 1e-9:
+        return f"有效门槛不变（{gate_before}）"
+    return (f"有效门槛 {gate_before}→{gate_after}，"
+            + ("停机会变频繁" if gate_after < gate_before else "停机会变少"))
+
+
+def _stop_values_equal(a, b):
+    fa, fb = _safe_float(a), _safe_float(b)
+    if fa is not None and fb is not None:
+        return abs(fa - fb) < 1e-9
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    return a == b
+
+
+def _stop_change_effect(field, g_val, cam_val):
+    """用一句话说明这处改动的后果。方向搞反会让人误判风险，所以单独测。"""
+    if field == "enabled":
+        return "该类会停机" if cam_val else "该类不再停机"
+    if field == "trigger_mode":
+        # 缺省时隐式为 area，显示成 area 比显示 None 有用
+        g_show = g_val if g_val is not None else "area"
+        c_show = cam_val if cam_val is not None else "area"
+        return f"停机判定方式 {g_show}→{c_show}"
+    if field == "min_confidence":
+        gf, cf = _safe_float(g_val), _safe_float(cam_val)
+        if gf is None or cf is None:
+            return "停机门槛变化"
+        if abs(cf - gf) < 1e-9:
+            return "无变化"
+        return "停机会变少" if cf > gf else "停机会变频繁"
+    if field in ("min_area_mm2", "min_width_mm", "min_height_mm"):
+        gf, cf = _safe_float(g_val), _safe_float(cam_val)
+        if gf is None or cf is None:
+            return "尺寸条件变化"
+        if abs(cf - gf) < 1e-9:
+            return "无变化"
+        return "停机会变少" if cf > gf else "停机会变频繁"
+    return "停机条件变化"
+
+
+def _stop_conf_lookup_takes_camera(fn) -> bool:
+    """判断注入的 ``stop_conf_lookup`` 能不能接受 camera_name。
+
+    T15 的签名是 ``(class_name)``；T17 起停机规则也能按相机覆盖，所以支持
+    ``(class_name, camera_name)``。**两种都必须能用** —— 否则升级 settings
+    会让所有还按老签名注入的调用点直接炸掉。
+    """
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        # 不只是 (TypeError, ValueError)：任何探测失败都按老签名调。
+        # 这个函数在启动打印路径上，探测失败不能把启动流程带崩。
+        return False
+    n_pos = 0
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True     # *args，怎么传都行
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            n_pos += 1
+    return n_pos >= 2
+
+
 def check_camera_threshold_stop_impact(camera_names,
                                        global_thresholds,
                                        global_default,
@@ -788,16 +1130,19 @@ def check_camera_threshold_stop_impact(camera_names,
     :param camera_names:     要检查的相机名列表
     :param global_thresholds: 全局按类阈值 dict
     :param global_default:   全局默认阈值
-    :param stop_conf_lookup: ``class_name -> 停机 min_confidence 或 None`` 的
-                             可调用对象。用注入而不是直接 import
-                             StopMachineService，是为了避免 settings ↔
-                             services 的循环导入。
+    :param stop_conf_lookup: 取停机 ``min_confidence`` 的可调用对象，取不到
+                             返回 None。可以是 ``(class_name)``，也可以是
+                             ``(class_name, camera_name)`` —— 后者用于停机
+                             规则本身也按相机覆盖的情况（T17）。
+                             用注入而不是直接 import StopMachineService，
+                             是为了避免 settings ↔ services 的循环导入。
     :return: list of dict，每项描述一处停机行为变化；空列表表示没有影响。
 
     返回项字段：camera / class_name / det_before / det_after /
                 stop_conf / gate_before / gate_after / effect
     """
     global_thresholds = dict(global_thresholds or {})
+    takes_camera = _stop_conf_lookup_takes_camera(stop_conf_lookup)
     out = []
     for name in camera_names or []:
         block = get_camera_threshold_override(name)
@@ -808,7 +1153,8 @@ def check_camera_threshold_stop_impact(camera_names,
             if cls == "<default>":
                 continue
             try:
-                stop_conf = stop_conf_lookup(cls)
+                stop_conf = (stop_conf_lookup(cls, name) if takes_camera
+                             else stop_conf_lookup(cls))
             except Exception:
                 stop_conf = None
             if stop_conf is None:

@@ -16,7 +16,7 @@ from General_Tool.EnhancedLogger import info, error
 
 from AnomalyDetection_Tool.config.settings import (
     MACHINE_STOP_RULES, STOP_ANALYSIS_MODE, PIXEL_TO_MM,
-    MACHINE_STOP_PATH, validate_analysis_mode,
+    MACHINE_STOP_PATH, validate_analysis_mode, effective_stop_rule,
 )
 from AnomalyDetection_Tool.models.data_types import (
     DetectionBox, AreaAnalysisResult, BoxAnalysisEntry,
@@ -159,7 +159,7 @@ class StopMachineService:
 
         default = AreaAnalysisResult()
 
-        rule = self.get_stop_rule(box.class_name)
+        rule = self.get_stop_rule(box.class_name, camera_name)
         if rule is None:
             if log_lines is not None:
                 log_lines.append(
@@ -262,8 +262,8 @@ class StopMachineService:
         """
         default = AreaAnalysisResult()
 
-        # ── 1. 取规则 ──────────────────────────────────────────────
-        rule = self.get_stop_rule(box.class_name)
+        # ── 1. 取规则（按相机）─────────────────────────────────────
+        rule = self.get_stop_rule(box.class_name, camera_name)
         if rule is None:
             if log_lines is not None:
                 log_lines.append(
@@ -484,15 +484,21 @@ class StopMachineService:
         return self.machine_stop_saver
 
     @staticmethod
-    def get_stop_rule(class_name: str) -> Optional[dict]:
-        if not MACHINE_STOP_RULES["enabled"]:
-            return None
-        rules = MACHINE_STOP_RULES.get("rules", {})
-        if class_name in rules:
-            rule = rules[class_name]
-            if rule.get("enabled", True):
-                return rule
-        return None
+    def get_stop_rule(class_name: str,
+                      camera_name: Optional[str] = None) -> Optional[dict]:
+        """取某个类**在某台相机上实际生效**的停机规则。
+
+        合并逻辑全部在 ``settings.effective_stop_rule`` 里——那边不依赖
+        libgxiapi，能脱离现场环境单独测。这里只保留原有入口。
+
+        :param class_name:  类别名
+        :param camera_name: 相机名。**传 None 时行为与改动前完全一致**
+                            （只看全局 machine_stop_rules），所以没升级的
+                            老调用点不受影响。
+        :return: 生效规则的**副本**，或 None（= 这台相机上这个类不停机）。
+                 是副本，改它不会影响配置本体。
+        """
+        return effective_stop_rule(class_name, camera_name)
 
     def get_stats(self) -> dict:
         with self._lock:
