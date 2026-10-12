@@ -32,6 +32,8 @@ CameraRegistry / Modbus.TriggerControlSystem / BackgroundTaskManager 无需改�
 """
 
 import os
+import socket
+import struct
 import sys
 import threading
 import time
@@ -64,6 +66,135 @@ _BAYER8_TO_CV = {
 
 # 丢帧/异常日志的节流间隔（秒），避免每帧刷屏把日志文件打爆
 _LOG_THROTTLE_SEC = 5.0
+
+# GigE Vision 的最小可用包长。低于这个值没有意义（一个 2440x2048 的帧会被
+# 切成上万个包），而且它恰好是以太网标准 MTU，任何链路都保证能过。
+_MIN_SAFE_PACKET_SIZE = 1500
+
+
+def _netmask_to_int(netmask) -> int:
+    """把 psutil 给出的掩码转成整数。
+
+    不同平台/版本给的形式不一样：点分十进制 '255.255.255.0'，
+    也可能是前缀长度的字符串 '24'。两种都要认。认不出来返回 0，
+    让调用方当作"掩码未知"处理，**绝不抛异常**——这个函数在相机启动
+    路径上，抛出去就会把相机启动一起带崩。
+    """
+    try:
+        s = str(netmask).strip()
+        if not s:
+            return 0
+        if "." in s:
+            return struct.unpack("!I", socket.inet_aton(s))[0]
+        # 前缀长度形式
+        prefix = int(s)
+        if prefix <= 0:
+            return 0
+        if prefix >= 32:
+            return 0xFFFFFFFF
+        return ((1 << prefix) - 1) << (32 - prefix)
+    except Exception:
+        return 0
+
+
+def _ip_to_int(ip: str) -> int:
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
+
+
+def _same_subnet(local_ip: str, netmask, peer_ip: str) -> bool:
+    try:
+        mask = _netmask_to_int(netmask)
+        if mask == 0:
+            return False
+        return (_ip_to_int(local_ip) & mask) == (_ip_to_int(peer_ip) & mask)
+    except Exception:
+        return False
+
+
+def probe_link_mtu(ip_address: str) -> int:
+    """探测与给定相机 IP 处于同一网段的本机网卡 MTU。
+
+    **返回 0 表示探测不到**，调用方必须把 0 当作"不要开巨型帧"处理，
+    绝不能当成"MTU 是 0"或"随便用一个大值"。
+
+    为什么必须实测、不能只信 config.yaml 里写的数：
+
+    现场踩过的坑是——交换机巨型帧开着，配置里也写了 8164，但相机实际发出
+    的包超过了链路上某一跳能承载的大小，包被丢弃，表现为"相机启动不起来"
+    或者只出不完整帧。关键在于 ``GevSCPSPacketSize`` 是**相机端**的设置，
+    SDK 的 range_check 只校验它是否落在相机自己支持的范围里，**它完全不知道
+    链路上能过多大的包**。所以这里以本机网卡实测 MTU 作为硬上限。
+    """
+    if not ip_address:
+        return 0
+    target = str(ip_address).strip()
+    if not target:
+        return 0
+
+    try:
+        import psutil
+    except Exception:
+        return 0
+
+    try:
+        stats = psutil.net_if_stats()
+        addrs_all = psutil.net_if_addrs()
+    except Exception:
+        return 0
+
+    for name, addrs in addrs_all.items():
+        st = stats.get(name)
+        if st is None or not getattr(st, "isup", False):
+            continue
+        mtu = int(getattr(st, "mtu", 0) or 0)
+        if mtu <= 0:
+            continue
+        for a in addrs:
+            try:
+                if getattr(a, "family", None) != socket.AF_INET:
+                    continue
+                addr = getattr(a, "address", "") or ""
+                # 相机 IP 就配在本机网卡上（同机直连/回环）：直接用这张网卡
+                if addr == target:
+                    return mtu
+                if _same_subnet(addr, getattr(a, "netmask", None), target):
+                    return mtu
+            except Exception:
+                continue
+    return 0
+
+
+def clamp_packet_size(desired: int, link_mtu: int,
+                      cam_min: int, cam_max: int, cam_inc: int) -> int:
+    """把期望包长收敛成"链路和相机都能接受"的值。返回 0 表示"别改，用相机默认"。
+
+    这是纯函数，所有边界都在这里处理，便于单测：
+
+    * **绝不超过链路实测 MTU**（这是防止"包超过设置值导致起不来"的核心）；
+    * 绝不超过相机支持的最大值，绝不小于相机支持的最小值；
+    * 按相机的步进 ``inc`` **向下**对齐（超一点就退回上一档，不四舍五入）；
+    * 结果低于 1500 时直接返回 0 —— 宁可放弃巨型帧也不要一个没意义的小值。
+
+    ``link_mtu=0`` 表示 MTU 未知，此时**保守退回 1500**，不冒险开巨型帧。
+    """
+    if cam_max <= 0:
+        return 0
+    inc = cam_inc if cam_inc and cam_inc > 0 else 1
+    lo = cam_min if cam_min > 0 else _MIN_SAFE_PACKET_SIZE
+
+    # MTU 未知 → 只允许标准帧
+    cap = link_mtu if link_mtu > 0 else _MIN_SAFE_PACKET_SIZE
+    cap = min(cap, cam_max)
+
+    target = min(int(desired), cap) if desired and desired > 0 else cap
+
+    # 向下对齐到步进
+    if inc > 1:
+        target -= target % inc
+
+    if target < lo or target < _MIN_SAFE_PACKET_SIZE:
+        return 0
+    return target
 
 
 class CameraOperationError(RuntimeError):
@@ -144,6 +275,11 @@ class CameraOperation:
         self._diag_convert_error_count = 0
         self._diag_callback_error_count = 0
         self._diag_last_frame_time = 0.0
+        # ---- GigE 包长实测结果（get_diag_info() 可查）----
+        self._diag_link_mtu = 0            # 探测到的本机网卡 MTU，0=未知
+        self._diag_packet_size_wanted = 0  # 配置里期望的值
+        self._diag_packet_size_applied = 0 # 实际写进相机并回读确认的值
+        self._diag_packet_size_note = ""   # 被降级/放弃的原因
 
     # ==================================================================
     # 内部工具
@@ -179,6 +315,144 @@ class CameraOperation:
             warning(f"设备 {self.st_serial_number} 设置 {name}={value} 失败: {e}")
             return -1
 
+    def _apply_packet_size(self) -> None:
+        """设置 GigE 包长。**契约：绝不抛异常、绝不挡住相机启动。**
+
+        相机启动路径上的任何一步失败都只能降级，不能失败——这正是现场
+        "相机启动不起来"要避免的。所以这里套一层兜底，真正逻辑在
+        :meth:`_apply_packet_size_impl` 里。
+        """
+        try:
+            self._apply_packet_size_impl()
+        except Exception as e:
+            warning(
+                f"设备 {self.st_serial_number} 设置 GigE 包长时发生未预期异常: {e!r}。"
+                f"**已放弃修改包长、沿用相机当前值**，相机照常启动。"
+                f"若随后取不到流，请把 config.yaml 的 packet_size 设为 -1。")
+            self._diag_packet_size_note = f"未预期异常，已放弃修改: {e!r}"
+
+    def _apply_packet_size_impl(self) -> None:
+        """把 ``GevSCPSPacketSize`` 设成链路和相机都能接受的值，并**回读校验**。
+
+        这一整套流程的设计目标是：
+
+        1. **写进相机的包长永远不会超过本机网卡实测 MTU** —— 现场出现过
+           "巨型帧明明开着、但包超过设置值导致相机启动不起来"，根因就是包长
+           只在相机侧校验范围、没人管链路。
+        2. **任何一步失败都不能挡住相机启动**。探测失败、特征不存在、设置
+           失败、回读不一致，一律告警后放弃修改、沿用相机当前值。
+        3. **设置后回读确认**。``set()`` 不抛异常不代表相机真的采纳了，
+           回读值不一致就当作失败并降级。
+
+        config.yaml 里 ``packet_size`` 的三种取值：
+
+        * ``0``  —— 自动：按实测 MTU 取最大安全值（交换机/网卡开了巨型帧
+          就自动用上，没开就自动退回 1500）。
+        * ``>0`` —— 指定值，但**仍然会被实测 MTU 夹紧**，配置写错也不会
+          把链路打挂。
+        * ``-1`` —— 完全不碰这个特征，保留相机出厂/上次保存的值。
+        """
+        self._diag_packet_size_wanted = self.packet_size
+        self._diag_packet_size_applied = 0
+        self._diag_packet_size_note = ""
+
+        if self.packet_size < 0:
+            self._diag_packet_size_note = "config 指定 -1，不修改包长"
+            return
+
+        try:
+            if not self._feature_control.is_implemented("GevSCPSPacketSize"):
+                self._diag_packet_size_note = "设备不支持 GevSCPSPacketSize"
+                return
+            feature = self._feature_control.get_int_feature("GevSCPSPacketSize")
+        except Exception as e:
+            warning(f"设备 {self.st_serial_number} 读取 GevSCPSPacketSize 失败: {e}")
+            self._diag_packet_size_note = f"读取特征失败: {e}"
+            return
+
+        # ---- 相机侧支持范围 ----
+        cam_min, cam_max, cam_inc = 0, 0, 1
+        try:
+            rng = feature.get_range() or {}
+            cam_min = int(rng.get("min", 0) or 0)
+            cam_max = int(rng.get("max", 0) or 0)
+            cam_inc = int(rng.get("inc", 1) or 1)
+        except Exception as e:
+            # 拿不到范围就不猜，保守退回标准帧
+            cam_min, cam_max, cam_inc = _MIN_SAFE_PACKET_SIZE, _MIN_SAFE_PACKET_SIZE, 1
+            self._diag_packet_size_note = f"读取包长范围失败，保守用 1500: {e}"
+
+        # ---- 链路侧实测 MTU（硬上限）----
+        # probe_link_mtu 内部已经兜了异常，但这里再兜一层：它处在相机启动
+        # 路径上，任何逃逸的异常都会让 Open_device 整体失败。
+        try:
+            link_mtu = probe_link_mtu(self.st_ip_address)
+        except Exception as e:
+            warning(f"设备 {self.st_serial_number} 探测链路 MTU 失败: {e!r}，"
+                    f"保守退回标准帧。")
+            link_mtu = 0
+        self._diag_link_mtu = link_mtu
+        if link_mtu <= 0:
+            warning(
+                f"设备 {self.st_serial_number} 探测不到网卡 MTU"
+                f"(camera_ip={self.st_ip_address or '未知'})，"
+                f"保守退回标准帧 {_MIN_SAFE_PACKET_SIZE}，不开巨型帧。"
+                f"若现场确实已开巨型帧，请检查相机 IP 与网卡是否同网段。")
+
+        desired = self.packet_size if self.packet_size > 0 else (
+            link_mtu if link_mtu > 0 else _MIN_SAFE_PACKET_SIZE)
+
+        target = clamp_packet_size(desired, link_mtu, cam_min, cam_max, cam_inc)
+        if target <= 0:
+            warning(
+                f"设备 {self.st_serial_number} 无法确定安全的 GigE 包长"
+                f"(期望={desired}, MTU={link_mtu}, 相机范围={cam_min}~{cam_max}"
+                f" 步进 {cam_inc})，沿用相机当前值，不修改。")
+            self._diag_packet_size_note = "无安全包长可用，未修改"
+            return
+
+        if self.packet_size > 0 and target < self.packet_size:
+            warning(
+                f"设备 {self.st_serial_number} 配置要求包长 {self.packet_size}，"
+                f"但链路实测 MTU={link_mtu}、相机支持上限={cam_max}，"
+                f"**已下调到 {target}** 以避免包超过链路承载导致取不到流。")
+            self._diag_packet_size_note = (
+                f"配置 {self.packet_size} 被下调到 {target}"
+                f"(MTU={link_mtu}, 相机上限={cam_max})")
+
+        # ---- 写入 ----
+        try:
+            feature.set(int(target))
+        except Exception as e:
+            warning(f"设备 {self.st_serial_number} 设置 GevSCPSPacketSize="
+                    f"{target} 失败: {e}，沿用相机当前值。")
+            self._diag_packet_size_note = f"设置 {target} 失败: {e}"
+            return
+
+        # ---- 回读校验：set 不抛异常不等于相机真的采纳了 ----
+        try:
+            actual = int(feature.get())
+        except Exception as e:
+            warning(f"设备 {self.st_serial_number} 回读 GevSCPSPacketSize 失败: {e}，"
+                    f"无法确认是否生效，沿用当前值继续。")
+            self._diag_packet_size_note = f"回读失败，无法确认 {target} 是否生效"
+            return
+
+        if actual != target:
+            # 相机没采纳（可能被固件夹到别的档位）。这是最危险的情况：
+            # 继续往下走可能取不到流，所以明确告警并把实际值记下来。
+            warning(
+                f"设备 {self.st_serial_number} GevSCPSPacketSize 回读不一致："
+                f"期望 {target}，实际 {actual}。**若随后取不到流，"
+                f"请把 config.yaml 的 packet_size 改成 -1 或 {actual}。**")
+            self._diag_packet_size_note = f"回读不一致：期望 {target}，实际 {actual}"
+            self._diag_packet_size_applied = actual
+            return
+
+        self._diag_packet_size_applied = actual
+        info(f"设备 {self.st_serial_number} GigE 包长设为 {actual} "
+             f"(链路 MTU={link_mtu}, 相机范围={cam_min}~{cam_max} 步进 {cam_inc})")
+
     # ==================================================================
     # 打开 / 关闭
     # ==================================================================
@@ -203,8 +477,10 @@ class CameraOperation:
             self._data_stream = cam.data_stream[0]
 
             # ---- GigE 链路参数（仅 GigE 设备有这些特征，不支持则自动跳过）----
-            if self.packet_size > 0:
-                self._set_int("GevSCPSPacketSize", self.packet_size)
+            # 包长必须走 _apply_packet_size()，不能直接 set：
+            # 它会用本机网卡实测 MTU 把值夹紧、并回读确认相机真的采纳了，
+            # 避免"包长超过链路承载 → 相机启动不起来 / 只出不完整帧"。
+            self._apply_packet_size()
             if self.heartbeat_timeout_ms > 0:
                 self._set_int("GevHeartbeatTimeout", self.heartbeat_timeout_ms)
 
@@ -618,5 +894,11 @@ class CameraOperation:
             "convert_error_count": self._diag_convert_error_count,
             "callback_error_count": self._diag_callback_error_count,
             "last_frame_time": self._diag_last_frame_time,
+            # GigE 包长实测结果：packet_size_applied 与 link_mtu 不匹配、
+            # 或 packet_size_note 非空，就是"包长没设对"的直接证据。
+            "link_mtu": self._diag_link_mtu,
+            "packet_size_wanted": self._diag_packet_size_wanted,
+            "packet_size_applied": self._diag_packet_size_applied,
+            "packet_size_note": self._diag_packet_size_note,
             "stream": stream_stats,
         }

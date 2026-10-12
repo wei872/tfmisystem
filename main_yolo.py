@@ -691,9 +691,22 @@ def _camera_diag_provider() -> dict:
             continue
         out[f"{name}.frames"] = d.get("frame_count", 0)
         out[f"{name}.bad"] = d.get("bad_frame_count", 0)
-        lost = (d.get("stream") or {}).get("lost")
+        stream = d.get("stream") or {}
+        lost = stream.get("lost")
         if lost is not None:
             out[f"{name}.lost"] = lost
+        # incomplete 是"包长设得比链路能承载的大"的直接特征：包被丢弃后
+        # 帧收不全。它和 lost 一起看能区分是带宽不够还是包长不对。
+        incomplete = stream.get("incomplete")
+        if incomplete is not None:
+            out[f"{name}.incomplete"] = incomplete
+        # 包长实测结果。applied 明显小于 mtu、或 note 非空，
+        # 说明包长被降级过，需要按 note 里的提示处理。
+        out[f"{name}.mtu"] = d.get("link_mtu", 0)
+        out[f"{name}.pkt"] = d.get("packet_size_applied", 0)
+        note = d.get("packet_size_note") or ""
+        if note:
+            out[f"{name}.pkt_note"] = note
     return out
 
 

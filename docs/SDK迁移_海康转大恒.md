@@ -114,6 +114,52 @@ raw = ctypes.string_at(pData, buff_size)
 - **内存与页面文件**：`buffer_count: 10` 在 8 路 2440×2048 下约占 400MB
   SDK 缓冲，内存紧张时把这个值调小。
 
+### 7. GigE 包长超过链路承载，导致相机启动不起来（已加防护）
+
+**现场事故**：用海康 SDK 时，实际发出的包超过了设置的包长，相机启动不起来，
+而巨型帧模式明明是开着的。
+
+根因：`GevSCPSPacketSize` 是**相机端**的设置。SDK 的 `range_check` 只校验
+它是否落在**相机自己**支持的范围里（`lib/gxipy/Feature.py::IntFeature.set`），
+**它完全不知道链路上能过多大的包**。所以"交换机开了巨型帧 + 配置写了 8164"
+并不构成任何保证——链路上任何一跳的 MTU 更小，包就被丢弃，表现为相机启动
+不起来或者只出不完整帧。
+
+现在的三道防线（`Camera_Tool/CameraOperation.py`）：
+
+| 防线 | 实现 | 保证 |
+|---|---|---|
+| 实测链路 MTU | `probe_link_mtu()` 用 `psutil` 找到与相机 IP **同网段**的本机网卡，取它的 MTU | 以实测值为硬上限；探测不到返回 0 |
+| 收敛包长 | `clamp_packet_size()` 纯函数 | **结果永不超过链路 MTU**；同时受相机 min/max 约束；按步进**向下**对齐；低于 1500 直接放弃 |
+| 回读校验 | `_apply_packet_size_impl()` 设置后再 `feature.get()` | `set()` 不抛异常 ≠ 相机采纳了；回读不一致就告警并记录实际值 |
+
+外加一条**契约**：`_apply_packet_size()` 外层套了兜底 `try/except`，
+任何未预期异常都只告警、放弃修改、沿用相机当前值——**绝不挡住相机启动**。
+
+`config.yaml → cameras.acquisition.packet_size` 的三种取值：
+
+| 值 | 行为 |
+|---|---|
+| `0`（推荐，当前默认） | 自动：按实测 MTU 取最大安全值。巨型帧开了自动用上，没开自动退回 1500 |
+| `>0` | 指定值，但**仍被实测 MTU 夹紧**并告警。配置写错也不会把链路打挂 |
+| `-1` | 完全不碰这个特征，沿用相机出厂/上次保存的值 |
+
+保守性是有意的：**MTU 探测不到时一律退回 1500，不冒险开巨型帧**。
+宁可少拿一点带宽，也不要一台起不来的相机。
+
+现场判读（`get_diag_info()` 与健康心跳都有）：
+
+| 读数 | 含义 |
+|---|---|
+| `packet_size_applied` ≈ `link_mtu` | 正常，巨型帧已生效 |
+| `packet_size_applied` = 1500 但现场开了巨型帧 | MTU 没探测到（通常是相机 IP 与网卡不同网段），看 `packet_size_note` |
+| `packet_size_note` 含"回读不一致" | 相机把包长夹到了别的档位，按 note 里给的值改配置 |
+| `stream.incomplete` 持续增长 | 包被丢，帧收不全 —— 包长或带宽问题 |
+
+回归测试：`Test_Tool/test_packet_size_safety.py`，27 例。其中
+`test_never_exceeds_link_mtu_across_sweep` 是性质测试，遍历
+MTU × 期望值 × 相机上限的组合，逐一断言结果不超过 MTU。
+
 ---
 
 ## 二、改了哪些文件
@@ -216,19 +262,32 @@ cameras:
    `大恒 GxIAPI 初始化失败`。
 3. 用大恒自带的 **GalaxyView** 先把 8 台相机逐台连一遍，确认 SN 与
    `config.yaml → cameras.sn_map` 一致、IP 与网卡同网段。
-4. 交换机 + 网卡都打开**巨型帧**；要生效就把 `packet_size` 设成 `8164`。
+4. 交换机 + 网卡都打开**巨型帧**（两边都要开，只开一边会造成大量分片/丢包）。
+   **`config.yaml → cameras.acquisition.packet_size` 保持 `0` 不要改**：
+   `0` 是自动模式，代码会实测本机网卡 MTU 后取最大安全值，巨型帧开了就自动
+   用上。
+   > 不要手工写死成 `8164` 或 `9000`。现场出过"巨型帧明明开着、但相机启动
+   > 不起来"，根因就是包长只在相机侧校验范围、没人管链路能过多大的包。
+   > 现在即使写死了，代码也会用实测 MTU 夹紧并告警；但保持 `0` 最稳。
+   > 想完全不动这个特征就设 `-1`。
 5. 跑一次 `python main_yolo.py`，在日志里确认每台相机都有
-   `设备 [SN] ... 启动成功！(TriggerSelector=FrameStart, TriggerMode=On, TriggerSource=Line0, BufferCount=10)`。
+   `设备 [SN] ... 启动成功！(TriggerSelector=FrameStart, TriggerMode=On, TriggerSource=Line0, BufferCount=10)`，
+   以及一行 `设备 [SN] GigE 包长设为 N (链路 MTU=..., 相机范围=...)`。
+   **如果这行里的 N 是 1500 而现场确实开了巨型帧，说明 MTU 没探测到**
+   （通常是相机 IP 与网卡不同网段），日志里会有对应的 WARNING。
 6. 运行中随时可以调 `CameraOperation.get_diag_info()` 看
-   `stream.lost`（SDK 侧丢帧数）和 `stream.incomplete`（不完整帧数）。
-   这两个数持续增长 = 网络带宽/丢包问题，不是软件问题。
+   `stream.lost`（SDK 侧丢帧数）、`stream.incomplete`（不完整帧数），
+   以及 `link_mtu` / `packet_size_applied` / `packet_size_note`。
+   这几个数持续增长或 note 非空 = 网络/包长问题，不是软件问题。
+   健康心跳里也导出了同样的字段（`{相机名}.lost` / `.incomplete` / `.mtu` / `.pkt`）。
 
 ---
 
 ## 六、无硬件回归测试
 
 ```bash
-python -m pytest Test_Tool/test_camera_operation.py -v
+python -m pytest Test_Tool/test_camera_operation.py -v      # 25 passed
+python -m pytest Test_Tool/test_packet_size_safety.py -v    # 27 passed
 ```
 
 `Test_Tool/fake_galaxy_sdk.py` **只替换 ctypes 那一层**

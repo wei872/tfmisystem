@@ -91,7 +91,11 @@ def test_open_device_sets_trigger_chain_and_buffer(cam, backend):
     assert fake.features['TriggerMode'].current == 'On'
     assert fake.features['TriggerSource'].current == 'Line0'
     assert fake.acquisition_buffer_number == 7
-    assert fake.features['GevSCPSPacketSize'].value == 8164
+    # 配置要求 8164，但沙箱里探测不到 192.168.1.10 所在网卡的 MTU，
+    # _apply_packet_size() 必须保守退回 1500 而不是把 8164 原样写进相机
+    # —— 后者正是"包超过链路承载导致相机起不来"的成因。
+    # 巨型帧真正被采用的路径见 test_packet_size_safety.py。
+    assert fake.features['GevSCPSPacketSize'].value == 1500
     assert fake.features['GevHeartbeatTimeout'].value == 2500
 
 
