@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from General_Tool.EnhancedLogger import error, info
+from General_Tool.EnhancedLogger import error, info, warning
 
 
 # ================================================================
@@ -694,6 +694,78 @@ def get_default_class_confidence() -> float:
         _refresh_live_sections()
     val = _CFG.get("default_class_confidence", DEFAULT_CLASS_CONFIDENCE)
     return float(val if val is not None else DEFAULT_CLASS_CONFIDENCE)
+
+
+# ----------------------------------------------------------------
+# 按相机覆盖的置信度阈值
+# ----------------------------------------------------------------
+# 现场 8 台相机的安装位置/光照条件不同，同一套阈值不一定都合适。
+# 这里允许只写"需要跟全局不一样"的那几台、那几个类，没写的沿用全局值。
+#
+# 同样走 _LiveDict，所以改完 config.yaml 不用重启就生效。
+CAMERA_THRESHOLD_OVERRIDES = _LiveDict("camera_threshold_overrides", {})
+
+
+def get_camera_threshold_override(camera_name) -> Optional[Dict]:
+    """🔥 热更新：取某台相机的阈值覆盖块；没有则返回 None。
+
+    返回的是 config.yaml 里 ``camera_threshold_overrides.<camera_name>``
+    那一段原样内容（dict），结构见 config.yaml 里的注释。
+
+    **返回 None 表示"这台相机没有任何覆盖，完全沿用全局"** —— 调用方必须
+    区分 None 和空 dict：前者是"没配"，后者是"配了但为空"。
+    """
+    if not camera_name:
+        return None
+    try:
+        block = CAMERA_THRESHOLD_OVERRIDES.get(str(camera_name))
+    except Exception:
+        return None
+    return block if isinstance(block, dict) else None
+
+
+def get_camera_default_confidence(camera_name):
+    """🔥 热更新：某台相机的默认置信度阈值；没配则返回 None（不是 0！）
+
+    返回 None 让调用方能区分"这台相机没配默认值"和"配成了 0"。
+    """
+    block = get_camera_threshold_override(camera_name)
+    if not block:
+        return None
+    val = block.get("default_class_confidence")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        warning(f"[配置] camera_threshold_overrides.{camera_name}."
+                f"default_class_confidence = {val!r} 不是数字，已忽略")
+        return None
+
+
+def describe_camera_thresholds(camera_name, global_thresholds) -> Dict:
+    """算出某台相机**实际生效**的阈值表，供启动时打印。
+
+    按相机覆盖很容易配出"我以为只改了一个类，结果整机灵敏度都变了"的情况
+    （相机级 default 会盖掉全局的按类阈值）。所以启动时把每台的生效值
+    打出来，让配置意图和实际行为对得上。
+    """
+    eff = dict(global_thresholds or {})
+    block = get_camera_threshold_override(camera_name)
+    if not block:
+        return eff
+    per_class = block.get("class_confidence_thresholds")
+    if isinstance(per_class, dict):
+        for k, v in per_class.items():
+            try:
+                eff[k] = float(v)
+            except (TypeError, ValueError):
+                warning(f"[配置] camera_threshold_overrides.{camera_name}."
+                        f"class_confidence_thresholds.{k} = {v!r} 不是数字，已忽略")
+    cam_default = get_camera_default_confidence(camera_name)
+    if cam_default is not None:
+        eff["<default>"] = cam_default
+    return eff
 
 # ================================================================
 # 实例化配置

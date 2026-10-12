@@ -794,6 +794,41 @@ def _print_stop_rules() -> None:
     info("=" * 60)
 
 
+def _print_camera_thresholds() -> None:
+    """打印每台相机**实际生效**的置信度阈值。
+
+    按相机覆盖有个容易踩的坑：相机级 ``default_class_confidence`` 会盖掉
+    全局的按类阈值（例如给 camera3 配 0.15，全局的「油点线: 0.85」在
+    camera3 上也变成 0.15）。所以启动时把生效值全部打出来，让配置意图和
+    实际行为能当场对上，而不是等现场漏检了才发现。
+    """
+    from AnomalyDetection_Tool.config.settings import (
+        CLASS_CONFIDENCE_THRESHOLDS, CAMERA_THRESHOLD_OVERRIDES,
+        get_default_class_confidence, describe_camera_thresholds,
+    )
+
+    overrides = dict(CAMERA_THRESHOLD_OVERRIDES or {})
+    if not overrides:
+        info("[阈值] 未配置 camera_threshold_overrides，8 台相机全部使用全局阈值 "
+             f"(default={get_default_class_confidence()})")
+        return
+
+    info("=" * 60)
+    info("[阈值] 按相机覆盖已启用，以下为各相机**实际生效**的阈值：")
+    names = sorted(set(CAMERA_SN_MAP.values()))
+    for name in names:
+        eff = describe_camera_thresholds(name, CLASS_CONFIDENCE_THRESHOLDS)
+        if name in overrides:
+            keys = ", ".join(
+                f"{k}={v}" for k, v in sorted(eff.items(), key=lambda x: str(x[0])))
+            info(f"  {name:<9} [已覆盖] {keys}")
+        else:
+            info(f"  {name:<9} [全局]   default={get_default_class_confidence()}")
+    info("  ⚠ 若某台显示 [已覆盖] 且带 <default>，说明该相机级默认值已盖掉"
+         "全局的按类阈值，请确认这是你的意图。")
+    info("=" * 60)
+
+
 def _shutdown_common() -> None:
     """两种模式共用的收尾流程"""
     shutdown_health_monitor()
@@ -927,6 +962,7 @@ def run_production_mode() -> int:
     Start_all_devices()
     task_manager.start_all_tasks()
 
+    _print_camera_thresholds()
     _print_stop_rules()
 
     press_any_key_exit()

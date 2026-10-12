@@ -363,6 +363,45 @@ class_confidence_thresholds:
 default_class_confidence: 0.1
 
 # ------------------------------------------------------------------
+# 按相机覆盖的置信度阈值  [热更新]
+# ------------------------------------------------------------------
+# 8 台相机安装位置/光照不同，同一套阈值不一定都合适。这里**只写需要跟全局
+# 不一样的那几台**，没列出的相机完全沿用上面的全局值。
+#
+# 每台相机下可用的键（都是可选的，写哪个覆盖哪个）：
+#   class_confidence_thresholds      按类别名覆盖，键名与上面全局那段一致
+#   class_confidence_thresholds_by_id 按类别 id 覆盖（一般用不到）
+#   default_class_confidence         该相机的兜底阈值
+#
+# 生效优先级（从具体到宽泛）：
+#   1. 该相机 + 类别名
+#   2. 该相机 + 类别 id
+#   3. 该相机的 default_class_confidence
+#   4. 全局 类别名
+#   5. 全局 类别 id
+#   6. 全局 default_class_confidence
+#
+# ⚠️ 注意第 3 条：**相机级 default 会盖掉全局的按类阈值**。
+# 例如下面若给 camera3 配 default_class_confidence: 0.15，那么全局精心调过的
+# 「油点线: 0.85」在 camera3 上也会变成 0.15。
+# 只想改某一台的某一个类、其余沿用全局的话，**只写 class_confidence_thresholds，
+# 不要写 default_class_confidence**。
+#
+# 启动时会把每台相机的实际生效阈值打印出来（describe_camera_thresholds），
+# 配完请核对那几行日志，确认和意图一致。
+#
+# 下面整段是示例，默认全部注释掉 = 所有相机都用全局阈值。
+# camera_threshold_overrides:
+#   camera3:                          # 位置偏、光照弱，整体放宽一点
+#     class_confidence_thresholds:
+#       多股线:   0.55                # 只改这一个类，其余沿用全局
+#       纬线不直: 0.25
+#   camera7:                          # 反光强，误检多，整体收紧
+#     default_class_confidence: 0.2   # ← 这会盖掉全局所有按类阈值，谨慎
+#     class_confidence_thresholds:
+#       蚊虫小黑点: 0.97              # 显式写出来的类仍然按这里生效
+
+# ------------------------------------------------------------------
 # 保存配置
 # ------------------------------------------------------------------
 save:

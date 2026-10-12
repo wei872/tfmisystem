@@ -31,6 +31,7 @@ from AnomalyDetection_Tool.config.settings import (
     WEFT_OUTPUT_DIR, SAVE_WEFT,
     WEFT_TRIGGER, WEFT_DENSITY_ENABLE, CONCURRENCY_CONFIG,
     WARP_TRIGGER, WARP_DENSITY_ENABLE, get_default_class_confidence,
+    get_camera_threshold_override,
     REAL_WIDTH_CM, IMAGE_WIDTH_PX,
     MACHINE_STOP_PATH,
 )
@@ -152,6 +153,12 @@ class DetectionPipeline:
             default_threshold=default_class_threshold,
             # 🔥 默认阈值改为动态读取，支持热更新
             default_threshold_provider=get_default_class_confidence,
+            # 🔥 按相机覆盖。**必须是 provider（调用时按 camera_name 查），
+            # 不能在构造时取一份快照**：pipeline 是每 worker 线程一个
+            # （detection_worker_pool._get_or_create_pipeline 用线程本地存储），
+            # num_workers=5 而相机 8 台，一个 pipeline 会服务多台相机，
+            # 构造时根本不知道将来处理的是哪台。
+            camera_override_provider=get_camera_threshold_override,
         )
 
         self._frame_counter: int = 0
@@ -348,7 +355,7 @@ class DetectionPipeline:
 
         # ── Step2: 检测框过滤 ─────────────────────────────────────────
         filtered, f_cls, f_thr, f_size, f_edge, f_machine = self._filter_boxes(
-            raw_boxes, fabric_bbox, machine_id
+            raw_boxes, fabric_bbox, machine_id, camera_name
         )
         max_conf = max((b.confidence for b in filtered), default=0.0)
 
@@ -620,7 +627,7 @@ class DetectionPipeline:
     #  检测框过滤
     # ──────────────────────────────────────────────────────────────────
 
-    def _filter_boxes(self, raw_boxes, fabric_bbox, machine_id=""):
+    def _filter_boxes(self, raw_boxes, fabric_bbox, machine_id="", camera_name=""):
         filtered = []
         f_cls = f_thr = f_size = f_edge = f_machine = 0
 
@@ -630,8 +637,9 @@ class DetectionPipeline:
                 f_cls += 1
                 continue
 
-            # 置信度过滤
-            thr = self.threshold_config.get_threshold(box.class_name, box.class_id)
+            # 置信度过滤（按相机取生效阈值，未配覆盖的相机走全局值）
+            thr = self.threshold_config.get_threshold(
+                box.class_name, box.class_id, camera_name)
             if float(box.confidence) < float(thr):
                 f_thr += 1
                 continue
