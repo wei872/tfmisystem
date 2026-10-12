@@ -208,6 +208,76 @@ class TestRealValueWins:
         assert det.is_fallback_width() is False
         assert det.get_stats()["fabric_width_is_fallback"] is False
 
+    # ---------------- 端到端：走真实 process_frame ----------------
+    # 上面几条是直接喂 _append_ratio/_finalize。下面这条走**现场真正的入口**
+    # process_frame + 真实空白图像，因为"算出来过就一直沿用"这条性质
+    # 依赖于空白帧处理路径不去动 _last_fabric_width —— 那部分代码
+    # 只有走 process_frame 才真的被执行。
+
+    @staticmethod
+    def _frame(y0, y1, x0, x1, h=120, w=400):
+        """黑底 + 一个内缩白块。
+
+        必须内缩：_border_floodfill 从图像边界采样做泛洪种子，前景一旦顶到
+        边界就会被当成背景填掉，整帧变成"全空白"。
+        """
+        import numpy as np
+        img = np.zeros((h, w, 3), np.uint8)
+        img[y0:y1, x0:x1] = 255
+        return img
+
+    @staticmethod
+    def _blank(h=120, w=400):
+        import numpy as np
+        return np.zeros((h, w, 3), np.uint8)
+
+    def test_end_to_end_stale_value_is_never_replaced(self):
+        """**这是本轮需求的核心性质**，端到端钉死。
+
+        现场的要求：算出来过就证明布幅能算，之后算不出来就沿用上次值，
+        **不要**换成 1580~1600 —— 因为 1400 突然变成 1590 是突变。
+        只有从头到尾一次都没算出来，才用 1580~1600。
+
+        这条测试特意跑到主/备相机都空白、并且已经切到备用相机，
+        以证明空白帧确实被识别了（否则测试会因为"根本没进入空白分支"
+        而假通过）。
+        """
+        det = make()
+        blank = self._blank()
+
+        for _ in range(3):
+            det.process_frame(self._frame(20, 100, 10, 390), "camera8")
+            det.process_frame(self._frame(20, 100, 10, 390), "camera1")
+        real = det._last_fabric_width
+        assert real is not None, "真实图像没能算出布幅，测试前提不成立"
+        assert not (1580.0 <= real * 10 <= 1600.0), \
+            "实测值不能刚好落在兜底带里，否则测不出区别"
+
+        for _ in range(200):
+            det.process_frame(blank, "camera8")     # 左主
+            det.process_frame(blank, "camera1")     # 右主
+            det.process_frame(blank, "camera7")     # 左备
+            det.process_frame(blank, "camera2")     # 右备
+            assert det.get_fabric_width() == real, "空白帧期间被换掉了"
+
+        # 空白检测确实生效了（否则上面 200 轮等于什么都没做）
+        assert det._active_cam == {"left": "camera7", "right": "camera2"}, \
+            f"主相机没切到备用，空白帧可能没被识别: {det._active_cam}"
+        assert det.is_fallback_width() is False
+        assert det.get_stats()["last_fabric_width"] == real
+
+    def test_end_to_end_never_computed_uses_fallback(self):
+        """对照组：从头到尾只有空白帧 → 必须走 1580~1600"""
+        det = make()
+        blank = self._blank()
+        for _ in range(30):
+            det.process_frame(blank, "camera8")
+            det.process_frame(blank, "camera1")
+        assert det._last_fabric_width is None
+        cm = det.get_fabric_width()
+        assert 158.0 <= cm <= 160.0
+        assert det.is_fallback_width() is True
+
 
 # ==================================================================
 # §4 配置容错：配错不能把检测器搞崩
