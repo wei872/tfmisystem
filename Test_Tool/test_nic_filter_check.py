@@ -303,7 +303,12 @@ class TestReporting:
         assert "⚠" in txt
         assert "MVGIgEFilter" in txt and "GXGigEFilter" in txt
         assert "Hikvision" in txt or "hikvision" in txt.lower()
-        assert "卸载海康" in txt or "只留大恒" in txt
+        # 建议文案改过：真机实证**取消勾选就够了**（Enabled=False 即不在收包
+        # 路径上），不必卸载。原来写"卸载海康 MVS"是针对海康 MVS 的措辞，
+        # 现场漏掉的是 HikRobot 的 HKR_neuGEVFilter，措辞得通用一点。
+        assert "取消勾选" in txt
+        assert "GigE Vision LightWeight Filter" in txt      # 点名要保留的那个
+        assert "ncpa.cpl" in txt                            # 给出可操作的路径
 
     def test_no_conflict_reports_ok(self):
         reg = FakeReg(
@@ -1134,3 +1139,127 @@ class TestBase64Transport:
         assert f["display_name"] == "Some GigE Vision Streaming Filter"
         assert f["matched_gige"], (
             "DisplayName 没有参与分类 —— _classify() 又跑在合并之前了")
+
+
+# ----------------------- §12 已禁用的过滤驱动不能算冲突（真机第三轮日志）
+class TestDisabledFiltersAreNotConflicts:
+    """用户按正确步骤操作了：ncpa.cpl 里取消勾选 + 重启。程序却仍然拒绝启动。
+
+    根因：analyse_nic_filters 数的是 `matched_gige` 的全部条目，**从来没看
+    enabled**。而在 ncpa.cpl 里取消勾选只是把 Enabled 置为 False —— 绑定项
+    **依然存在**，Get-NetAdapterBinding **依然会列出来**，只是不在收包路径上。
+    于是"已禁用"被当成了"还挂着"。"""
+
+    ETH = "Realtek PCIe GbE Family Controller"
+
+    def _reg_and_rows(self, enabled_map):
+        import json as _json
+        rows = []
+        for cid, disp in [("HKR_neuGEVFilter", "Neu GigEVision Image Filter Driver"),
+                          ("ms_GxGVLWFilter", "GigE Vision LightWeight Filter"),
+                          ("MVTec_Hgevstrm", "MVTec GigE Vision Streaming Filter")]:
+            rows.append({"Name": "以太网", "InterfaceDescription": self.ETH,
+                         "ComponentID": cid, "DisplayName": disp,
+                         "Enabled": enabled_map[cid]})
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"], SVC: list(enabled_map)},
+            values={NIC_KEY + r"\0000": {"DriverDesc": self.ETH},
+                    SVC + r"\ms_GxGVLWFilter": {"FilterClass": "Custom"},
+                    SVC + r"\HKR_neuGEVFilter": {"FilterClass": "Custom"},
+                    SVC + r"\MVTec_Hgevstrm": {"FilterClass": "Custom"}})
+        return reg, _json.dumps(rows)
+
+    def _rep(self, enabled_map):
+        reg, payload = self._reg_and_rows(enabled_map)
+        return nfc.report_nic_filters(
+            reg=reg, use_powershell=True,
+            ps_runner=lambda c, t=20: (0, payload, ""), log_fn=lambda m: None)
+
+    def test_the_users_exact_scenario_now_passes(self):
+        """用户的实际操作：海康和 MVTec 取消勾选，大恒保留 → 必须放行。"""
+        rep = self._rep({"HKR_neuGEVFilter": False,
+                         "ms_GxGVLWFilter": True,
+                         "MVTec_Hgevstrm": False})
+        assert rep["conflicts"] == [], "已禁用的还在算冲突"
+
+    def test_all_enabled_is_still_a_conflict(self):
+        """反向守住：三个都启用时必须照样拦。"""
+        rep = self._rep({"HKR_neuGEVFilter": True,
+                         "ms_GxGVLWFilter": True,
+                         "MVTec_Hgevstrm": True})
+        assert len(rep["conflicts"]) == 1
+        assert len(rep["conflicts"][0]["gige_active"]) == 3
+
+    def test_two_enabled_is_still_a_conflict(self):
+        rep = self._rep({"HKR_neuGEVFilter": True,
+                         "ms_GxGVLWFilter": True,
+                         "MVTec_Hgevstrm": False})
+        assert len(rep["conflicts"]) == 1
+        assert len(rep["conflicts"][0]["gige_active"]) == 2
+
+    def test_disabled_ones_are_still_listed_and_marked(self):
+        """已禁用的仍然要打印出来 —— 操作员得看得见它们还在，只是被关掉了。"""
+        rep = self._rep({"HKR_neuGEVFilter": False,
+                         "ms_GxGVLWFilter": True,
+                         "MVTec_Hgevstrm": False})
+        out = []
+        reg, payload = self._reg_and_rows({"HKR_neuGEVFilter": False,
+                                           "ms_GxGVLWFilter": True,
+                                           "MVTec_Hgevstrm": False})
+        nfc.report_nic_filters(reg=reg, use_powershell=True,
+                               ps_runner=lambda c, t=20: (0, payload, ""),
+                               log_fn=out.append)
+        txt = "\n".join(out)
+        assert "HKR_neuGEVFilter" in txt and "MVTec_Hgevstrm" in txt
+        assert "已禁用" in txt
+        assert len(rep["all_filters"][0]["gige_disabled"]) == 2
+
+    def test_singles_reports_the_active_one_not_a_disabled_one(self):
+        """日志里 ✓ 那行必须报**启用中**的那个。
+        原来取 gige_filters[0]，会把一个已经不在收包路径上的驱动
+        说成"这张卡上唯一在用的 GigE 驱动"。"""
+        reg, payload = self._reg_and_rows({"HKR_neuGEVFilter": False,
+                                           "ms_GxGVLWFilter": True,
+                                           "MVTec_Hgevstrm": False})
+        out = []
+        nfc.report_nic_filters(reg=reg, use_powershell=True,
+                               ps_runner=lambda c, t=20: (0, payload, ""),
+                               log_fn=out.append)
+        singles_line = [l for l in out if l.strip().startswith("网卡 以太网")]
+        assert singles_line
+        assert "ms_GxGVLWFilter" in singles_line[0], singles_line[0]
+        assert "HKR_neuGEVFilter" not in singles_line[0]
+
+    def test_unknown_enabled_state_is_treated_as_active(self):
+        """只有注册表来源时拿不到 Enabled —— 一律**当启用**，宁可多拦不漏拦。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={NIC_KEY + r"\0001": {
+                        "DriverDesc": "NIC",
+                        "UpperBindings": ["MVGIgEFilter", "GXGigEFilter"]},
+                    SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE"},
+                    SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE"}})
+        nics = nfc.enumerate_nic_filters(reg=reg)
+        assert all(f["enabled"] is None for f in nics[0]["filters"])
+        rep = nfc.analyse_nic_filters(nics)
+        assert len(rep["conflicts"]) == 1, "状态未知时必须按启用处理"
+
+    def test_plan_disable_skips_already_disabled(self):
+        reg, payload = self._reg_and_rows({"HKR_neuGEVFilter": False,
+                                           "ms_GxGVLWFilter": True,
+                                           "MVTec_Hgevstrm": True})
+        rep = nfc.report_nic_filters(
+            reg=reg, use_powershell=True,
+            ps_runner=lambda c, t=20: (0, payload, ""), log_fn=lambda m: None)
+        plan = nfc.plan_disable(report=rep)
+        assert [a["service"] for a in plan["actions"]] == ["MVTec_Hgevstrm"]
+
+    def test_registry_path_does_not_claim_enabled(self):
+        """注册表来源给不出启用状态，不能谎报 True。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={NIC_KEY + r"\0001": {
+                        "DriverDesc": "NIC", "UpperBindings": ["GXGigEFilter"]},
+                    SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE"}})
+        nics = nfc.enumerate_nic_filters(reg=reg)
+        assert nics[0]["filters"][0]["enabled"] is None

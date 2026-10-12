@@ -1024,20 +1024,30 @@ def run_production_mode() -> int:
             for _c in _conflicts:
                 _lines.append(f"    网卡 {_c.get('nic')} "
                               f"({_c.get('driver_desc')}):")
-                for _f in _c.get("gige_filters") or []:
+                # ⚠️ 只列**启用中**的 —— 已禁用的不算冲突（见 analyse_nic_filters）
+                for _f in (_c.get("gige_active") or _c.get("gige_filters") or []):
                     _lines.append(f"      - {_f.get('service')}  "
                                   f"({_f.get('display_name')})")
+                _dis = _c.get("gige_disabled") or []
+                if _dis:
+                    _lines.append(f"      （另有 {len(_dis)} 个同类驱动**已禁用**，"
+                                  f"不算冲突）：")
+                    for _f in _dis:
+                        _lines.append(f"      - {_f.get('service')}  "
+                                      f"({_f.get('display_name')})  [已禁用]")
             _lines += [
                 "",
-                "  这是整机网络栈卡死 / 电脑死机的高频原因，必须只保留大恒 "
-                "Galaxy 的那一个：",
-                "    1) 停产，以**管理员身份**打开命令行，先预演看计划：",
-                "         python -m General_Tool.NicFilterCheck",
-                "    2) 确认无误后执行（网卡会短暂 reset，相机会断线重连）：",
-                "         python -m General_Tool.NicFilterCheck --yes",
-                "    3) 重启本机，再启动本程序确认日志里出现 ✓",
-                "  也可以手工处理：控制面板 → 网络适配器 → 属性，取消勾选海康 "
-                "MVS 的 GigE Filter Driver，或直接卸载海康 MVS。",
+                "  这是整机网络栈卡死 / 电脑死机的高频原因。**取消勾选即可，"
+                "不必卸载**：",
+                "    Win+R → ncpa.cpl → 对上面每张网卡右键 → 属性 → "
+                "只留 'GigE Vision LightWeight Filter'（大恒 Galaxy），",
+                "    取消勾选其余所有 GigE Vision 过滤驱动 → 确定。",
+                "    取消勾选会把 Enabled 置为 False，驱动就不再在收包路径上；"
+                "绑定项仍会出现在清单里，但会标成 [已禁用]，不再算冲突。",
+                "",
+                "  也可以用命令行代劳（停产时做，网卡会短暂 reset、相机断线重连）：",
+                "    python -m General_Tool.NicFilterCheck          # 先预演看计划",
+                "    python -m General_Tool.NicFilterCheck --yes    # 以管理员身份执行",
                 "  详见 docs/SDK迁移_海康转大恒.md。",
             ]
             error("\n".join(_lines))

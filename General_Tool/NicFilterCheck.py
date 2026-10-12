@@ -490,7 +490,9 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
                 if svc in seen:
                     continue
                 f = _classify(_service_meta(reg, svc), gp, cp)
-                f["enabled"] = True
+                # 注册表的 Upper/LowerBindings **给不出启用状态**，
+                # 不要谎报 True —— 标 None 让上层知道这是"未知"。
+                f["enabled"] = None
                 rec["filters"].append(f)
                 seen.add(svc)
         except Exception:
@@ -525,19 +527,29 @@ def analyse_nic_filters(nics: Optional[List[Dict]]) -> Dict:
     for nic in nics:
         filters = nic.get("filters") or []
         gige = [f for f in filters if f.get("matched_gige")]
+        # ⚠️ **判定只看启用中的**。真机实证：在 ncpa.cpl 里取消勾选后，
+        #    绑定**依然存在**、Get-NetAdapterBinding 依然会列出来，只是
+        #    Enabled 变成 False —— 那时它已经不在收包路径上，不构成卡死风险。
+        #    原来的代码把已禁用的一起算，于是用户明明按正确步骤禁用并重启了，
+        #    程序还是拒绝启动。
+        #    enabled 为 None 表示"来源给不出这个信息"（只有注册表时），
+        #    一律**当启用**处理 —— 宁可多拦，不能漏拦。
+        gige_active = [f for f in gige if f.get("enabled") is not False]
         entry = {
             "nic": nic.get("nic_key", ""),
             "driver_desc": nic.get("driver_desc", ""),
             "filters": filters,
             "gige_filters": gige,
+            "gige_active": gige_active,
+            "gige_disabled": [f for f in gige if f.get("enabled") is False],
             # 这条记录的数据从哪来（netadapterbinding / registry）。
             # 日志要靠它区分"权威来源查到是空的"和"只有遗留来源、结果不可信"。
             "sources": nic.get("sources", []),
         }
         out["all_filters"].append(entry)
-        if len(gige) >= 2:
+        if len(gige_active) >= 2:
             out["conflicts"].append(entry)
-        elif len(gige) == 1:
+        elif len(gige_active) == 1:
             out["singles"].append(entry)
     return out
 
@@ -548,6 +560,13 @@ def _fmt_filter(f: Dict) -> str:
         tag = f"  [疑似GigE: 命中 '{f['matched_gige']}']"
     elif f.get("matched_capture"):
         tag = f"  [抓包驱动: 命中 '{f['matched_capture']}']"
+    # 启用状态**必须打出来**：这是判断"禁用到底生效没有"的唯一依据。
+    # 之前不打印，导致用户明明禁用了、程序还在拦，双方都看不出问题在哪。
+    en = f.get("enabled")
+    if en is False:
+        tag += "  [已禁用·不在收包路径上]"
+    elif en is None:
+        tag += "  [启用状态未知]"
     name = f.get("display_name") or f.get("service", "?")
     return f"{f.get('service', '?')}  ({name}){tag}"
 
@@ -629,18 +648,31 @@ def report_nic_filters(report: Optional[Dict] = None,
             for c in conflicts:
                 warn("  网卡 {} ({}):".format(
                     c["nic"], c["driver_desc"] or "名称未知"))
-                for f in c["gige_filters"]:
+                for f in c.get("gige_active") or c["gige_filters"]:
                     warn("      " + _fmt_filter(f))
-            warn("  处理办法：控制面板 → 网络适配器 → 属性，取消勾选海康 "
-                 "MVS 的 GigE Filter Driver，或直接卸载海康 MVS；"
-                 "只留大恒 Galaxy 的过滤驱动。")
+                dis = c.get("gige_disabled") or []
+                if dis:
+                    warn("      （另有 {} 个同类驱动**已禁用**，不算冲突）："
+                         .format(len(dis)))
+                    for f in dis:
+                        warn("      " + _fmt_filter(f))
+            warn("  处理办法：**取消勾选即可，不必卸载**。")
+            warn("    Win+R → ncpa.cpl → 对该网卡右键 → 属性 → 只留 "
+                 "'GigE Vision LightWeight Filter'（大恒），"
+                 "取消勾选其余所有 GigE Vision 过滤驱动 → 确定。")
+            warn("    取消勾选会把 Enabled 置为 False，驱动就不再在收包路径上；"
+                 "绑定项仍会出现在清单里，但会被标成 [已禁用]，不再算冲突。")
             warn("  详见 docs/SDK迁移_海康转大恒.md 的现场部署步骤。")
         elif result["singles"]:
             log("[网卡过滤驱动] ✓ 未发现重复的 GigE 过滤驱动（每张网卡最多 1 个）")
             for s in result["singles"]:
+                # ⚠️ 取 gige_active[0] 而不是 gige_filters[0]：
+                #    后者可能是**已禁用**的那个，于是日志会把一个已经不在
+                #    收包路径上的驱动说成"这张卡上唯一在用的 GigE 驱动"。
+                act = s.get("gige_active") or s["gige_filters"]
                 log("  网卡 {} ({}): {}".format(
                     s["nic"], s["driver_desc"] or "名称未知",
-                    _fmt_filter(s["gige_filters"][0])))
+                    _fmt_filter(act[0])))
         elif not ps_ok:
             # ⚠️ 这种情况**不能**说"没有 GigE 过滤驱动"。
             # 只拿到注册表时，Upper/LowerBindings 覆盖不到 NDIS 6 轻量过滤
@@ -666,6 +698,15 @@ def report_nic_filters(report: Optional[Dict] = None,
         if result["installed_gige"]:
             bound_svcs = {f.get("service")
                           for e in result["all_filters"] for f in e["filters"]}
+            # 注册表里读不到 DisplayName 时（真机上 HKR_neuGEVFilter /
+            # MVTec_Hgevstrm 就是这样），用 Get-NetAdapterBinding 给的名字回填，
+            # 否则清单里会是一排空括号，看不出是哪个驱动。
+            names = {f.get("service"): f.get("display_name")
+                     for e in result["all_filters"] for f in e["filters"]
+                     if f.get("display_name")}
+            for f in result["installed_gige"]:
+                if not f.get("display_name"):
+                    f["display_name"] = names.get(f.get("service"), "")
             unbound = [f for f in result["installed_gige"]
                        if f.get("service") not in bound_svcs]
             log("[网卡过滤驱动] 本机已安装的疑似 GigE 过滤驱动 {} 个：".format(
@@ -812,7 +853,10 @@ def plan_disable(report: Optional[Dict] = None,
         filters = nic.get("filters") or []
         # ⚠️ 用**下标**而不是字典相等来标记身份。同一张网卡上完全可能出现两条
         #    字段一模一样的驱动记录，用 `f in keepable` 会互相误判。
-        gige_idx = [i for i, f in enumerate(filters) if f.get("matched_gige")]
+        # 已禁用（Enabled=False）的既不算冲突、也没必要再动一次，
+        # 所以整个计划里都不出现。enabled 为 None（来源给不出）时按启用处理。
+        gige_idx = [i for i, f in enumerate(filters)
+                    if f.get("matched_gige") and f.get("enabled") is not False]
 
         # 不变量 1：大恒自家驱动永远不动
         protected = {i for i in gige_idx if _is_kept(filters[i])}
