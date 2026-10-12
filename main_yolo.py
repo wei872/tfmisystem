@@ -999,6 +999,16 @@ def run_production_mode() -> int:
 
     info("\n系统启动（大恒 Galaxy SDK + YOLO检测 + 布幅检测）")
 
+    # ==================== 网卡过滤驱动检查 ====================
+    # 必须在开相机**之前**做：两个 GigE 过滤驱动挂同一张网卡是整机网络栈
+    # 卡死的高频原因，而这种卡死从 Python 侧完全看不出来（进程还活着，
+    # 整台机器不动了）。趁还能打日志的时候先说清楚。
+    # 内部保证不抛异常、不阻塞——查不到就只是日志里说没查成。
+    if LOGGING_CONFIG.get("nic_filter_check", True):
+        from General_Tool.NicFilterCheck import check_nic_filter_drivers
+        check_nic_filter_drivers(
+            gige_patterns=LOGGING_CONFIG.get("nic_filter_patterns"))
+
     # ==================== 大恒 SDK 初始化 ====================
     # DeviceManager 的构造里就会调用 gx_init_lib()（等价于海康的
     # MV_CC_Initialize），所以不再需要单独的一次"初始化"调用；

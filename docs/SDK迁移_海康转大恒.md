@@ -108,6 +108,19 @@ raw = ctypes.string_at(pData, buff_size)
 - **网卡上是否同时装了海康和大恒两个 GigE 过滤驱动**。
   两个过滤驱动挂同一张网卡是"整机网络栈卡死"的高频原因。
   换 SDK 后请把海康 MVS 的 GigE Filter Driver 卸载或禁用，只留大恒的。
+
+  > ✅ **这一条现在程序会自动查**：启动时（在 `gx.DeviceManager()` 之前）
+  > 读注册表枚举每张网卡绑定的 NDIS 过滤驱动，发现同一张网卡上挂了 ≥2 个
+  > 疑似 GigE 过滤驱动就升级为 WARNING，逐个点名并给出处理办法。
+  > 实现在 `General_Tool/NicFilterCheck.py`，开关是
+  > `config.yaml: logging.nic_filter_check`。
+  >
+  > 日志里还会**无条件打印每张网卡的完整过滤驱动清单**——因为内置的厂商
+  > 名字表不可能覆盖所有驱动。如果日志说"未识别到任何疑似 GigE 过滤驱动"
+  > 但现场确实在用 GigE 相机，把清单里的驱动名补进
+  > `logging.nic_filter_patterns` 即可。
+  >
+  > 注意：查不到（权限不足等）时只是日志里说一声，**不会影响相机启动**。
 - **巨型帧（Jumbo Frame）**：交换机和网卡必须同时开（一般 9014 字节），
   只开一边会造成大量分片/丢包，CPU 被软中断打满。
 - **网卡收包缓冲 / 中断亲和性**：8 路 GigE 相机建议每路独占一个 CPU 核。
