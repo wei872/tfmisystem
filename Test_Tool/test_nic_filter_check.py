@@ -604,3 +604,92 @@ class TestNotWiredIntoStartup:
         assert "main()" in after
         assert src.count("sys.exit(main())") == 1
         assert importlib.util.find_spec("General_Tool.NicFilterCheck") is not None
+
+
+# ------------------------------------------------------- §8 启动拦截（硬闸门）
+class TestStartupGate:
+    """main_yolo.run_production_mode() 里的硬性拦截。
+
+    判定门槛：**只有"确实查到了、且确认有冲突"才拦**。读不到注册表必须放过，
+    否则非 Windows 开发机和权限不足的机器会永远起不来。"""
+
+    def _setup(self, monkeypatch, reg):
+        import fake_galaxy_sdk
+        fake_galaxy_sdk.install()
+        import main_yolo
+
+        real = nfc.enumerate_nic_filters
+        monkeypatch.setattr(nfc, "enumerate_nic_filters",
+                            lambda reg_=None, **k: real(reg=reg))
+
+        # 记录有没有真的走到开相机那一步
+        built = []
+        orig_dm = main_yolo.gx.DeviceManager
+
+        class _Spy(orig_dm):
+            def __init__(self, *a, **k):
+                built.append(1)
+                super().__init__(*a, **k)
+        monkeypatch.setattr(main_yolo.gx, "DeviceManager", _Spy)
+        # 让后面的枚举步骤立刻失败，避免测试真去连相机
+        monkeypatch.setattr(main_yolo.gx.DeviceManager, "update_all_device_list",
+                            lambda self, t=0: (0, []), raising=False)
+        monkeypatch.setitem(main_yolo.LOGGING_CONFIG, "nic_filter_check", True)
+        errors = []
+        monkeypatch.setattr(main_yolo, "error", lambda m: errors.append(m))
+        return main_yolo, built, errors
+
+    def test_conflict_blocks_startup_before_sdk_init(self, monkeypatch):
+        main_yolo, built, errors = self._setup(
+            monkeypatch, reg_with_two_gige_filters())
+        rc = main_yolo.run_production_mode()
+        assert rc == 1, f"应该拒绝启动，实际返回 {rc}"
+        assert built == [], "拦截失效：已经走到 gx.DeviceManager() 了"
+        txt = "\n".join(errors)
+        assert "拒绝启动" in txt
+        assert "MVGIgEFilter" in txt and "GXGigEFilter" in txt
+        assert "NicFilterCheck --yes" in txt      # 必须给出可执行的修复命令
+
+    def test_unreadable_registry_does_not_block(self, monkeypatch):
+        """读不到注册表 ≠ 装了两个驱动。这种情况必须放过，只留一条日志。"""
+        main_yolo, built, errors = self._setup(monkeypatch, reg=None)
+        rc = main_yolo.run_production_mode()
+        assert built, "读不到注册表却把启动拦下来了 —— 开发机会永远起不来"
+        assert not any("拒绝启动" in e for e in errors)
+        assert rc == 1          # 后面因为没相机才失败，与拦截无关
+
+    def test_single_filter_does_not_block(self, monkeypatch):
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={NIC_KEY + r"\0001": {
+                        "DriverDesc": "Intel(R) I219-LM",
+                        "UpperBindings": ["GXGigEFilter"]},
+                    SVC + r"\GXGigEFilter": {
+                        "DisplayName": "Galaxy GigE Filter Driver"}})
+        main_yolo, built, errors = self._setup(monkeypatch, reg=reg)
+        main_yolo.run_production_mode()
+        assert built, "只有一个大恒过滤驱动也被拦了"
+        assert not any("拒绝启动" in e for e in errors)
+
+    def test_two_filters_on_two_nics_does_not_block(self, monkeypatch):
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001", "0002"]},
+            values={
+                NIC_KEY + r"\0001": {"DriverDesc": "NIC A",
+                                     "UpperBindings": ["MVGIgEFilter"]},
+                NIC_KEY + r"\0002": {"DriverDesc": "NIC B",
+                                     "UpperBindings": ["GXGigEFilter"]},
+                SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE Filter"},
+                SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE Filter"}})
+        main_yolo, built, errors = self._setup(monkeypatch, reg=reg)
+        main_yolo.run_production_mode()
+        assert built, "分挂两张网卡不是冲突，不该拦"
+        assert not any("拒绝启动" in e for e in errors)
+
+    def test_check_disabled_skips_gate_entirely(self, monkeypatch):
+        main_yolo, built, errors = self._setup(
+            monkeypatch, reg_with_two_gige_filters())
+        monkeypatch.setitem(main_yolo.LOGGING_CONFIG, "nic_filter_check", False)
+        main_yolo.run_production_mode()
+        assert built, "nic_filter_check: false 时不该做任何检查"
+        assert not any("拒绝启动" in e for e in errors)

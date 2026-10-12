@@ -109,11 +109,21 @@ raw = ctypes.string_at(pData, buff_size)
   两个过滤驱动挂同一张网卡是"整机网络栈卡死"的高频原因。
   换 SDK 后请把海康 MVS 的 GigE Filter Driver 卸载或禁用，只留大恒的。
 
-  > ✅ **这一条现在程序会自动查**：启动时（在 `gx.DeviceManager()` 之前）
-  > 读注册表枚举每张网卡绑定的 NDIS 过滤驱动，发现同一张网卡上挂了 ≥2 个
-  > 疑似 GigE 过滤驱动就升级为 WARNING，逐个点名并给出处理办法。
-  > 实现在 `General_Tool/NicFilterCheck.py`，开关是
-  > `config.yaml: logging.nic_filter_check`。
+  > ✅ **这一条现在程序会自动查，并且查到了就拒绝启动**：启动时（在
+  > `gx.DeviceManager()` 之前）读注册表枚举每张网卡绑定的 NDIS 过滤驱动，
+  > **发现同一张网卡上挂了 ≥2 个疑似 GigE 过滤驱动就直接拒绝启动**
+  > （`run_production_mode()` 返回 1，不会走到开相机那一步），并打印出
+  > 是哪张网卡、哪几个驱动、以及修复命令。
+  > 实现在 `General_Tool/NicFilterCheck.py`，接线在 `main_yolo.py` 的
+  > `run_production_mode()` 开头。
+  >
+  > **判定门槛**：只在"确实查到了、且确认有冲突"时才拦。读不到注册表
+  > （权限不足、非 Windows 开发机）时**放行**，只留一条"没查成"的日志 ——
+  > 读不到跟"装了两个"是两回事，不能混。
+  >
+  > **没有运行时绕过方式**（环境变量、命令行参数都不认）。唯一的关闭开关是
+  > `config.yaml` 里的 `logging.nic_filter_check: false`，需要能改到那台机器上
+  > 的配置文件。这是整个检查功能的总开关，关掉之后连日志都不再打印。
   >
   > 日志里还会**无条件打印每张网卡的完整过滤驱动清单**——因为内置的厂商
   > 名字表不可能覆盖所有驱动。如果日志说"未识别到任何疑似 GigE 过滤驱动"

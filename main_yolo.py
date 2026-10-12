@@ -1006,8 +1006,44 @@ def run_production_mode() -> int:
     # 内部保证不抛异常、不阻塞——查不到就只是日志里说没查成。
     if LOGGING_CONFIG.get("nic_filter_check", True):
         from General_Tool.NicFilterCheck import check_nic_filter_drivers
-        check_nic_filter_drivers(
+        _nic_rep = check_nic_filter_drivers(
             gige_patterns=LOGGING_CONFIG.get("nic_filter_patterns"))
+
+        # ⚠️ 硬性拦截：确认有冲突就**拒绝启动**。
+        #
+        # 判定门槛很关键 —— 只在**确实查到了、且确认有冲突**时才拦：
+        #   conflicts 非空  ⇒  一定是 checked=True（analyse_nic_filters 在
+        #                       没查到数据时返回的 conflicts 恒为空）
+        #   读不到注册表    ⇒  conflicts 为空 ⇒ **不拦**，只有一条"没查成"的日志
+        # 后者必须放过：否则非 Windows 开发机、以及权限不足读不到注册表的机器
+        # 会永远起不来，而这跟"装了两个过滤驱动"是两回事。
+        _conflicts = _nic_rep.get("conflicts") or []
+        if _conflicts:
+            _lines = ["✗ 拒绝启动：检测到同一张网卡上挂了多个 GigE Vision "
+                      "过滤驱动。"]
+            for _c in _conflicts:
+                _lines.append(f"    网卡 {_c.get('nic')} "
+                              f"({_c.get('driver_desc')}):")
+                for _f in _c.get("gige_filters") or []:
+                    _lines.append(f"      - {_f.get('service')}  "
+                                  f"({_f.get('display_name')})")
+            _lines += [
+                "",
+                "  这是整机网络栈卡死 / 电脑死机的高频原因，必须只保留大恒 "
+                "Galaxy 的那一个：",
+                "    1) 停产，以**管理员身份**打开命令行，先预演看计划：",
+                "         python -m General_Tool.NicFilterCheck",
+                "    2) 确认无误后执行（网卡会短暂 reset，相机会断线重连）：",
+                "         python -m General_Tool.NicFilterCheck --yes",
+                "    3) 重启本机，再启动本程序确认日志里出现 ✓",
+                "  也可以手工处理：控制面板 → 网络适配器 → 属性，取消勾选海康 "
+                "MVS 的 GigE Filter Driver，或直接卸载海康 MVS。",
+                "  详见 docs/SDK迁移_海康转大恒.md。",
+            ]
+            error("\n".join(_lines))
+            Shutdown_yolo_detector()
+            return 1
+
 
     # ==================== 大恒 SDK 初始化 ====================
     # DeviceManager 的构造里就会调用 gx_init_lib()（等价于海康的
