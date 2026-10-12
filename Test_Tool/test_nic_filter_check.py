@@ -693,3 +693,244 @@ class TestStartupGate:
         main_yolo.run_production_mode()
         assert built, "nic_filter_check: false 时不该做任何检查"
         assert not any("拒绝启动" in e for e in errors)
+
+
+# ------------------------------------------- §9 数据来源（真机日志逼出来的）
+def _ps_rows():
+    """Get-NetAdapterBinding 的真实形状：一张 Realtek 网卡上有 WFP + 两个 GigE"""
+    return [
+        {"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE Family Controller",
+         "ComponentID": "ms_wfplwf_upper", "Enabled": True, "Class": "Filter"},
+        {"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE Family Controller",
+         "ComponentID": "MVGIgEFilter", "Enabled": True, "Class": "Filter"},
+        {"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE Family Controller",
+         "ComponentID": "GXGigEFilter", "Enabled": True, "Class": "Filter"},
+        # 协议/服务不是过滤驱动，必须被排除
+        {"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE Family Controller",
+         "ComponentID": "ms_tcpip", "Enabled": True, "Class": "Protocol"},
+        {"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE Family Controller",
+         "ComponentID": "ms_server", "Enabled": True, "Class": "Service"},
+    ]
+
+
+def _ps_runner(rows=None, rc=0, out=None):
+    import json as _json
+    payload = out if out is not None else _json.dumps(
+        rows if rows is not None else _ps_rows())
+    def run(cmd, timeout=20):
+        run.calls.append(cmd)
+        return rc, payload, ""
+    run.calls = []
+    return run
+
+
+class TestDataSources:
+    def test_non_instance_subkeys_are_not_treated_as_nics(self):
+        """真机日志里冒出过「网卡 Configuration (名称未知)」
+        「网卡 Properties (名称未知)」——类键下这些不是网卡实例。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000", "0001", "Configuration", "Properties"]},
+            values={
+                NIC_KEY + r"\0000": {"DriverDesc": "Realtek PCIe GbE"},
+                NIC_KEY + r"\0001": {"DriverDesc": "VMware VMnet1"},
+            })
+        nics = nfc.enumerate_nic_filters(reg=reg)
+        keys = [n["nic_key"] for n in nics]
+        assert "Configuration" not in keys, keys
+        assert "Properties" not in keys, keys
+        assert keys == ["0000", "0001"], keys
+
+    def test_powershell_source_finds_what_registry_misses(self):
+        """这就是真机那个 bug：注册表的 Upper/LowerBindings 覆盖不到 NDIS 6
+        过滤驱动，只有 Get-NetAdapterBinding 能拿到。"""
+        reg = FakeReg(                       # 注册表这边**什么都没有**
+            subkeys={NIC_KEY: ["0000"]},
+            # ⚠️ DriverDesc 必须和 PowerShell 的 InterfaceDescription **同串**：
+            #    真机上这两个值来自同一个 INF，是一样的。合并键就靠这个对齐。
+            values={NIC_KEY + r"\0000": {
+                        "DriverDesc": "Realtek PCIe GbE Family Controller"},
+                    SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE"},
+                    SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE"},
+                    SVC + r"\ms_wfplwf_upper": {"DisplayName": "WFP Lightweight Filter"}},
+        )
+        nics = nfc.enumerate_nic_filters(reg=reg, use_powershell=True,
+                                         ps_runner=_ps_runner())
+        assert len(nics) == 1
+        svcs = [f["service"] for f in nics[0]["filters"]]
+        assert "MVGIgEFilter" in svcs and "GXGigEFilter" in svcs, svcs
+        assert "netadapterbinding" in nics[0]["sources"]
+
+    def test_powershell_excludes_non_filter_classes(self):
+        reg = FakeReg(subkeys={NIC_KEY: ["0000"]},
+                      values={NIC_KEY + r"\0000": {"DriverDesc": "NIC"}})
+        nics = nfc.enumerate_nic_filters(reg=reg, use_powershell=True,
+                                         ps_runner=_ps_runner())
+        svcs = [f["service"] for f in nics[0]["filters"]]
+        assert "ms_tcpip" not in svcs, svcs
+        assert "ms_server" not in svcs, svcs
+
+    def test_powershell_conflict_still_blocks(self):
+        """权威来源查到双驱动 → 必须判定为冲突（这是硬闸门的输入）"""
+        reg = FakeReg(subkeys={NIC_KEY: ["0000"]},
+                      values={NIC_KEY + r"\0000": {"DriverDesc": "Realtek PCIe GbE"},
+                              SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE"},
+                              SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE"}})
+        nics = nfc.enumerate_nic_filters(reg=reg, use_powershell=True,
+                                         ps_runner=_ps_runner())
+        rep = nfc.analyse_nic_filters(nics)
+        assert len(rep["conflicts"]) == 1
+        assert sorted(f["service"] for f in rep["conflicts"][0]["gige_filters"]) == \
+            ["GXGigEFilter", "MVGIgEFilter"]
+
+    def test_convert_to_json_single_object_is_handled(self):
+        """ConvertTo-Json 只有一条记录时输出对象而不是数组"""
+        import json as _json
+        one = {"Name": "以太网", "InterfaceDescription": "NIC A",
+               "ComponentID": "ms_wfplwf_upper", "Enabled": True, "Class": "Filter"}
+        reg = FakeReg(subkeys={NIC_KEY: ["0000"]},
+                      values={NIC_KEY + r"\0000": {"DriverDesc": "NIC A"}})
+        nics = nfc.enumerate_nic_filters(
+            reg=reg, use_powershell=True,
+            ps_runner=_ps_runner(out=_json.dumps(one)))
+        assert len(nics) == 1
+        assert [f["service"] for f in nics[0]["filters"]] == ["ms_wfplwf_upper"]
+
+    def test_powershell_failure_falls_back_to_registry(self):
+        def bad_runner(cmd, timeout=20):
+            raise OSError("powershell 被策略禁用")
+        reg = FakeReg(subkeys={NIC_KEY: ["0000"]},
+                      values={NIC_KEY + r"\0000": {"DriverDesc": "NIC A"}})
+        nics = nfc.enumerate_nic_filters(reg=reg, use_powershell=True,
+                                         ps_runner=bad_runner)
+        assert nics is not None, "PowerShell 挂了就整个查不到了？"
+        assert nics[0]["sources"] == ["registry"]
+
+    def test_empty_or_garbage_output_means_source_unavailable(self):
+        for payload in ("", "   ", "not json at all", "[]", "null"):
+            got = nfc.enumerate_via_powershell(
+                runner=_ps_runner(out=payload))
+            assert got is None, payload
+
+
+class TestInstalledFilterScan:
+    """已安装但未绑定的过滤驱动也要报——"海康 MVS 装过、只是没勾上"
+    现在不惹事，但换网卡/重装驱动时可能自己绑回去。"""
+
+    def _reg(self):
+        return FakeReg(
+            subkeys={NIC_KEY: ["0000"],
+                     SVC: ["MVGIgEFilter", "GXGigEFilter", "ms_wfplwf_upper",
+                           "Tcpip", "W32Time"]},
+            values={
+                NIC_KEY + r"\0000": {"DriverDesc": "Realtek PCIe GbE"},
+                # 两个 GigE 过滤驱动都装了，但**都没绑定**
+                SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE Filter",
+                                         "FilterClass": "Custom",
+                                         "FilterRunOrder": ["Begin"]},
+                SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE Filter",
+                                         "FilterClass": "Custom"},
+                SVC + r"\ms_wfplwf_upper": {"DisplayName": "WFP Lightweight Filter",
+                                            "FilterClass": "Custom"},
+                # 这两个没有 FilterClass / FilterRunOrder → 不是过滤驱动
+                SVC + r"\Tcpip": {"DisplayName": "TCP/IP Protocol Driver"},
+                SVC + r"\W32Time": {"DisplayName": "Windows Time"},
+            })
+
+    def test_only_ndis_filters_are_returned(self):
+        got = nfc.enumerate_installed_filters(reg=self._reg())
+        names = sorted(f["service"] for f in got)
+        assert names == ["GXGigEFilter", "MVGIgEFilter", "ms_wfplwf_upper"], names
+
+    def test_gige_ones_are_flagged(self):
+        got = nfc.enumerate_installed_filters(reg=self._reg())
+        flagged = sorted(f["service"] for f in got if f["matched_gige"])
+        assert flagged == ["GXGigEFilter", "MVGIgEFilter"], flagged
+
+    def test_non_windows_returns_empty_not_error(self, monkeypatch):
+        monkeypatch.setattr(nfc.sys, "platform", "linux")
+        assert nfc.enumerate_installed_filters() == []
+
+
+class TestHonestDegradation:
+    """只有遗留来源时，日志**不能**给出一个假的 ✓。
+
+    这是真机日志暴露的问题：一张 Realtek GbE 报"无"，而 Windows 8+ 上这块卡
+    至少绑着 WFP Lightweight Filter。全空 = 数据源不够，不是真的没有。"""
+
+    def test_registry_only_must_not_claim_success(self):
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"]},
+            values={NIC_KEY + r"\0000": {"DriverDesc": "Realtek PCIe GbE"}})
+        out = []
+        # 模拟"只有注册表来源"：把 PowerShell 来源打断
+        orig = nfc.enumerate_via_powershell
+        nfc.enumerate_via_powershell = lambda runner=None, timeout=20: None
+        try:
+            nfc.report_nic_filters(reg=reg, log_fn=out.append)
+        finally:
+            nfc.enumerate_via_powershell = orig
+        txt = "\n".join(out)
+        assert "✓" not in txt, "只有遗留来源却给了 ✓ —— 这是骗人"
+        assert "不能" in txt and "NDIS 6" in txt, txt
+        assert "Get-NetAdapterBinding" in txt      # 必须给出手工核对命令
+
+
+class TestReportWithPowerShell:
+    """report_nic_filters 走权威来源时的完整输出（之前这条路径在非 Windows 上
+    被平台守卫挡掉，测不到——已透传 use_powershell）。"""
+
+    NIC_DESC = "Realtek PCIe GbE Family Controller"
+
+    # 本机**已安装**的过滤驱动（Services 键下）。刻意和"已绑定"分开：
+    # 装了不等于绑了，这正是这个测试要覆盖的区别。
+    INSTALLED = ("ms_wfplwf_upper", "GXGigEFilter", "MVGIgEFilter")
+
+    def _reg(self, bindings=("ms_wfplwf_upper", "GXGigEFilter")):
+        rows = [{"Name": "以太网", "InterfaceDescription": self.NIC_DESC,
+                 "ComponentID": c, "Enabled": True, "Class": "Filter"}
+                for c in bindings]
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"],
+                     SVC: list(self.INSTALLED) + ["Tcpip"]},
+            values={
+                NIC_KEY + r"\0000": {"DriverDesc": self.NIC_DESC},
+                SVC + r"\ms_wfplwf_upper": {"DisplayName": "WFP Lightweight Filter",
+                                            "FilterClass": "Custom"},
+                SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE Filter",
+                                         "FilterClass": "Custom"},
+                SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE",
+                                         "FilterClass": "Custom"},
+                SVC + r"\Tcpip": {"DisplayName": "TCP/IP Protocol Driver"},
+            })
+        return reg, rows
+
+    def test_single_gige_reports_success_and_shows_wfp(self):
+        reg, rows = self._reg()
+        out = []
+        rep = nfc.report_nic_filters(reg=reg, use_powershell=True,
+                                     ps_runner=_ps_runner(rows), log_fn=out.append)
+        txt = "\n".join(out)
+        assert "✓" in txt
+        assert "WFP Lightweight Filter" in txt   # 权威来源确实生效了
+        assert rep["sources"] == ["netadapterbinding", "registry"]
+        assert len(rep["all_filters"]) == 1, "同一块卡被拆成两条了"
+
+    def test_two_gige_via_powershell_warns_and_counts_conflict(self):
+        reg, rows = self._reg(("MVGIgEFilter", "GXGigEFilter"))
+        out = []
+        rep = nfc.report_nic_filters(reg=reg, use_powershell=True,
+                                     ps_runner=_ps_runner(rows), log_fn=out.append)
+        assert len(rep["conflicts"]) == 1
+        assert "⚠" in "\n".join(out)
+
+    def test_installed_but_unbound_is_reported(self):
+        """装了但没绑定的 GigE 过滤驱动也要报出来。"""
+        reg, rows = self._reg(("ms_wfplwf_upper",))   # 只绑了 WFP
+        out = []
+        rep = nfc.report_nic_filters(reg=reg, use_powershell=True,
+                                     ps_runner=_ps_runner(rows), log_fn=out.append)
+        txt = "\n".join(out)
+        bound = {f["service"] for e in rep["all_filters"] for f in e["filters"]}
+        assert "GXGigEFilter" not in bound           # 确实没绑定
+        assert "未绑定到任何网卡" in txt, txt
+        assert "已安装的疑似 GigE 过滤驱动" in txt

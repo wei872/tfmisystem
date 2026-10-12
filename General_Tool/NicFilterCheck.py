@@ -32,6 +32,8 @@
 ===============================================================================
 """
 
+import json
+import re
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -44,10 +46,41 @@ _NIC_CLASS_KEY = (
 )
 _SERVICES_KEY = r"SYSTEM\CurrentControlSet\Services"
 
+# ⚠️ 网卡类键下面的子键**不全是网卡实例**。除了 0000/0001/... 之外还有
+#    Properties、Configuration 等非实例键。真机日志实证过：不加这个过滤，
+#    日志里会冒出「网卡 Configuration (名称未知)」「网卡 Properties (名称未知)」。
+_NIC_INSTANCE_RE = re.compile(r"^\d{4}$")
+
 # 扫描上限。正常机器上网卡实例是几个到十几个；这个上限纯粹是防御性的，
 # 避免注册表异常时把启动流程拖住。
 _MAX_NIC_KEYS = 64
 _MAX_FILTERS_PER_NIC = 64
+_MAX_SERVICE_KEYS = 8192
+
+# ------------------------------------------------------------------
+# 数据来源
+# ------------------------------------------------------------------
+# ⚠️ 这是本模块**最关键**的一点，也是真机日志逼出来的教训：
+#
+#   `UpperBindings` / `LowerBindings` 是 **NDIS 5.x 时代**中间驱动/协议驱动
+#   的绑定机制。**NDIS 6 轻量过滤驱动（GigE Vision 过滤驱动就是这一类）
+#   不写这两个值。** 所以在现代 Windows 上只读它们，结果是每张网卡都"无"。
+#   真机日志实证：一块 Realtek PCIe GbE 报"无"，而任何 Windows 8+ 机器上
+#   这块卡至少绑着 "WFP Lightweight Filter"。全空 = 读错了地方。
+#
+# 因此改用三个来源合并：
+#   1. `Get-NetAdapterBinding`（**权威**，就是设备管理器那个勾选框的数据源，
+#      只读、不需要管理员权限）
+#   2. 扫描 Services 找**已安装**的 NDIS 过滤驱动（判据：服务键下有
+#      FilterClass / FilterRunOrder）—— 抓"装了但没绑定"的情况，这对判断
+#      "海康 MVS 到底卸干净没有"更重要
+#   3. UpperBindings / LowerBindings（保留，兼容老的 NDIS 5 驱动）
+_PS_QUERY = (
+    "Get-NetAdapterBinding | "
+    "Select-Object Name, InterfaceDescription, ComponentID, Enabled, Class | "
+    "ConvertTo-Json -Compress -Depth 3"
+)
+_PS_TIMEOUT_SEC = 20
 
 # ------------------------------------------------------------------
 # GigE Vision 过滤驱动的名字特征（大小写不敏感子串匹配）
@@ -195,23 +228,125 @@ def _matches(text: str, patterns: Sequence[str]) -> Optional[str]:
 #  枚举 + 判定
 # ==================================================================
 
+def _service_meta(reg: _Registry, svc: str) -> Dict:
+    """从 Services 键取一个服务的基本信息，用于认厂商。"""
+    sbase = _SERVICES_KEY + "\\" + svc
+    return {
+        "service": svc,
+        "display_name": reg.value(sbase, "DisplayName") or "",
+        "description": reg.value(sbase, "Description") or "",
+        "image_path": reg.value(sbase, "ImagePath") or "",
+    }
+
+
+def _classify(meta: Dict, gp: Sequence[str], cp: Sequence[str]) -> Dict:
+    hay = _haystack(meta.get("service", ""), meta.get("display_name", ""),
+                    meta.get("description", ""), meta.get("image_path", ""))
+    out = dict(meta)
+    out["matched_gige"] = _matches(hay, gp)
+    out["matched_capture"] = _matches(hay, cp)
+    return out
+
+
+def enumerate_via_powershell(runner=None, timeout: int = _PS_TIMEOUT_SEC):
+    """用 ``Get-NetAdapterBinding`` 枚举每张网卡上的绑定项。
+
+    这是**权威**来源：设备管理器里"此连接使用下列项目"那个勾选框，读的就是
+    同一份数据。只读，不需要管理员权限。
+
+    :param runner: ``(cmd, timeout) -> (rc, stdout, stderr)``，测试可注入
+    :return: list of dict（每项含 Name/InterfaceDescription/ComponentID/
+             Enabled/Class）；**来源不可用时返回 None**（PowerShell 不存在、
+             被策略禁用、超时、输出不是 JSON 都算不可用）
+    """
+    run = runner or _run_powershell
+    try:
+        rc, out, err = run(_PS_QUERY, timeout)
+    except Exception:
+        return None
+    if not out or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    # ConvertTo-Json 在只有一条记录时会输出对象而不是数组
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not data:
+        return None
+    return data
+
+
+def enumerate_installed_filters(reg: Optional[_Registry] = None,
+                                gige_patterns=None) -> List[Dict]:
+    """扫描 Services，找出本机**已安装**的 NDIS 过滤驱动。
+
+    判据是服务键下存在 ``FilterClass`` 或 ``FilterRunOrder`` —— 这两个值只有
+    NDIS 6 轻量过滤驱动才会注册。
+
+    为什么单独做这一步：``Get-NetAdapterBinding`` 只能看到**已绑定**的过滤
+    驱动。而"海康 MVS 装过、只是没勾上"同样是个隐患（下次有人装驱动、或
+    换了网卡，它可能自己绑上去）。这一步跟网卡无关，纯粹看装没装。
+
+    :return: list of dict，每项含 ``service`` / ``display_name`` /
+             ``description`` / ``image_path`` / ``filter_class`` /
+             ``matched_gige``。读不到返回空列表。
+    """
+    if reg is None:
+        if sys.platform != "win32":
+            return []
+        reg = _WinRegistry()
+        if not reg.available():
+            return []
+
+    gp = tuple(gige_patterns) if gige_patterns else DEFAULT_GIGE_PATTERNS
+    try:
+        names = reg.subkeys(_SERVICES_KEY)
+    except Exception:
+        return []
+
+    out: List[Dict] = []
+    for name in names[:_MAX_SERVICE_KEYS]:
+        try:
+            sbase = _SERVICES_KEY + "\\" + name
+            fclass = reg.value(sbase, "FilterClass")
+            forder = reg.value(sbase, "FilterRunOrder")
+            if fclass is None and forder is None:
+                continue          # 不是 NDIS 过滤驱动
+            meta = _service_meta(reg, name)
+            meta["filter_class"] = str(fclass or "")
+            hay = _haystack(meta["service"], meta["display_name"],
+                            meta["description"], meta["image_path"],
+                            meta["filter_class"])
+            meta["matched_gige"] = _matches(hay, gp)
+            out.append(meta)
+        except Exception:
+            continue
+    return out
+
+
 def enumerate_nic_filters(reg: Optional[_Registry] = None,
                           gige_patterns: Optional[Sequence[str]] = None,
-                          capture_patterns: Optional[Sequence[str]] = None
+                          capture_patterns: Optional[Sequence[str]] = None,
+                          ps_runner=None,
+                          use_powershell: Optional[bool] = None
                           ) -> Optional[List[Dict]]:
-    """枚举每张网卡上绑定的 NDIS 过滤驱动。
+    """枚举每张网卡上绑定的 NDIS 过滤驱动（三个来源合并）。
 
     :param reg:              注册表实现，默认用真实 winreg；测试注入假实现
     :param gige_patterns:    覆盖默认的 GigE 特征表（现场发现漏了某个厂商时，
                              从 config.yaml 的 ``logging.nic_filter_patterns``
                              传进来）。传 None 用 :data:`DEFAULT_GIGE_PATTERNS`。
     :param capture_patterns: 同上，抓包类驱动特征表
+    :param ps_runner:        ``Get-NetAdapterBinding`` 的执行器，测试可注入
+    :param use_powershell:   None = 自动（Windows 且没显式传 reg 时才用）
     :return: list of dict，每项一张网卡：
-             ``{"nic_key", "driver_desc", "filters": [{"service",
-             "display_name", "description", "image_path",
-             "matched_gige", "matched_capture"}]}``；
-             **非 Windows / 读不到注册表时返回 None**（不是空列表——
-             空列表的意思是"查到了，一张网卡都没有"，两者不能混）。
+             ``{"nic_key", "driver_desc", "conn_name", "sources",
+             "filters": [{"service", "display_name", "description",
+             "image_path", "matched_gige", "matched_capture", "enabled"}]}``；
+             **所有来源都拿不到数据时返回 None**（不是空列表——空列表的意思是
+             "查到了，一张网卡都没有"，两者不能混）。
     """
     gp = tuple(gige_patterns) if gige_patterns else DEFAULT_GIGE_PATTERNS
     cp = tuple(capture_patterns) if capture_patterns else CAPTURE_PATTERNS
@@ -225,50 +360,86 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
         if not reg.available():
             return None
 
+    # --- 来源 1：Get-NetAdapterBinding（权威）----------------------------
+    ps = None
+    if use_powershell is True or (
+            use_powershell is None and sys.platform == "win32"):
+        ps = enumerate_via_powershell(runner=ps_runner)
+
+    nics: Dict[str, Dict] = {}      # key: 网卡标识 -> 记录
+
+    if ps:
+        for row in ps:
+            try:
+                if str(row.get("Class", "")).lower() != "filter":
+                    continue        # 只要过滤驱动，不要协议/服务/客户端
+                cid = str(row.get("ComponentID") or "").strip()
+                if not cid:
+                    continue
+                name = str(row.get("Name") or "").strip()
+                idesc = str(row.get("InterfaceDescription") or "").strip()
+                # ⚠️ 合并键必须和注册表那边一致，否则**同一块物理网卡会被拆成
+                #    两条记录**：PowerShell 给的是连接名（"以太网 2"），注册表
+                #    给的是 DriverDesc（"Realtek PCIe GbE Family Controller"）。
+                #    两边能对上的是 InterfaceDescription == DriverDesc，所以
+                #    一律用它做键。拆开的后果不只是日志重复 —— 两个来源各看到
+                #    一部分过滤驱动时，"≥2"的阈值可能谁都不满足，硬闸门会漏判。
+                key = idesc or name
+                if not key:
+                    continue
+                rec = nics.setdefault(key, {
+                    "nic_key": name, "driver_desc": idesc,
+                    "conn_name": name, "sources": set(), "filters": []})
+                rec["driver_desc"] = rec["driver_desc"] or idesc
+                rec["sources"].add("netadapterbinding")
+                f = _classify(_service_meta(reg, cid), gp, cp)
+                f["enabled"] = bool(row.get("Enabled", True))
+                rec["filters"].append(f)
+            except Exception:
+                continue
+
+    # --- 来源 2/3：注册表网卡类键（含遗留的 Upper/LowerBindings）-----------
     try:
         keys = reg.subkeys(_NIC_CLASS_KEY)
     except Exception:
-        return None
-    if not keys:
-        # 键存在但一个子键都没有：要么真没网卡，要么权限不够。
-        # 一律当"没查到"，不猜。
-        return None
-
-    nics = []
+        keys = []
     for sub in keys:
+        # ⚠️ 必须过滤：类键下还有 Properties / Configuration 等非实例子键
+        if not _NIC_INSTANCE_RE.match(str(sub)):
+            continue
         try:
             base = _NIC_CLASS_KEY + "\\" + sub
             desc = reg.value(base, "DriverDesc")
             bound = list(_as_str_list(reg.value(base, "UpperBindings")))
             bound += [s for s in _as_str_list(reg.value(base, "LowerBindings"))
                       if s not in bound]
-
-            filters = []
+            if not bound and not nics:
+                # 这张卡没有任何遗留绑定，而 PowerShell 那边也没有它的记录：
+                # 仍然要列出来，让操作员看见"这张卡查过了、是空的"
+                pass
+            key = str(desc or "").strip() or sub
+            rec = nics.setdefault(key, {
+                "nic_key": sub, "driver_desc": desc or "",
+                "conn_name": "", "sources": set(), "filters": []})
+            rec["sources"].add("registry")
+            seen = {f["service"] for f in rec["filters"]}
             for svc in bound[:_MAX_FILTERS_PER_NIC]:
-                sbase = _SERVICES_KEY + "\\" + svc
-                disp = reg.value(sbase, "DisplayName")
-                descr = reg.value(sbase, "Description")
-                img = reg.value(sbase, "ImagePath")
-                hay = _haystack(svc, disp, descr, img)
-                filters.append({
-                    "service": svc,
-                    "display_name": disp or "",
-                    "description": descr or "",
-                    "image_path": img or "",
-                    "matched_gige": _matches(hay, gp),
-                    "matched_capture": _matches(hay, cp),
-                })
-
-            nics.append({
-                "nic_key": sub,
-                "driver_desc": desc or "",
-                "filters": filters,
-            })
+                if svc in seen:
+                    continue
+                f = _classify(_service_meta(reg, svc), gp, cp)
+                f["enabled"] = True
+                rec["filters"].append(f)
+                seen.add(svc)
         except Exception:
-            # 单张网卡读失败不影响其他网卡
-            continue
+            continue      # 单张网卡读失败不影响其他网卡
 
-    return nics if nics else None
+    if not nics:
+        return None
+    out = []
+    for rec in nics.values():
+        rec["sources"] = sorted(rec["sources"])
+        out.append(rec)
+    return out
 
 
 def analyse_nic_filters(nics: Optional[List[Dict]]) -> Dict:
@@ -296,6 +467,9 @@ def analyse_nic_filters(nics: Optional[List[Dict]]) -> Dict:
             "driver_desc": nic.get("driver_desc", ""),
             "filters": filters,
             "gige_filters": gige,
+            # 这条记录的数据从哪来（netadapterbinding / registry）。
+            # 日志要靠它区分"权威来源查到是空的"和"只有遗留来源、结果不可信"。
+            "sources": nic.get("sources", []),
         }
         out["all_filters"].append(entry)
         if len(gige) >= 2:
@@ -318,7 +492,9 @@ def _fmt_filter(f: Dict) -> str:
 def report_nic_filters(report: Optional[Dict] = None,
                        reg: Optional[_Registry] = None,
                        log_fn=None,
-                       gige_patterns: Optional[Sequence[str]] = None) -> Dict:
+                       gige_patterns: Optional[Sequence[str]] = None,
+                       ps_runner=None,
+                       use_powershell: Optional[bool] = None) -> Dict:
     """查 + 打日志。**这是给 main_yolo 启动流程调的入口，永不抛异常。**
 
     日志策略（刻意的设计）：
@@ -331,13 +507,19 @@ def report_nic_filters(report: Optional[Dict] = None,
 
     :param gige_patterns: 覆盖默认 GigE 特征表（来自
                           ``config.yaml: logging.nic_filter_patterns``）
+    :param ps_runner:     ``Get-NetAdapterBinding`` 的执行器，测试注入用
+    :param use_powershell: None = 自动（仅 Windows）。**显式传 True 时不再判
+                          平台** —— 否则平台守卫会把注入的执行器挡掉，
+                          PowerShell 那条路径就永远测不到。
     :return: analyse_nic_filters() 的结果；异常时返回 ``{"checked": False}``
     """
     log = log_fn or info
     warn = log_fn or warning
 
     try:
-        nics = enumerate_nic_filters(reg, gige_patterns=gige_patterns)
+        nics = enumerate_nic_filters(reg, gige_patterns=gige_patterns,
+                                     ps_runner=ps_runner,
+                                     use_powershell=use_powershell)
     except Exception as e:                       # 防御性兜底，正常到不了
         try:
             log(f"[网卡过滤驱动] 检查失败（不影响启动）: {e!r}")
@@ -360,6 +542,21 @@ def report_nic_filters(report: Optional[Dict] = None,
     result = analyse_nic_filters(nics)
     conflicts = result["conflicts"]
 
+    # 本机**已安装**的 NDIS 过滤驱动（跟有没有绑定无关）。
+    # 抓的是"海康 MVS 装过、只是没勾上"这种情况——它现在不惹事，
+    # 但换网卡 / 重装驱动时可能自己绑回去。
+    try:
+        installed = enumerate_installed_filters(reg, gige_patterns=gige_patterns)
+    except Exception:
+        installed = []
+    result["installed_filters"] = installed
+    result["installed_gige"] = [f for f in installed if f.get("matched_gige")]
+
+    # 用了哪些数据来源
+    srcs = sorted({s for e in result["all_filters"] for s in e.get("sources", [])})
+    ps_ok = "netadapterbinding" in srcs
+    result["sources"] = srcs
+
     try:
         if conflicts:
             warn("[网卡过滤驱动] ⚠ 发现 {} 张网卡上同时挂了多个疑似 "
@@ -381,20 +578,54 @@ def report_nic_filters(report: Optional[Dict] = None,
                 log("  网卡 {} ({}): {}".format(
                     s["nic"], s["driver_desc"] or "名称未知",
                     _fmt_filter(s["gige_filters"][0])))
+        elif not ps_ok:
+            # ⚠️ 这种情况**不能**说"没有 GigE 过滤驱动"。
+            # 只拿到注册表时，Upper/LowerBindings 覆盖不到 NDIS 6 轻量过滤
+            # 驱动，"全空"极可能是数据源不够而不是真的没有。必须如实说明，
+            # 并给出可手工核对的命令 —— 否则就是拿一个假的 ✓ 骗人。
+            warn("[网卡过滤驱动] ⚠ 未能通过 Get-NetAdapterBinding 取到网卡绑定"
+                 "数据（PowerShell 不可用 / 被策略禁用 / 超时），"
+                 "只查到了注册表里的遗留绑定项。")
+            warn("  ⚠ 因此下面清单里的\"无\"**不能**当作\"这张卡没有过滤驱动\"："
+                 "注册表的 UpperBindings/LowerBindings 覆盖不到 NDIS 6 轻量"
+                 "过滤驱动，而 GigE Vision 过滤驱动正是这一类。")
+            warn("  请手工核对（不需要管理员权限）：")
+            warn("    powershell -NoProfile -Command \""
+                 "Get-NetAdapterBinding -Class Filter | "
+                 "Format-Table Name, InterfaceDescription, ComponentID, Enabled\"")
         else:
-            log("[网卡过滤驱动] 未识别到任何疑似 GigE 过滤驱动。"
-                "如果现场确实在用 GigE 相机，请把下面清单里的驱动名补进 "
-                "config.yaml 的 logging.nic_filter_patterns。")
+            log("[网卡过滤驱动] ✓ 各网卡上均未发现疑似 GigE 过滤驱动"
+                "（数据来源：Get-NetAdapterBinding，权威）。")
+            log("  如果现场确实在用 GigE 相机却看到这条，请把上面清单里的驱动名"
+                "补进 config.yaml 的 logging.nic_filter_patterns。")
+
+        # 已安装但未绑定的 GigE 过滤驱动：不是冲突，但值得知道
+        if result["installed_gige"]:
+            bound_svcs = {f.get("service")
+                          for e in result["all_filters"] for f in e["filters"]}
+            unbound = [f for f in result["installed_gige"]
+                       if f.get("service") not in bound_svcs]
+            log("[网卡过滤驱动] 本机已安装的疑似 GigE 过滤驱动 {} 个：".format(
+                len(result["installed_gige"])))
+            for f in result["installed_gige"]:
+                state = ("已绑定" if f.get("service") in bound_svcs
+                         else "未绑定到任何网卡")
+                log("      {}  ({})  [{}]".format(
+                    f.get("service"), f.get("display_name") or "", state))
+            if unbound:
+                log("  ↑ 未绑定的这些现在不影响运行，但换网卡或重装驱动时可能"
+                    "自己绑上去；确认不再使用海康设备的话建议卸载。")
 
         # 完整清单一律打印：名字表不可能覆盖所有厂商
         log("[网卡过滤驱动] 各网卡已绑定的过滤驱动完整清单：")
         for e in result["all_filters"]:
+            tag = "/".join(e.get("sources") or []) or "无来源"
             if not e["filters"]:
-                log("  网卡 {} ({}): 无".format(
-                    e["nic"], e["driver_desc"] or "名称未知"))
+                log("  网卡 {} ({}): 无   [来源: {}]".format(
+                    e["nic"], e["driver_desc"] or "名称未知", tag))
                 continue
-            log("  网卡 {} ({}):".format(
-                e["nic"], e["driver_desc"] or "名称未知"))
+            log("  网卡 {} ({}):   [来源: {}]".format(
+                e["nic"], e["driver_desc"] or "名称未知", tag))
             for f in e["filters"]:
                 log("      " + _fmt_filter(f))
     except Exception:
@@ -630,12 +861,16 @@ def disable_filter_bindings(confirm: bool = False,
     return out
 
 
-def _run_powershell(cmd: str):
-    """执行一条 PowerShell 命令，返回 (returncode, stdout, stderr)。"""
+def _run_powershell(cmd: str, timeout: int = 60):
+    """执行一条 PowerShell 命令，返回 (returncode, stdout, stderr)。
+
+    超时和任何异常都由**调用方**负责吞掉——本函数只负责跑。
+    """
     import subprocess
     p = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-        capture_output=True, text=True, timeout=60)
+        capture_output=True, text=True, timeout=timeout,
+        encoding="utf-8", errors="replace")
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
