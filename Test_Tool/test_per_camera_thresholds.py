@@ -445,3 +445,106 @@ def test_stop_lookup_raising_is_tolerated(monkeypatch):
     assert st.check_camera_threshold_stop_impact(
         ["camera3"], GLOBAL, GLOBAL_DEFAULT, _boom) == []
 
+
+# ======================================================================
+#  7. 校验真实 config.yaml（守住已发布的配置本身）
+# ======================================================================
+
+CONFIG_PATH = os.path.join(_ROOT, "config.yaml")
+
+
+def _load_config():
+    import yaml
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def test_shipped_config_override_blocks_are_dicts():
+    """
+    **这条守的是一个真实踩过的坑**：生成配置时漏写冒号，
+    ``class_confidence_thresholds`` 整块被 YAML 解析成一个字符串。
+
+    危险之处在于它**不会报错**——代码对"非字典覆盖块"是按"没配覆盖"
+    静默处理的，所以程序照常跑，但按相机配置完全不生效。
+    """
+    cfg = _load_config()
+    ov = cfg.get("camera_threshold_overrides")
+    if not ov:
+        return                      # 未配置也是合法状态
+    assert isinstance(ov, dict), "camera_threshold_overrides 必须是映射"
+    for cam, block in ov.items():
+        assert isinstance(block, dict), (
+            f"{cam} 的覆盖块必须是映射，实际是 {type(block).__name__}。"
+            f"常见原因是漏写冒号导致整块被解析成字符串。")
+        pc = block.get("class_confidence_thresholds")
+        if pc is not None:
+            assert isinstance(pc, dict), (
+                f"{cam}.class_confidence_thresholds 必须是映射，"
+                f"实际是 {type(pc).__name__}")
+            for cls, v in pc.items():
+                assert isinstance(v, (int, float)) and not isinstance(v, bool), (
+                    f"{cam}.{cls} = {v!r} 必须是数字")
+
+
+def test_shipped_config_covers_all_cameras_or_none():
+    """要么一台都不配（全走全局），要么 8 台都列全——避免只配一半造成混乱"""
+    cfg = _load_config()
+    ov = cfg.get("camera_threshold_overrides")
+    if not ov:
+        return
+    expected = sorted(set(cfg["cameras"]["sn_map"].values()))
+    assert sorted(ov) == expected, (
+        f"覆盖块应列全 {expected}，实际只有 {sorted(ov)}")
+
+
+def test_shipped_config_matches_global_so_behaviour_is_unchanged():
+    """
+    已发布的 8 台展开配置，每台的值都等于全局值，所以**行为必须与不配置
+    时完全一致**。若有人改了某台的数，这条会失败——那是有意的，提醒同时
+    去看启动日志的停机交叉校验。
+    """
+    cfg = _load_config()
+    ov = cfg.get("camera_threshold_overrides")
+    if not ov:
+        return
+    gdet = dict(cfg["class_confidence_thresholds"])
+    for cam, block in ov.items():
+        pc = block.get("class_confidence_thresholds") or {}
+        for cls, v in pc.items():
+            assert cls in gdet, (
+                f"{cam} 覆盖了一个全局里没有的类 {cls!r}，"
+                f"请确认类名没有写错（写错的类名不会报错，只会静默无效）")
+            assert float(v) == float(gdet[cls]), (
+                f"{cam}.{cls}={v} 与全局 {gdet[cls]} 不同，"
+                f"说明这台相机的检测行为已被改动")
+
+
+def test_shipped_config_does_not_shadow_global_default():
+    """
+    展开的 8 台里**不应该**出现 default_class_confidence。
+
+    写了它会让该相机上所有"没显式列出的类"都用这个默认值，把全局的按类
+    阈值全部遮蔽。目前有 4 个类只在 machine_stop_rules 里（棉团、捻接器
+    接头、小尾巴、稀缝），它们靠回落到全局 default_class_confidence 工作。
+    """
+    cfg = _load_config()
+    ov = cfg.get("camera_threshold_overrides")
+    if not ov:
+        return
+    for cam, block in ov.items():
+        assert "default_class_confidence" not in block, (
+            f"{cam} 不应配置 default_class_confidence：它会遮蔽全局的按类"
+            f"阈值，使只在 machine_stop_rules 里的类拿不到正确的回落值")
+
+
+def test_shipped_config_classes_are_a_subset_of_global():
+    """覆盖里出现的每个类名都必须在全局里存在，否则是拼写错误"""
+    cfg = _load_config()
+    ov = cfg.get("camera_threshold_overrides")
+    if not ov:
+        return
+    gdet = cfg["class_confidence_thresholds"]
+    for cam, block in ov.items():
+        for cls in (block.get("class_confidence_thresholds") or {}):
+            assert cls in gdet, f"{cam} 里的类名 {cls!r} 在全局配置中不存在"
+
