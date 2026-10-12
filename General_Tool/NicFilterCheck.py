@@ -82,10 +82,20 @@ _MAX_SERVICE_KEYS = 8192
 #    过滤掉，变成静默的假阴性。
 #    所以这里取全部绑定项，"是不是 NDIS 过滤驱动"改由注册表 Services 扫描
 #    （FilterClass / FilterRunOrder）来判定 —— 那个判据是可靠的。
+# ⚠️ 输出走 **base64**，这是为了根除中文乱码。
+#
+#   Windows PowerShell 5.1 在 stdout 被重定向时用的是**控制台/OEM 代码页**
+#   （中文机器 cp936），不是 UTF-8。真机实证：直接取文本会把"以太网"变成
+#   "?̫?"、"Microsoft 网络客户端"变成"Microsoft ????ͻ???"。
+#   靠猜代码页不可靠（ANSI 页和 OEM 页在非中文系统上还不是同一个）。
+#
+#   base64 只含 ASCII，**与控制台代码页完全无关**，解码侧不需要猜任何东西：
+#   base64 → UTF-8 字节 → JSON。这是唯一能保证不出乱码的路子。
 _PS_QUERY = (
-    "Get-NetAdapterBinding | "
+    "$j = Get-NetAdapterBinding | "
     "Select-Object Name, InterfaceDescription, ComponentID, DisplayName, "
-    "Enabled | ConvertTo-Json -Compress -Depth 3"
+    "Enabled | ConvertTo-Json -Compress -Depth 3; "
+    "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))"
 )
 _PS_TIMEOUT_SEC = 20
 
@@ -117,6 +127,17 @@ DEFAULT_GIGE_PATTERNS: Sequence[str] = (
     "gxgige",
     "gxiapi",
     "galaxy",
+    # ⚠️ 真机实证补的（用户生产机 PowerShell 输出里实际存在，而原表漏了）：
+    #   HKR_neuGEVFilter  "Neu GigEVision Image Filter Driver"  <- 海康机器人
+    #   MVTec_Hgevstrm    "MVTec GigE Vision Streaming Filter"  <- HALCON 厂商
+    "hkr",           # HikRobot 前缀
+    "hikrobot",
+    "neu gev",
+    "gevision",      # "GigEVision" 常写成连写
+    "gevfilter",
+    "gevstrm",
+    "hgev",
+    "mvtec",
     # 其他常见 GigE Vision 厂商（现场可能装过试用版驱动）
     "basler",
     "pleora",
@@ -276,8 +297,16 @@ def enumerate_via_powershell(runner=None, timeout: int = _PS_TIMEOUT_SEC):
         return None
     if not out or not out.strip():
         return None
+    payload = out.strip()
+    # 正常路径：base64 → UTF-8 字节 → JSON。与控制台代码页无关，不会乱码。
     try:
-        data = json.loads(out)
+        import base64
+        payload = base64.b64decode(payload).decode("utf-8")
+    except Exception:
+        pass          # 不是 base64（比如 cmdlet 报错时输出的是错误文本），
+                      # 就按原样交给 json 解析，解析不出来返回 None
+    try:
+        data = json.loads(payload)
     except Exception:
         return None
     # ConvertTo-Json 在只有一条记录时会输出对象而不是数组
@@ -411,15 +440,23 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
                     "conn_name": name, "sources": set(), "filters": []})
                 rec["driver_desc"] = rec["driver_desc"] or idesc
                 rec["sources"].add("netadapterbinding")
-                f = _classify(_service_meta(reg, cid), gp, cp)
+                # ⚠️ **顺序是要害**：PowerShell 给的 DisplayName 必须在
+                #    _classify() **之前**合进 meta。真机实证：注册表里读不到
+                #    HKR_neuGEVFilter / MVTec_Hgevstrm 的 DisplayName，于是
+                #    haystack 只剩服务名（"hkr_neugevfilter" 里没有 "gige"），
+                #    matched_gige 变成 None —— 一张网卡上三个 GigE 过滤驱动
+                #    只认出一个，硬闸门因此没触发。而漏掉的 HKR_neuGEVFilter
+                #    正是海康机器人（HikRobot）的驱动。
+                meta = _service_meta(reg, cid)
+                ps_disp = str(row.get("DisplayName") or "").strip()
+                if ps_disp:
+                    meta["display_name"] = ps_disp
+                f = _classify(meta, gp, cp)
                 f["enabled"] = bool(row.get("Enabled", True))
                 # 注册表确认它是 NDIS 过滤驱动；否则只是普通协议/服务绑定。
                 # 拿不准时（Services 扫描失败）标 None，不冒充。
                 f["is_ndis_filter"] = (cid in _known_filters
                                        if _known_filters else None)
-                # PowerShell 那边直接给了 DisplayName，比注册表更权威
-                f["display_name"] = (str(row.get("DisplayName") or "").strip()
-                                     or f.get("display_name") or "")
                 rec["filters"].append(f)
             except Exception:
                 continue
@@ -897,17 +934,47 @@ def disable_filter_bindings(confirm: bool = False,
     return out
 
 
+def _decode_console(raw: bytes) -> str:
+    """把子进程输出按**正确的**代码页解码。
+
+    ⚠️ 真机实证的坑（本模块自己踩的回归）：
+      Windows PowerShell 5.1 在 stdout 被重定向时，用的是**控制台/OEM 代码页**，
+      中文机器是 cp936(GBK)，**不是 UTF-8**。之前这里写死 encoding="utf-8"，
+      于是"以太网"变成"?̫?"、"Microsoft 网络客户端"变成"Microsoft ????ͻ???"。
+      讽刺的是：不写 encoding、让 subprocess 用系统默认反而是对的。
+
+    策略：拿**字节**，按 UTF-8 严格 → 本机 ANSI/OEM → 兜底 replace 逐级尝试。
+    UTF-8 严格能过就说明是 UTF-8（PowerShell 7，或下面显式设过 OutputEncoding）；
+    过不了就是本机代码页。
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        import locale
+        enc = locale.getpreferredencoding(False)
+        if enc:
+            return raw.decode(enc)
+    except Exception:
+        pass
+    return raw.decode("utf-8", errors="replace")
+
+
 def _run_powershell(cmd: str, timeout: int = 60):
     """执行一条 PowerShell 命令，返回 (returncode, stdout, stderr)。
 
     超时和任何异常都由**调用方**负责吞掉——本函数只负责跑。
+    **不用 text=True**：编码由 :func:`_decode_console` 自己判，
+    交给 subprocess 猜会在中文机器上出乱码。
     """
     import subprocess
     p = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-        capture_output=True, text=True, timeout=timeout,
-        encoding="utf-8", errors="replace")
-    return p.returncode, p.stdout or "", p.stderr or ""
+        capture_output=True, timeout=timeout)
+    return p.returncode, _decode_console(p.stdout), _decode_console(p.stderr)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

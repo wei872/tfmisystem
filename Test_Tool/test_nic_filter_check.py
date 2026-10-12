@@ -1014,3 +1014,123 @@ class TestRealDahengComponentId:
         assert [a["service"] for a in plan["actions"]] == ["MVGIgEFilter"]
         assert [x["service"] for x in plan["skipped"]] == ["ms_GxGVLWFilter"]
         assert "大恒" in plan["skipped"][0]["reason"]
+
+
+# --------------------------- §11 真机第二轮日志暴露的两个缺陷（回归钉子）
+class TestDisplayNameMustFeedClassification:
+    """真机实证：以太网那块卡上有**三个** GigE Vision 过滤驱动，
+    但只有大恒那个被认出来 —— 因为 _classify() 用的是注册表的 DisplayName，
+    而 PowerShell 给的那个补得太晚。漏掉的 HKR_neuGEVFilter 正是海康机器人的。"""
+
+    ETH = "Realtek PCIe GbE Family Controller"
+    ROWS = [
+        ("ms_GxGVLWFilter", "GigE Vision LightWeight Filter"),
+        ("HKR_neuGEVFilter", "Neu GigEVision Image Filter Driver"),
+        ("MVTec_Hgevstrm", "MVTec GigE Vision Streaming Filter"),
+        ("ms_tcpip", "Internet 协议版本 4 (TCP/IPv4)"),
+    ]
+
+    def _nics(self):
+        import json as _json
+        rows = [{"Name": "以太网", "InterfaceDescription": self.ETH,
+                 "ComponentID": c, "DisplayName": d, "Enabled": True}
+                for c, d in self.ROWS]
+        # 注册表**故意不给** DisplayName —— 真机就是读不到，才暴露了这个 bug
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"],
+                     SVC: ["ms_GxGVLWFilter", "HKR_neuGEVFilter", "MVTec_Hgevstrm"]},
+            values={NIC_KEY + r"\0000": {"DriverDesc": self.ETH},
+                    SVC + r"\ms_GxGVLWFilter": {"FilterClass": "Custom"},
+                    SVC + r"\HKR_neuGEVFilter": {"FilterClass": "Custom"},
+                    SVC + r"\MVTec_Hgevstrm": {"FilterClass": "Custom"}})
+        return nfc.enumerate_nic_filters(
+            reg=reg, use_powershell=True,
+            ps_runner=lambda c, t=20: (0, _json.dumps(rows), ""))
+
+    def test_all_three_gige_filters_are_detected(self):
+        by = {f["service"]: f["matched_gige"] for f in self._nics()[0]["filters"]}
+        assert by["ms_GxGVLWFilter"], by
+        assert by["HKR_neuGEVFilter"], "海康机器人的驱动漏检了: %r" % by
+        assert by["MVTec_Hgevstrm"], "MVTec 的驱动漏检了: %r" % by
+
+    def test_hikrobot_driver_is_attributed_to_hikrobot(self):
+        by = {f["service"]: f["matched_gige"] for f in self._nics()[0]["filters"]}
+        assert by["HKR_neuGEVFilter"] == "hkr"
+
+    def test_three_filters_on_one_nic_is_a_conflict(self):
+        rep = nfc.analyse_nic_filters(self._nics())
+        assert len(rep["conflicts"]) == 1
+        assert len(rep["conflicts"][0]["gige_filters"]) == 3
+
+    def test_plan_disable_protects_daheng_and_targets_the_rest(self):
+        rep = nfc.analyse_nic_filters(self._nics())
+        plan = nfc.plan_disable(report=rep)
+        acts = sorted(a["service"] for a in plan["actions"])
+        assert acts == ["HKR_neuGEVFilter", "MVTec_Hgevstrm"], acts
+        assert [x["service"] for x in plan["skipped"]] == ["ms_GxGVLWFilter"]
+
+    def test_protocol_binding_is_not_counted_as_gige(self):
+        by = {f["service"]: f["matched_gige"] for f in self._nics()[0]["filters"]}
+        assert by["ms_tcpip"] is None
+
+
+class TestBase64Transport:
+    """乱码根因：Windows PowerShell 5.1 重定向输出用控制台/OEM 代码页
+    （中文机器 cp936），不是 UTF-8。改走 base64 后与控制台代码页无关。"""
+
+    def test_query_uses_base64_not_raw_text(self):
+        assert "ToBase64String" in nfc._PS_QUERY, nfc._PS_QUERY
+
+    def test_chinese_survives_the_round_trip(self):
+        import json as _json, base64 as _b64
+        rows = [{"Name": "以太网", "InterfaceDescription": "Realtek PCIe GbE",
+                 "ComponentID": "ms_tcpip", "DisplayName": "Internet 协议版本 4",
+                 "Enabled": True}]
+        payload = _b64.b64encode(_json.dumps(rows).encode("utf-8")).decode("ascii")
+        assert payload.isascii()                     # 载荷本身必须纯 ASCII
+        got = nfc.enumerate_via_powershell(
+            runner=lambda c, t=20: (0, payload, ""))
+        assert got[0]["Name"] == "以太网", got
+        assert got[0]["DisplayName"] == "Internet 协议版本 4", got
+
+    def test_non_base64_output_still_parses_as_json(self):
+        """向后兼容：不是 base64 就当普通 JSON 试一次。"""
+        import json as _json
+        rows = [{"Name": "NIC A", "InterfaceDescription": "NIC A",
+                 "ComponentID": "ms_tcpip", "Enabled": True}]
+        got = nfc.enumerate_via_powershell(
+            runner=lambda c, t=20: (0, _json.dumps(rows), ""))
+        assert got[0]["ComponentID"] == "ms_tcpip"
+
+    def test_error_text_is_not_mistaken_for_data(self):
+        got = nfc.enumerate_via_powershell(
+            runner=lambda c, t=20: (
+                1, "", "Get-NetAdapterBinding : 找不到与参数名称 Class 匹配的参数。"))
+        assert got is None
+
+    def test_classification_uses_the_powershell_display_name(self):
+        """⚠️ 这条是**专门钉顺序**的，必须和特征表覆盖度解耦。
+
+        上面几条测试其实盖不住顺序 bug：因为 DEFAULT_GIGE_PATTERNS 里补的
+        'hkr' / 'gevstrm' 光靠**服务名**就能匹配上，于是把 DisplayName 合并
+        挪回 _classify() 之后，测试照样全绿（实测 80 passed，注入无效）。
+
+        所以这里造一个**服务名里没有任何 GigE 线索、只有 DisplayName 有**的
+        驱动。它能不能被认出来，只取决于顺序。"""
+        import json as _json
+        ETH = "Realtek PCIe GbE Family Controller"
+        rows = [{"Name": "以太网", "InterfaceDescription": ETH,
+                 "ComponentID": "zzz_opaque_svc",          # 服务名毫无线索
+                 "DisplayName": "Some GigE Vision Streaming Filter",
+                 "Enabled": True}]
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"], SVC: ["zzz_opaque_svc"]},
+            values={NIC_KEY + r"\0000": {"DriverDesc": ETH},
+                    SVC + r"\zzz_opaque_svc": {"FilterClass": "Custom"}})
+        nics = nfc.enumerate_nic_filters(
+            reg=reg, use_powershell=True,
+            ps_runner=lambda c, t=20: (0, _json.dumps(rows), ""))
+        f = nics[0]["filters"][0]
+        assert f["display_name"] == "Some GigE Vision Streaming Filter"
+        assert f["matched_gige"], (
+            "DisplayName 没有参与分类 —— _classify() 又跑在合并之前了")
