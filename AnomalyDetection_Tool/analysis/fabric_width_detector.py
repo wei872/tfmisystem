@@ -11,14 +11,31 @@
 ===============================================================================
 """
 
+import random
 import threading
+import time
 from collections import deque
 from typing import Optional, Tuple, Dict
 
 import cv2
 import numpy as np
 
-from General_Tool.EnhancedLogger import info, error
+from General_Tool.EnhancedLogger import info, error, warning
+
+
+def _as_float(v, default: float) -> float:
+    """把配置值转成 float，转不动就返回默认值。
+
+    配置里写错（空值、写成字符串、YAML 少个冒号）不能让检测器构造失败——
+    布幅检测起不来会连带影响经线密度计算。
+    """
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        warning("[布幅检测] 配置值 {!r} 不是数字，改用默认 {}".format(v, default))
+        return default
 
 
 class FabricWidthDetector:
@@ -104,6 +121,30 @@ class FabricWidthDetector:
         # 报告间隔
         # ============================================================
         self._report_interval: int = config.get("report_interval", 50)
+
+        # ============================================================
+        # 兜底布幅：从未成功算出布幅时上报的值
+        # ============================================================
+        # 为什么需要它：算不出来时 get_fabric_width() 返回 None，而两个消费方
+        # （periodic_report_service、Modbus）都是 `or 0`，于是上游收到 width=0，
+        # 会被当成断布/异常。现场要求这种情况下给一个看起来正常的波动值。
+        #
+        # 单位是 **mm**，内部换算成 cm 存储（本模块内部一律用 cm）。
+        self._fb_min_mm: float = _as_float(
+            config.get("fallback_width_min_mm"), 0.0)
+        self._fb_max_mm: float = _as_float(
+            config.get("fallback_width_max_mm"), 0.0)
+        self._fb_refresh_sec: float = max(0.0, _as_float(
+            config.get("fallback_refresh_sec"), 5.0))
+        self._fb_enabled: bool = (
+            self._fb_min_mm > 0 and self._fb_max_mm >= self._fb_min_mm)
+        if (self._fb_min_mm > 0) != self._fb_enabled:
+            warning("[布幅检测] 兜底范围配置无效 "
+                    "min={}mm max={}mm，兜底已关闭（算不出来时仍返回 None）".format(
+                        self._fb_min_mm, self._fb_max_mm))
+        self._fb_value_cm: Optional[float] = None
+        self._fb_generated_at: float = 0.0
+        self._fb_warned: bool = False
 
         self._last_fabric_bbox: Dict[str, tuple] = {}
 
@@ -280,7 +321,11 @@ class FabricWidthDetector:
         if fw is not None:
             self._last_fabric_width = fw
 
-        if (self._total_frames % self._report_interval == 0
+        # report_interval <= 0 表示"关掉周期打印"。这里必须先判 > 0 再取模，
+        # 否则配成 0 会在每一帧抛 ZeroDivisionError —— 而且是在锁内、
+        # 在 process_frame 的调用栈里抛，属于既有隐患。
+        if (self._report_interval > 0
+                and self._total_frames % self._report_interval == 0
                 and self._last_fabric_width is not None):
             self._print_report()
 
@@ -405,7 +450,13 @@ class FabricWidthDetector:
         """打印布幅统计报告"""
         avg_l = self._avg_left_ratio
         avg_r = self._avg_right_ratio
-        fw = self._last_fabric_width or 0
+        fw = self._last_fabric_width
+        if fw is None:
+            fb = self._fallback_width_cm()
+            fw_txt = ("无实测值 → 兜底 {:.2f} cm ({:.0f} mm)".format(fb, fb * 10)
+                      if fb is not None else "无（未算出，且兜底已关闭）")
+        else:
+            fw_txt = "{:.2f} cm".format(fw)
         l_cam = self._active_cam["left"]
         r_cam = self._active_cam["right"]
 
@@ -416,7 +467,7 @@ class FabricWidthDetector:
         info("\n" + "=" * 58
              + "\n[布幅检测] 第 {} 帧统计".format(
                  self._total_frames)
-             + "\n  布幅: {:.2f} cm".format(fw)
+             + "\n  布幅: {}".format(fw_txt)
              + "\n  活跃相机  左={}{} 右={}{}".format(
                  l_cam, l_tag, r_cam, r_tag)
              + "\n  左侧({}) 切除比 {:.2%}  "
@@ -435,12 +486,23 @@ class FabricWidthDetector:
         if not self._enabled:
             return {"enabled": False}
         with self._lock:
+            is_fb = (self._last_fabric_width is None and self._fb_enabled)
             return {
                 "enabled": True,
                 "total_frames": self._total_frames,
                 "left_count": self._left_count,
                 "right_count": self._right_count,
+                # last_fabric_width 保持**原始测量值**：没算出来就是 None。
+                # 兜底值单独放 fabric_width_effective，不要把合成值混进测量字段。
                 "last_fabric_width": self._last_fabric_width,
+                "fabric_width_effective": (
+                    self._fallback_width_cm()
+                    if self._last_fabric_width is None
+                    else self._last_fabric_width),
+                "fabric_width_is_fallback": is_fb,
+                "fallback_width_range_mm": (
+                    [self._fb_min_mm, self._fb_max_mm]
+                    if self._fb_enabled else None),
                 "last_left_ratio": self._last_left_ratio,
                 "last_right_ratio": self._last_right_ratio,
                 "left_window_size": len(self._left_ratios),
@@ -455,12 +517,54 @@ class FabricWidthDetector:
                 "avg_right_ratio": self._avg_right_ratio,
             }
 
+    def _fallback_width_cm(self) -> Optional[float]:
+        """从未成功算出布幅时，返回一个在配置范围内波动的兜底值（cm）。
+
+        一个刷新周期内保持同一个值：Modbus 上报和定时上报跑在不同线程、
+        不同时刻，每次读都随机会让同一批数据的两个上报口径对不上。
+        **锁内调用。**
+        """
+        if not self._fb_enabled:
+            return None
+        now = time.monotonic()
+        if (self._fb_value_cm is None
+                or now - self._fb_generated_at >= self._fb_refresh_sec):
+            mm = random.uniform(self._fb_min_mm, self._fb_max_mm)
+            self._fb_value_cm = mm / 10.0      # mm → cm
+            self._fb_generated_at = now
+            if not self._fb_warned:
+                self._fb_warned = True
+                warning("[布幅检测] 尚未成功算出布幅，改用兜底值 "
+                        "{}~{}mm 波动上报（每 {}s 重新取一次）。"
+                        "这是**合成值不是测量值**，"
+                        "请检查主/备相机是否都能看到布边。".format(
+                            self._fb_min_mm, self._fb_max_mm,
+                            self._fb_refresh_sec))
+        return self._fb_value_cm
+
     def get_fabric_width(self) -> Optional[float]:
-        """获取最新布幅值（线程安全）"""
+        """获取最新布幅值（cm，线程安全）。
+
+        **从未成功算出过**布幅时返回兜底值（见 _fallback_width_cm），
+        避免上游收到 width=0。一旦算出过真值，之后即使帧全空白也继续沿用
+        上次真值，不会再退回兜底。
+
+        是否兜底由 is_fallback_width() / get_stats() 的
+        ``fabric_width_is_fallback`` 判断。
+        """
         if not self._enabled:
             return None
         with self._lock:
-            return self._last_fabric_width
+            if self._last_fabric_width is not None:
+                return self._last_fabric_width
+            return self._fallback_width_cm()
+
+    def is_fallback_width(self) -> bool:
+        """当前 get_fabric_width() 返回的是兜底值还是真实测量值"""
+        if not self._enabled:
+            return False
+        with self._lock:
+            return self._last_fabric_width is None and self._fb_enabled
 
     def get_active_cameras(self) -> Dict[str, str]:
         """获取当前活跃相机 {"left": "camera8", "right": "camera1"}"""

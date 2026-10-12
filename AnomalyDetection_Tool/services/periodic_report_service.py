@@ -24,12 +24,19 @@ import requests
 
 from General_Tool.EnhancedLogger import info, error, warning
 from AnomalyDetection_Tool.output.encoder_state_service import get_encoder_state
-from AnomalyDetection_Tool.output.fabric_width_service import get_fabric_width
+from AnomalyDetection_Tool.output.fabric_width_service import (
+    get_fabric_width, get_fabric_stats,
+)
 
 # ══════════════════════════════════════════════
 #  配置
 # ══════════════════════════════════════════════
 REPORT_INTERVAL: float = 5.0  # 约 5s 触发一次
+
+# 布幅兜底告警的节流间隔（秒）。
+# 上报是 5s 一轮 × 8 台相机 ≈ 96 次/分钟，每次都告警会把日志刷满；
+# 但"布幅根本没测出来"是必须看得见的故障，所以压到 60s 一条而不是不打。
+FABRIC_FALLBACK_WARN_INTERVAL: float = 60.0
 DATA_VALIDITY_SECONDS: float = 30.0  # 缓存数据有效期
 UPLOAD_TIMEOUT: float = 5.0  # 单次 HTTP 超时
 MAX_UPLOAD_RETRIES: int = 2  # 密度接口最大重试次数
@@ -114,6 +121,7 @@ class GlobalReportScheduler:
             density_url: Optional[str] = None,
     ):
         self._interval = report_interval
+        self._last_fb_warn_ts = 0.0     # 布幅兜底告警节流用
         # None 表示跟随 config.yaml（推荐）；显式传入则固定为该地址（测试用）
         self._density_url_override = density_url
 
@@ -460,8 +468,20 @@ class GlobalReportScheduler:
         fabric_width_cm = get_fabric_width() or 0.0
         width_mm = round(fabric_width_cm * 10.0, 1)
 
-        # ★★★ 修改点 5：添加布幅调试日志 ★★★
-        if width_mm == 0.0:
+        # 布幅兜底生效后 width_mm 不再是 0，但它是**合成值**，日志里必须
+        # 看得出来——否则操作员看到 width 稳定在 ~1590mm，会以为是实测的。
+        # 节流到 60s 一条：上报是 5s 一轮 × 8 台相机，每次都告警会刷满日志。
+        if get_fabric_stats().get("fabric_width_is_fallback"):
+            now = time.time()
+            if now - self._last_fb_warn_ts >= FABRIC_FALLBACK_WARN_INTERVAL:
+                self._last_fb_warn_ts = now
+                warning(
+                    f"[GlobalScheduler] {camera_name} 布幅未实测"
+                    f"（两侧滑动窗口无数据），正在上报**兜底合成值** "
+                    f"{width_mm}mm；原始测量值仍为空，"
+                    f"请检查主/备相机能否看到布边"
+                )
+        elif width_mm == 0.0:
             warning(
                 f"[GlobalScheduler] {camera_name} "
                 f"布幅为零：get_fabric_width()={fabric_width_cm}"
