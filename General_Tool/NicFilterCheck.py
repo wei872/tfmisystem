@@ -75,10 +75,17 @@ _MAX_SERVICE_KEYS = 8192
 #      FilterClass / FilterRunOrder）—— 抓"装了但没绑定"的情况，这对判断
 #      "海康 MVS 到底卸干净没有"更重要
 #   3. UpperBindings / LowerBindings（保留，兼容老的 NDIS 5 驱动）
+# ⚠️ **不要**用 `Get-NetAdapterBinding -Class Filter`：真机实证该 cmdlet
+#    **没有 -Class 参数**（"找不到与参数名称 Class 匹配的参数"）。
+#    也不要在 Select-Object 里取 Class —— 无法确认输出对象有这个属性，
+#    而一旦没有，Python 侧 `row["Class"] == "filter"` 会把**所有**记录都
+#    过滤掉，变成静默的假阴性。
+#    所以这里取全部绑定项，"是不是 NDIS 过滤驱动"改由注册表 Services 扫描
+#    （FilterClass / FilterRunOrder）来判定 —— 那个判据是可靠的。
 _PS_QUERY = (
     "Get-NetAdapterBinding | "
-    "Select-Object Name, InterfaceDescription, ComponentID, Enabled, Class | "
-    "ConvertTo-Json -Compress -Depth 3"
+    "Select-Object Name, InterfaceDescription, ComponentID, DisplayName, "
+    "Enabled | ConvertTo-Json -Compress -Depth 3"
 )
 _PS_TIMEOUT_SEC = 20
 
@@ -102,7 +109,10 @@ DEFAULT_GIGE_PATTERNS: Sequence[str] = (
     "mvgige",
     "mv_gige",
     "mvs",
-    # 大恒 Galaxy
+    # 大恒 Galaxy。⚠️ gxgv 必须在最前：真机上的 ComponentID 是
+    # ms_GxGVLWFilter，不含 gxgige/gxiapi/galaxy 任何一个。
+    "gxgv",
+    "gvlwfilter",
     "daheng",
     "gxgige",
     "gxiapi",
@@ -256,7 +266,7 @@ def enumerate_via_powershell(runner=None, timeout: int = _PS_TIMEOUT_SEC):
 
     :param runner: ``(cmd, timeout) -> (rc, stdout, stderr)``，测试可注入
     :return: list of dict（每项含 Name/InterfaceDescription/ComponentID/
-             Enabled/Class）；**来源不可用时返回 None**（PowerShell 不存在、
+             Enabled）；**来源不可用时返回 None**（PowerShell 不存在、
              被策略禁用、超时、输出不是 JSON 都算不可用）
     """
     run = runner or _run_powershell
@@ -369,10 +379,19 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
     nics: Dict[str, Dict] = {}      # key: 网卡标识 -> 记录
 
     if ps:
+        # 哪些 ComponentID 是**真正的 NDIS 过滤驱动**：由 Services 扫描判定
+        # （服务键下有 FilterClass / FilterRunOrder）。这比依赖
+        # Get-NetAdapterBinding 的 Class 属性可靠 —— 而那个属性存不存在
+        # 根本无法确认，猜错了就是静默假阴性。
+        try:
+            _known_filters = {f["service"] for f in
+                              enumerate_installed_filters(reg,
+                                                          gige_patterns=gp)}
+        except Exception:
+            _known_filters = set()
+
         for row in ps:
             try:
-                if str(row.get("Class", "")).lower() != "filter":
-                    continue        # 只要过滤驱动，不要协议/服务/客户端
                 cid = str(row.get("ComponentID") or "").strip()
                 if not cid:
                     continue
@@ -394,6 +413,13 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
                 rec["sources"].add("netadapterbinding")
                 f = _classify(_service_meta(reg, cid), gp, cp)
                 f["enabled"] = bool(row.get("Enabled", True))
+                # 注册表确认它是 NDIS 过滤驱动；否则只是普通协议/服务绑定。
+                # 拿不准时（Services 扫描失败）标 None，不冒充。
+                f["is_ndis_filter"] = (cid in _known_filters
+                                       if _known_filters else None)
+                # PowerShell 那边直接给了 DisplayName，比注册表更权威
+                f["display_name"] = (str(row.get("DisplayName") or "").strip()
+                                     or f.get("display_name") or "")
                 rec["filters"].append(f)
             except Exception:
                 continue
@@ -680,6 +706,16 @@ def check_nic_filter_drivers(gige_patterns=None) -> Dict:
 # 绝对不能动的驱动：大恒自己的过滤驱动。
 # 这是硬约束，不是可配置项——把它关掉等于让本项目自己收不到图。
 KEEP_PATTERNS: Sequence[str] = (
+    # ⚠️ 真机实证（用户 PowerShell 输出）：大恒的过滤驱动实际叫
+    #    ComponentID  = ms_GxGVLWFilter
+    #    DisplayName  = "GigE Vision LightWeight Filter"
+    #    ImagePath    = ...\GxGVLWFilter.sys
+    # 原来这张表只有 daheng/galaxy/gxgige/gxiapi —— **一个都匹配不上**，
+    # 于是 _is_kept() 返回 False，"绝不禁用大恒自家驱动"那道闸在真机上是
+    # 空的。下面 gxgv / gvlwfilter / gvlw 就是照真机名字补的。
+    "gxgv",            # ms_GxGVLWFilter / GxGVLWFilter.sys
+    "gvlwfilter",
+    "gvlw",
     "daheng",
     "galaxy",
     "gxgige",

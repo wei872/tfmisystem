@@ -760,14 +760,34 @@ class TestDataSources:
         assert "MVGIgEFilter" in svcs and "GXGigEFilter" in svcs, svcs
         assert "netadapterbinding" in nics[0]["sources"]
 
-    def test_powershell_excludes_non_filter_classes(self):
-        reg = FakeReg(subkeys={NIC_KEY: ["0000"]},
-                      values={NIC_KEY + r"\0000": {"DriverDesc": "NIC"}})
+    def test_all_bindings_listed_and_ndis_filter_flag_from_registry(self):
+        """契约变更（真机实证逼出来的）：
+        `Get-NetAdapterBinding` **没有 -Class 参数**，输出对象有没有 Class
+        属性也无法确认。原先按 Class 过滤，一旦属性不存在就会把**所有**记录
+        滤掉 —— 静默假阴性。现在改成：全部列出，"是不是 NDIS 过滤驱动"由
+        注册表 Services 扫描（FilterClass/FilterRunOrder）判定。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"],
+                     SVC: ["ms_wfplwf_upper", "MVGIgEFilter", "GXGigEFilter"]},
+            values={NIC_KEY + r"\0000": {"DriverDesc":
+                                          "Realtek PCIe GbE Family Controller"},
+                    SVC + r"\ms_wfplwf_upper": {"FilterClass": "Custom"},
+                    SVC + r"\MVGIgEFilter": {"FilterClass": "Custom"},
+                    SVC + r"\GXGigEFilter": {"FilterClass": "Custom"}})
         nics = nfc.enumerate_nic_filters(reg=reg, use_powershell=True,
                                          ps_runner=_ps_runner())
-        svcs = [f["service"] for f in nics[0]["filters"]]
-        assert "ms_tcpip" not in svcs, svcs
-        assert "ms_server" not in svcs, svcs
+        by = {f["service"]: f for f in nics[0]["filters"]}
+        # 协议/服务绑定也要列出来（完整清单，操作员看得到全貌）
+        assert "ms_tcpip" in by and "ms_server" in by
+        # 但注册表能认出哪些是真过滤驱动
+        assert by["ms_wfplwf_upper"]["is_ndis_filter"] is True
+        assert by["ms_tcpip"]["is_ndis_filter"] is False
+        assert by["ms_server"]["is_ndis_filter"] is False
+
+    def test_ps_query_does_not_use_the_nonexistent_class_parameter(self):
+        """防回归：真机上 `-Class` 会直接报"找不到与参数名称 Class 匹配的参数"。"""
+        assert "-Class" not in nfc._PS_QUERY, nfc._PS_QUERY
+        assert "Class" not in nfc._PS_QUERY.split("Select-Object")[1]
 
     def test_powershell_conflict_still_blocks(self):
         """权威来源查到双驱动 → 必须判定为冲突（这是硬闸门的输入）"""
@@ -934,3 +954,63 @@ class TestReportWithPowerShell:
         assert "GXGigEFilter" not in bound           # 确实没绑定
         assert "未绑定到任何网卡" in txt, txt
         assert "已安装的疑似 GigE 过滤驱动" in txt
+
+
+# --------------------------------- §10 真机实证的大恒 ComponentID（回归钉子）
+# 用户在生产机上跑 PowerShell 得到的真实身份：
+#   ComponentID = ms_GxGVLWFilter
+#   DisplayName = "GigE Vision LightWeight Filter"
+#   ImagePath   = ...\GxGVLWFilter.sys
+# 我原先 KEEP_PATTERNS 里只有 daheng/galaxy/gxgige/gxiapi —— 一个都不匹配，
+# _is_kept() 返回 False，"绝不禁用大恒自家驱动"那道闸在真机上是空的。
+REAL_DAHENG = {
+    "service": "ms_GxGVLWFilter",
+    "display_name": "GigE Vision LightWeight Filter",
+    "description": "",
+    "image_path": r"\SystemRoot\system32\DRIVERS\GxGVLWFilter.sys",
+}
+
+
+class TestRealDahengComponentId:
+    def test_is_kept_recognises_the_real_daheng_driver(self):
+        assert nfc._is_kept(REAL_DAHENG) is True, (
+            "大恒真机驱动名 ms_GxGVLWFilter 没被认成自己人 —— "
+            "禁用工具会去动项目自己要用的驱动")
+
+    def test_attributed_to_daheng_not_generic_gige(self):
+        hay = nfc._haystack(REAL_DAHENG["service"], REAL_DAHENG["display_name"],
+                            "", REAL_DAHENG["image_path"])
+        assert nfc._matches(hay, nfc.DEFAULT_GIGE_PATTERNS) == "gxgv"
+
+    def test_is_kept_by_display_name_alone(self):
+        """只有 DisplayName 时也要认得出（注册表读不到 ImagePath 的情况）"""
+        assert nfc._is_kept({"service": "ms_GxGVLWFilter", "display_name": "",
+                             "description": "", "image_path": ""}) is True
+
+    def test_hikvision_is_still_not_kept(self):
+        assert nfc._is_kept({"service": "MVGIgEFilter",
+                             "display_name": "MVS GigE Filter Driver",
+                             "description": "Hikvision MVS GigE Vision filter",
+                             "image_path": r"...\MVGIgEFilter.sys"}) is False
+
+    def test_plan_disable_protects_real_daheng_and_targets_hikvision(self):
+        """端到端：真机身份的大恒 + 海康，禁用工具必须只动海康。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0000"], SVC: ["ms_GxGVLWFilter", "MVGIgEFilter"]},
+            values={
+                NIC_KEY + r"\0000": {"DriverDesc": "Realtek PCIe GbE Family Controller",
+                                     "UpperBindings": ["ms_GxGVLWFilter",
+                                                       "MVGIgEFilter"]},
+                SVC + r"\ms_GxGVLWFilter": {
+                    "DisplayName": "GigE Vision LightWeight Filter",
+                    "FilterClass": "Custom",
+                    "ImagePath": r"\SystemRoot\system32\DRIVERS\GxGVLWFilter.sys"},
+                SVC + r"\MVGIgEFilter": {"DisplayName": "MVS GigE Filter Driver",
+                                         "FilterClass": "Custom"},
+            })
+        rep = nfc.analyse_nic_filters(nfc.enumerate_nic_filters(reg=reg))
+        assert len(rep["conflicts"]) == 1
+        plan = nfc.plan_disable(report=rep)
+        assert [a["service"] for a in plan["actions"]] == ["MVGIgEFilter"]
+        assert [x["service"] for x in plan["skipped"]] == ["ms_GxGVLWFilter"]
+        assert "大恒" in plan["skipped"][0]["reason"]
