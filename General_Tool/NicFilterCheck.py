@@ -425,3 +425,246 @@ def check_nic_filter_drivers(gige_patterns=None) -> Dict:
         except Exception:
             pass
         return {"checked": False}
+
+
+# ============================================================================
+#  显式禁用（人工调用，**绝不在启动路径上**）
+# ============================================================================
+#
+# 为什么这部分不能挂到 main_yolo 里：
+#
+#   1. 绑定状态在 HKLM\SYSTEM\CurrentControlSet\... 下，**写入需要管理员权限**。
+#      本项目全仓库零提权代码、零 subprocess 调用（已 grep 确认），程序是普通
+#      用户身份跑的。普通用户写 HKLM = PermissionError，而本模块的纪律是"永不
+#      抛异常"，于是会变成**静默失效**——日志说已禁用、其实什么都没做。这比
+#      不做更糟。
+#   2. 禁用过滤驱动会让**网卡短暂 reset**，8 路 GigE 相机全部断线重连。在生产
+#      运行中执行等于主动制造一次停机。
+#   3. 万一这台机器上还有别处在用海康相机，静默禁用会造成一个"某台相机突然
+#      找不到"的故障，排查方向完全错。
+#
+# 所以这里的入口是命令行：由现场人员在**停产时**、**以管理员身份**、**显式加
+# --yes** 才会执行。main_yolo 永远不调用本文件里任何 disable_* 函数。
+
+# 绝对不能动的驱动：大恒自己的过滤驱动。
+# 这是硬约束，不是可配置项——把它关掉等于让本项目自己收不到图。
+KEEP_PATTERNS: Sequence[str] = (
+    "daheng",
+    "galaxy",
+    "gxgige",
+    "gxiapi",
+    "gx_igev",
+)
+
+
+def is_admin() -> bool:
+    """当前进程是否有管理员权限。任何异常一律当 False。"""
+    try:
+        if sys.platform != "win32":
+            return False
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _is_kept(f: Dict) -> bool:
+    """这个驱动是否属于"绝对不能动"的（大恒自己的）。"""
+    return _matches(_haystack(f.get("service", ""),
+                             f.get("display_name", ""),
+                             f.get("description", ""),
+                             f.get("image_path", "")), KEEP_PATTERNS) is not None
+
+
+def plan_disable(report: Optional[Dict] = None,
+                 reg: Optional[_Registry] = None,
+                 only_conflicting_nics: bool = True) -> Dict:
+    """**纯函数**：算出要禁用哪些驱动、以及确切的 PowerShell 命令。不执行任何东西。
+
+    三条安全不变量（都有测试盯着）：
+
+    1. **绝不禁用大恒自己的驱动**（匹配 KEEP_PATTERNS 的一律跳过）
+    2. **绝不把某张网卡上最后一个 GigE 过滤驱动也禁掉**——那会让相机彻底收不到图
+    3. 默认只处理**有冲突的网卡**；两个过滤驱动分挂两张网卡不算冲突、也不该动
+
+    :return: ``{"actions": [...], "skipped": [...], "blocked": [...]}``
+             每个 action 是 ``{"nic", "nic_desc", "service", "display_name",
+             "probe_cmd", "disable_cmd"}``
+    """
+    if report is None:
+        report = analyse_nic_filters(enumerate_nic_filters(reg=reg))
+
+    actions: List[Dict] = []
+    skipped: List[Dict] = []
+    blocked: List[Dict] = []
+
+    nics = report.get("all_filters") or []
+    conflicting = {c.get("nic") for c in (report.get("conflicts") or [])}
+
+    for nic in nics:
+        nic_name = nic.get("nic")
+        if only_conflicting_nics and nic_name not in conflicting:
+            continue
+        filters = nic.get("filters") or []
+        # ⚠️ 用**下标**而不是字典相等来标记身份。同一张网卡上完全可能出现两条
+        #    字段一模一样的驱动记录，用 `f in keepable` 会互相误判。
+        gige_idx = [i for i, f in enumerate(filters) if f.get("matched_gige")]
+
+        # 不变量 1：大恒自家驱动永远不动
+        protected = {i for i in gige_idx if _is_kept(filters[i])}
+        candidates = [i for i in gige_idx if i not in protected]
+
+        # 不变量 2：这张网卡上必须至少留下一个 GigE 过滤驱动。
+        #   已经有受保护的（大恒）了 → 候选全都可以禁；
+        #   一个受保护的都没有     → 保留第一个候选，其余禁掉（留哪个由现场定，
+        #                              工具不擅自替人做这个决定）。
+        if not protected and candidates:
+            protected.add(candidates[0])
+            candidates = candidates[1:]
+        actionable = set(candidates)
+
+        for i in gige_idx:
+            f = filters[i]
+            svc = str(f.get("service") or "").strip()
+            desc = str(nic.get("driver_desc") or "").strip()
+            rec = {"nic": nic_name, "nic_desc": desc,
+                   "service": svc, "display_name": f.get("display_name") or ""}
+            if not svc:
+                blocked.append(dict(rec, reason="服务名为空，无法定位组件"))
+                continue
+            if _is_kept(f):
+                skipped.append(dict(rec, reason="属于大恒 Galaxy 自家驱动，禁止禁用"))
+                continue
+            if i not in actionable:
+                skipped.append(dict(
+                    rec, reason="保留项：禁掉它这张网卡上就没有 GigE 过滤驱动了，"
+                                "相机会收不到图"))
+                continue
+            # ⚠️ 描述为空就**拒绝**，不要生成命令。
+            #    生成的命令会是 `-eq ''`，在 PowerShell 里匹配不到任何网卡，
+            #    于是"执行成功"但什么都没改 —— 正是要避免的静默失效。
+            #    宁可不做，也不要让操作员以为做了。
+            if not desc:
+                blocked.append(dict(
+                    rec, reason="注册表里 DriverDesc 为空，无法定位这张网卡；"
+                                "请手工在设备管理器里处理"))
+                continue
+            # 按 InterfaceDescription 定位，而不是靠猜连接名——DriverDesc 是注册表里
+            # 能拿到的，而 Get-NetAdapterBinding 需要的连接名（"以太网 2"之类）拿不到。
+            desc = desc.replace("'", "''")
+            rec["probe_cmd"] = (
+                "Get-NetAdapterBinding -ComponentID '{}' | "
+                "Where-Object {{ $_.InterfaceDescription -eq '{}' }} | "
+                "Format-List Name, InterfaceDescription, ComponentID, Enabled"
+            ).format(svc, desc)
+            rec["disable_cmd"] = (
+                "Get-NetAdapterBinding -ComponentID '{}' | "
+                "Where-Object {{ $_.InterfaceDescription -eq '{}' }} | "
+                "Disable-NetAdapterBinding"
+            ).format(svc, desc)
+            actions.append(rec)
+
+    return {"actions": actions, "skipped": skipped, "blocked": blocked}
+
+
+def disable_filter_bindings(confirm: bool = False,
+                            only_conflicting_nics: bool = True,
+                            runner=None) -> Dict:
+    """真正执行禁用。**默认只 dry-run**。
+
+    :param confirm: 必须显式为 True 才会执行（CLI 上的 ``--yes``）。
+                    为 False 时只打印计划，不动任何东西。
+    :param runner:  执行命令的可调用对象，签名 ``runner(cmd) -> (rc, out, err)``。
+                    默认用 PowerShell。抽出来是为了能在非 Windows 上测试编排逻辑。
+    :return: ``{"admin", "dry_run", "plan", "results"}``
+    """
+    plan = plan_disable(only_conflicting_nics=only_conflicting_nics)
+    out: Dict = {"admin": is_admin(), "dry_run": not confirm,
+                 "plan": plan, "results": []}
+
+    acts = plan["actions"]
+    print(f"\n[网卡过滤驱动] 计划禁用 {len(acts)} 个过滤驱动：")
+    for a in acts:
+        print(f"  网卡 {a['nic']} ({a['nic_desc']}) → {a['service']}"
+              f"  ({a['display_name']})")
+    for s in plan["skipped"]:
+        print(f"  跳过 {s['service']}: {s['reason']}")
+    for b in plan["blocked"]:
+        print(f"  拒绝 {b['service']}: {b['reason']}")
+
+    if not confirm:
+        print("\n[网卡过滤驱动] 这是预演（dry-run），没有改动任何东西。"
+              "确认无误后加 --yes 才会真的执行。")
+        return out
+
+    if not out["admin"]:
+        print("\n[网卡过滤驱动] ✗ 当前不是管理员权限，无法修改网卡绑定。"
+              "请用管理员身份重新打开命令行。", file=sys.stderr)
+        out["error"] = "not_admin"
+        return out
+
+    if not acts:
+        print("\n[网卡过滤驱动] 没有需要禁用的驱动。")
+        return out
+
+    print("\n[网卡过滤驱动] ⚠ 执行后网卡会短暂 reset，所有 GigE 相机会断线重连。"
+          "请确认产线已停。")
+    if runner is None:
+        runner = _run_powershell
+    for a in acts:
+        print(f"\n$ {a['probe_cmd']}")
+        rc, o, e = runner(a["probe_cmd"])
+        if o:
+            print(o.rstrip())
+        if "Enabled : True" not in (o or ""):
+            print("  → 该组件在这张网卡上未处于启用状态，跳过禁用。")
+            out["results"].append({**a, "rc": rc, "skipped": True})
+            continue
+        print(f"$ {a['disable_cmd']}")
+        rc, o, e = runner(a["disable_cmd"])
+        out["results"].append({**a, "rc": rc, "skipped": False})
+        print("  → 完成" if rc == 0 else f"  → 失败 (rc={rc}) {e}")
+
+    print("\n[网卡过滤驱动] 全部执行完毕。建议**重启本机**让 NDIS 绑定彻底干净，"
+          "然后重新启动本程序确认日志里出现 ✓。")
+    return out
+
+
+def _run_powershell(cmd: str):
+    """执行一条 PowerShell 命令，返回 (returncode, stdout, stderr)。"""
+    import subprocess
+    p = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+        capture_output=True, text=True, timeout=60)
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """命令行入口：``python -m General_Tool.NicFilterCheck [--yes] [--all-nics]``"""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    yes = "--yes" in argv
+    all_nics = "--all-nics" in argv
+
+    print("=" * 72)
+    print(" 网卡 GigE 过滤驱动检查 / 禁用工具")
+    print("=" * 72)
+    print(f" 管理员权限: {'是' if is_admin() else '否（禁用操作需要管理员权限）'}")
+    print()
+    rep = analyse_nic_filters(enumerate_nic_filters())
+    if not rep.get("checked"):
+        print("\n读不到注册表里的网卡绑定信息，无法继续。")
+        return 2
+    for c in rep.get("conflicts") or []:
+        print(f"\n⚠ 冲突网卡 {c.get('nic')} ({c.get('driver_desc')}):")
+        for f in c.get("filters") or []:
+            print(f"    {_fmt_filter(f)}")
+    if not rep.get("conflicts"):
+        print("✓ 未发现同一张网卡上有多个 GigE 过滤驱动，无需处理。")
+
+    res = disable_filter_bindings(confirm=yes,
+                                  only_conflicting_nics=not all_nics)
+    return 0 if res.get("error") is None else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

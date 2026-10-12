@@ -410,3 +410,197 @@ class TestShippedConfig:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------- §7 禁用编排
+class TestPlanDisable:
+    """plan_disable 是纯函数，但它决定了会去动操作系统的哪些东西。
+    这几条不变量是整个禁用功能的安全边界。"""
+
+    def _plan(self, reg=None, **kw):
+        rep = nfc.analyse_nic_filters(nfc.enumerate_nic_filters(reg=reg))
+        return nfc.plan_disable(report=rep, **kw)
+
+    def test_never_disables_daheng_driver(self):
+        """最重要的一条：大恒自家的过滤驱动绝对不能出现在禁用列表里。
+        把它关掉等于让本项目自己收不到图。"""
+        plan = self._plan(reg=reg_with_two_gige_filters())
+        targets = [a["service"] for a in plan["actions"]]
+        assert "GXGigEFilter" not in targets, "禁用列表里出现了大恒的驱动"
+        assert targets == ["MVGIgEFilter"], targets
+
+    def test_daheng_is_recorded_as_skipped_with_reason(self):
+        plan = self._plan(reg=reg_with_two_gige_filters())
+        sk = {s["service"]: s["reason"] for s in plan["skipped"]}
+        assert "GXGigEFilter" in sk
+        assert "大恒" in sk["GXGigEFilter"]
+
+    def test_disable_command_names_the_hikvision_component(self):
+        plan = self._plan(reg=reg_with_two_gige_filters())
+        cmd = plan["actions"][0]["disable_cmd"]
+        assert "Disable-NetAdapterBinding" in cmd
+        assert "MVGIgEFilter" in cmd
+        assert "GXGigEFilter" not in cmd
+        # 用 InterfaceDescription 定位网卡，而不是靠猜连接名
+        assert "Intel(R) I219-LM Gigabit Network Connection" in cmd
+
+    def test_never_disables_the_last_gige_filter_on_a_nic(self):
+        """两个都不是大恒的过滤驱动时，工具不能把两个都禁掉——
+        那张网卡上就一个 GigE 过滤驱动都不剩了。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={
+                NIC_KEY + r"\0001": {
+                    "DriverDesc": "NIC A",
+                    "UpperBindings": ["FilterX", "FilterY"],
+                },
+                SVC + r"\FilterX": {"DisplayName": "GigE Filter X"},
+                SVC + r"\FilterY": {"DisplayName": "GigE Filter Y"},
+            })
+        plan = self._plan(reg=reg)
+        assert len(plan["actions"]) == 1, [a["service"] for a in plan["actions"]]
+        assert len(plan["skipped"]) == 1
+        assert "收不到图" in plan["skipped"][0]["reason"]
+
+    def test_two_filters_on_two_nics_produces_no_actions(self):
+        """分挂两张网卡不是冲突，默认（only_conflicting_nics=True）什么都不该动。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001", "0002"]},
+            values={
+                NIC_KEY + r"\0001": {"DriverDesc": "NIC A",
+                                     "UpperBindings": ["MVGIgEFilter"]},
+                NIC_KEY + r"\0002": {"DriverDesc": "NIC B",
+                                     "UpperBindings": ["GXGigEFilter"]},
+                SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE Filter"},
+                SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE Filter"},
+            })
+        assert self._plan(reg=reg)["actions"] == []
+
+    def test_empty_service_name_is_ignored_entirely(self):
+        """空服务名连 GigE 判定都过不了（haystack 为空），所以正确行为是
+        **整个忽略**，不进 action、不进 blocked、也不崩。
+        ⚠️ 必须造出 ≥2 个 GigE 过滤驱动才构成冲突，否则整张网卡会被跳过，
+        这条测试就什么都测不到了。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={
+                NIC_KEY + r"\0001": {"DriverDesc": "NIC A",
+                                      "UpperBindings": ["FilterX", "FilterY", ""]},
+                SVC + r"\FilterX": {"DisplayName": "GigE Filter X"},
+                SVC + r"\FilterY": {"DisplayName": "GigE Filter Y"},
+            })
+        plan = self._plan(reg=reg)
+        assert plan["blocked"] == []                       # 空名字压根没进判定
+        assert [a["service"] for a in plan["actions"]] == ["FilterY"]
+        assert [x["service"] for x in plan["skipped"]] == ["FilterX"]
+        assert "" not in [a["service"] for a in plan["actions"]]
+
+    def test_missing_driver_desc_is_blocked_not_silently_ignored(self):
+        """DriverDesc 为空时**必须拒绝**，不能生成命令。
+        生成的命令会是 `-eq ''`，PowerShell 里匹配不到任何网卡，于是
+        "执行成功"却什么都没改——正是要避免的静默失效。"""
+        reg = FakeReg(
+            subkeys={NIC_KEY: ["0001"]},
+            values={
+                NIC_KEY + r"\0001": {          # 故意不给 DriverDesc
+                    "UpperBindings": ["MVGIgEFilter", "GXGigEFilter"],
+                },
+                SVC + r"\MVGIgEFilter": {"DisplayName": "Hikvision MVS GigE Filter"},
+                SVC + r"\GXGigEFilter": {"DisplayName": "Galaxy GigE Filter"},
+            })
+        plan = self._plan(reg=reg)
+        assert plan["actions"] == []
+        assert any("DriverDesc 为空" in b["reason"] for b in plan["blocked"]), \
+            plan["blocked"]
+
+    def test_plan_is_pure_never_touches_powershell(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("plan_disable 执行了系统命令")
+        monkeypatch.setattr(nfc, "_run_powershell", boom)
+        self._plan(reg=reg_with_two_gige_filters())
+
+
+class TestDisableExecution:
+    def test_dry_run_is_the_default_and_runs_nothing(self, monkeypatch):
+        real = nfc.enumerate_nic_filters
+        monkeypatch.setattr(nfc, "enumerate_nic_filters",
+                            lambda reg=None, **k: real(
+                                reg=reg_with_two_gige_filters()))
+        calls = []
+        res = nfc.disable_filter_bindings(
+            runner=lambda c: calls.append(c) or (0, "", ""))
+        assert calls == [], "没加 --yes 就执行了命令"
+        assert res["dry_run"] is True
+        assert len(res["plan"]["actions"]) == 1   # 计划仍然算出来了
+
+    def test_confirm_without_admin_refuses_and_runs_nothing(self, monkeypatch):
+        monkeypatch.setattr(nfc, "is_admin", lambda: False)
+        calls = []
+        res = nfc.disable_filter_bindings(
+            confirm=True, runner=lambda c: calls.append(c) or (0, "", ""))
+        assert res.get("error") == "not_admin"
+        assert calls == [], "不是管理员却执行了命令"
+        assert res["dry_run"] is False
+
+    def test_admin_path_probes_before_disabling(self, monkeypatch):
+        monkeypatch.setattr(nfc, "is_admin", lambda: True)
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            if cmd.startswith("Get-"):
+                return 0, "Enabled : True", ""
+            return 0, "", ""
+
+        # 用真实注册表读不到，这里让 plan 走注入的假注册表
+        real = nfc.enumerate_nic_filters          # ⚠️ 先抓住原函数，
+        monkeypatch.setattr(nfc, "enumerate_nic_filters",   # 否则 lambda 里
+                            lambda reg=None, **k: real(     # 调自己会无限递归
+                                reg=reg_with_two_gige_filters()))
+        res = nfc.disable_filter_bindings(confirm=True, runner=runner)
+        assert len(calls) == 2, calls
+        assert calls[0].startswith("Get-NetAdapterBinding"), "先探测后禁用"
+        assert calls[1].startswith("Get-NetAdapterBinding")
+        assert "Disable-NetAdapterBinding" in calls[1]
+        assert res["results"][0]["service"] == "MVGIgEFilter"
+
+    def test_already_disabled_component_is_not_touched(self, monkeypatch):
+        monkeypatch.setattr(nfc, "is_admin", lambda: True)
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            return 0, "Enabled : False", ""     # 本来就是关的
+
+        real = nfc.enumerate_nic_filters          # ⚠️ 先抓住原函数，
+        monkeypatch.setattr(nfc, "enumerate_nic_filters",   # 否则 lambda 里
+                            lambda reg=None, **k: real(     # 调自己会无限递归
+                                reg=reg_with_two_gige_filters()))
+        res = nfc.disable_filter_bindings(confirm=True, runner=runner)
+        assert len(calls) == 1, calls          # 只探测，没执行禁用
+        assert res["results"][0]["skipped"] is True
+
+
+class TestNotWiredIntoStartup:
+    def test_main_yolo_never_calls_the_disable_path(self):
+        """禁用能力**只能**由人在命令行显式触发。
+        启动流程里出现任何一个禁用入口都是缺陷。"""
+        import inspect
+        import fake_galaxy_sdk
+        fake_galaxy_sdk.install()
+        import main_yolo
+        src = inspect.getsource(main_yolo)
+        for banned in ("disable_filter_bindings", "plan_disable",
+                       "NicFilterCheck.main", "subprocess"):
+            assert banned not in src, f"main_yolo 里出现了 {banned}"
+
+    def test_module_itself_is_not_runnable_from_import(self):
+        """import 时绝不能执行禁用。只有 python -m 才会走 main()。"""
+        import importlib
+        src = open(nfc.__file__, encoding="utf-8").read()
+        assert 'if __name__ == "__main__":' in src
+        # main() 只在 __main__ 分支里被调用
+        after = src.split('if __name__ == "__main__":')[1]
+        assert "main()" in after
+        assert src.count("sys.exit(main())") == 1
+        assert importlib.util.find_spec("General_Tool.NicFilterCheck") is not None
