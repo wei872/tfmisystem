@@ -849,5 +849,31 @@ class TestRealStartupPrint:
         assert "camera2 / 多股线" not in txt, "多股线由停机阈值 0.70 把关，不该报警"
 
 
+    def test_default_shadow_warning_is_conditional(self, main, lines, monkeypatch):
+        """⚠ 相机级 default 的警告必须是**有条件**的。
+
+        出厂配置里没有任何相机配 default_class_confidence，所以不该出现
+        这条 ⚠️——原来它是无条件打印的，"一切正常"时也顶着警告。
+        """
+        monkeypatch.setattr(st, "CAMERA_STOP_RULE_OVERRIDES", {})
+        monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+            "camera1": {"class_confidence_thresholds": {"多股线": 0.6}}})
+        main._print_camera_thresholds()
+        txt = "\n".join(lines)
+        assert "配了相机级 default_class_confidence" not in txt
+        assert "✓ 无相机配置 default_class_confidence" in txt
+
+    def test_default_shadow_warning_fires_when_configured(
+            self, main, lines, monkeypatch):
+        """真配了 default 时必须点名是哪台"""
+        monkeypatch.setattr(st, "CAMERA_STOP_RULE_OVERRIDES", {})
+        monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
+            "camera4": {"default_class_confidence": 0.15}})
+        main._print_camera_thresholds()
+        txt = "\n".join(lines)
+        assert "⚠ camera4 配了相机级 default_class_confidence" in txt
+        assert "<default>=0.15" in txt
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

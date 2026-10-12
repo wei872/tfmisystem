@@ -161,191 +161,31 @@ default_detect:
   percentile: 85
   min_area: 20
 
+# ==================================================================
+# 阈值配置总览
 # ------------------------------------------------------------------
-# 停机规则  [热更新]
-# 各类别的 min_confidence / min_area_mm2 / min_width_mm / min_height_mm
-# 以及 enabled、trigger_relay、save_to_folder 均可在线调整。
-# ------------------------------------------------------------------
-machine_stop_rules:
-  enabled: true
-  save_to_folder: true
-  trigger_relay: true
-  default_rule: null
-  rules:
-    飘絮:
-      enabled: true
-      min_confidence: 0.1
-      min_area_mm2: 130
-    棉团:
-      enabled: true
-      min_confidence: 0.75
-      min_area_mm2: 69
-    纬线杂质:
-      enabled: true
-      min_confidence: 0.1
-      min_area_mm2: 62
-    经线毛球:
-      enabled: true
-      min_confidence: 0.1
-      min_area_mm2: 60
-    单根包不进:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.5
-      min_height_mm: 47.0
-    包边不良:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.90
-      min_width_mm: 10.0
-      min_height_mm: 10.0
-    捻接器接头:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.5
-      min_width_mm: 30.0
-      min_height_mm: 30.0
-    多股线:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.70
-      min_width_mm: 30.0
-      min_height_mm: 30.0
-    油点线:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.5
-      min_width_mm: 70.0
-      min_height_mm: 70.0
-    小尾巴:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.5
-      min_width_mm: 20.0
-      min_height_mm: 20.0
-    纬线不直:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.5
-      min_width_mm: 30.0
-      min_height_mm: 30.0
-    包边不重叠:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.56
-      min_width_mm: 50.0
-      min_height_mm: 50.0
-    短废纱线:
-      enabled: true
-      trigger_mode: dimension
-      min_confidence: 0.50
-      min_width_mm: 50.0
-      min_height_mm: 50.0
-    蚊虫小黑点:
-      enabled: false
-    稀缝:
-      enabled: false
+# 两套阈值，各自都有「全局」和「按相机」两份，分别放在相邻位置：
+#
+#   【一】检测阈值 —— 决定一个框算不算缺陷（在 _filter_boxes 里生效）
+#         class_confidence_thresholds     全局按类
+#         default_class_confidence        全局默认（没列出的类用它兜底）
+#         camera_threshold_overrides      按相机覆盖（8 台已展开）
+#
+#   【二】停机阈值 —— 决定一个缺陷要不要停机（在 StopMachineService 里生效）
+#         machine_stop_rules              全局按类
+#         camera_stop_rule_overrides      按相机覆盖（8 台已展开）
+#
+# 两者的关系（重要）：停机判定吃的是**过滤后**的框，所以
+#         有效停机门槛 = max(该相机检测阈值, 该相机停机 min_confidence)
+# 只改一边也可能改变停机行为。启动日志会对两段分别做交叉校验并打印结果，
+# 看到 ✓ 才说明停机没受影响。
+#
+# ⚠️ 两段「按相机」都已把 8 台逐类列全，所以改**全局**那两份对这 8 台
+#    不再生效。要改就改对应相机那一段，或者 8 段一起改。
+# ==================================================================
 
 # ------------------------------------------------------------------
-# 热力图 / 掩膜配置
-# ------------------------------------------------------------------
-heatmap:
-  enabled: true
-  save_overlay: true
-  colormap: "jet"
-  overlay_alpha: 0.5
-  save_mask_overlay: true
-  mask_color: [0, 0, 255]
-  save_pure_heatmap: false
-
-# ------------------------------------------------------------------
-# 类别尺寸过滤（不纳入检测）  [热更新]
-# ------------------------------------------------------------------
-class_size_filter:
-  包边不重叠: {min_width: 170, min_height: 100}
-  小尾巴:     {min_width: 170}
-  单根包不进: {min_width: 100, min_height: 100}
-  纬线杂质:   {min_width: 70, min_height: 70}
-  油点线:     {min_height: 150}
-  飘絮: {min_width: 85, min_height: 85}
-
-# ------------------------------------------------------------------
-# 类别边缘距离过滤（洪泛切除区距离阈值，单位：像素）  [热更新]
-# ------------------------------------------------------------------
-class_edge_filter:
-  飘絮:       {max_distance_to_fabric: 150}
-  棉团:       {max_distance_to_fabric: 150}
-  单根包不进: {max_distance_to_fabric: 200}
-  短废纱线:   {max_distance_to_fabric: 200}
-  蚊虫小黑点: {max_distance_to_fabric: 150}
-
-
-# ------------------------------------------------------------------
-# 竖线误检过滤
-# [热更新] max_x_deviation / min_accumulate_count / time_window / target_*
-# [需重启] enabled —— 它决定过滤器对象是否被创建
-# ------------------------------------------------------------------
-vertical_line_filter:
-  enabled: false
-  target_cameras: ["camera1", "camera8"]
-  target_classes: ["纬线杂质", "飘絮"]
-  max_x_deviation: 50.0
-  min_accumulate_count: 3
-  time_window: 20.0
-
-# ------------------------------------------------------------------
-# YOLO 检测配置
-# ------------------------------------------------------------------
-yolo:
-  model_path: "./Modelfile/yolo_20260608.engine"
-  # 多模型切换：按布料是否含边缘选用不同模型；留空(null)则始终使用上面的 model_path
-  with_edge_model_path: null
-  without_edge_model_path: null
-  confidence: 0.1
-  image_size: 1280
-  iou_threshold: 0.5
-  patch_size: 640
-  num_workers: 5
-  # 采集队列长度。这是"缓冲"不是"性能"：队列越长，过载时端到端延迟越大。
-  # 派发线程会按相机去重只保留最新帧，因此不需要很长的队列。
-  queue_size: 32
-  dinomaly_use_fp16: true
-  use_cuda_stream: true
-  cuda_benchmark: true
-  pth_checkpoint: "./Modelfile/YoloDinomaly/best_acc.pth"
-  pth_device: "cuda:0"
-  pth_model_source_dir: "./Modelfile/YoloDinomaly"
-  mask_threshold: 0.7
-  # ★ 在途帧上限 —— 端到端延迟的决定性参数。
-  # 延迟 ≈ max_inflight_frames / 实际吞吐(帧/秒)。
-  # 原值 128：若吞吐为 20 帧/s，排队延迟就高达 6 秒，而且 128 帧 x 15MB
-  # 会占用近 2GB 内存。它的本意是内存保护，却被当成了性能参数。
-  # 实时场景应取 2~3 倍 num_workers：够填满流水线，又不至于堆积。
-  max_inflight_frames: 12
-  memory_high_watermark: 90
-  memory_critical_watermark: 95
-  post_workers: 6
-  upload_timeout: 10
-
-# ------------------------------------------------------------------
-# 并发与采样
-# ------------------------------------------------------------------
-# 说明：全局线程池的规模集中在这里，便于按现场 CPU/GPU 情况整体调参。
-# 叠加 yolo.num_workers 与 yolo.post_workers 后即为进程内工作线程总量，
-# 设置过大反而会加剧 GIL 争用与 GPU 显存竞争。
-concurrency:
-  warp_sample_interval: 2     # 每 N 帧提交一次经线分析（增大可降低 GPU 争用）
-  weft_sample_interval: 2     # 每 N 帧提交一次纬线分析
-  warp_workers: 2             # 经线分析线程数
-  weft_workers: 2             # 纬线分析线程数
-  save_workers: 2             # 经纬停机图落盘线程数
-  async_save_workers: 4       # 检测结果保存+上传线程数
-  infer_pool_workers: 2       # 管理器侧推理提交池
-  io_pool_workers: 4          # 管理器侧后处理 I/O 池
-  aux_io_workers: 2           # 主程序调试存图/推帧池
-
-# ------------------------------------------------------------------
-# 类别置信度阈值  [热更新]
+# 【一】检测阈值 · 全局  [热更新]
 # ------------------------------------------------------------------
 class_confidence_thresholds:
   多股线:     0.65
@@ -363,7 +203,7 @@ class_confidence_thresholds:
 default_class_confidence: 0.1
 
 # ------------------------------------------------------------------
-# 按相机覆盖的置信度阈值  [热更新]
+# 【一】检测阈值 · 按相机覆盖  [热更新]
 # ------------------------------------------------------------------
 # 下面 8 台相机已全部展开，每台的初始值 = 上面 class_confidence_thresholds
 # 的当前值，也就是**行为与不配置时完全一致**。要调哪台就改哪台的数。
@@ -380,7 +220,7 @@ default_class_confidence: 0.1
 #      = 0.1；不写 default 才能让它们继续正确回落。
 #
 # 与停机阈值的关系（重要）：
-#   这里只管**检测**。停机用的是 machine_stop_rules → rules → <类> →
+#   这里只管**检测**。停机用的是下面的 machine_stop_rules → rules → <类> →
 #   min_confidence，那是按类别的全局值，**与相机无关**，本段不会改动它。
 #   但停机判定吃的是过滤后的框，所以：
 #       有效停机门槛 = max(该相机检测阈值, 该类停机 min_confidence)
@@ -496,7 +336,92 @@ camera_threshold_overrides:
       经线毛球  : 0.5
 
 # ------------------------------------------------------------------
-# 按相机覆盖的停机规则  [热更新]
+# 【二】停机阈值 · 全局  [热更新]
+# 各类别的 min_confidence / min_area_mm2 / min_width_mm / min_height_mm
+# 以及 enabled、trigger_relay、save_to_folder 均可在线调整。
+# ------------------------------------------------------------------
+machine_stop_rules:
+  enabled: true
+  save_to_folder: true
+  trigger_relay: true
+  default_rule: null
+  rules:
+    飘絮:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 130
+    棉团:
+      enabled: true
+      min_confidence: 0.75
+      min_area_mm2: 69
+    纬线杂质:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 62
+    经线毛球:
+      enabled: true
+      min_confidence: 0.1
+      min_area_mm2: 60
+    单根包不进:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_height_mm: 47.0
+    包边不良:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.90
+      min_width_mm: 10.0
+      min_height_mm: 10.0
+    捻接器接头:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    多股线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.70
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    油点线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 70.0
+      min_height_mm: 70.0
+    小尾巴:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 20.0
+      min_height_mm: 20.0
+    纬线不直:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.5
+      min_width_mm: 30.0
+      min_height_mm: 30.0
+    包边不重叠:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.56
+      min_width_mm: 50.0
+      min_height_mm: 50.0
+    短废纱线:
+      enabled: true
+      trigger_mode: dimension
+      min_confidence: 0.50
+      min_width_mm: 50.0
+      min_height_mm: 50.0
+    蚊虫小黑点:
+      enabled: false
+    稀缝:
+      enabled: false
+
+# ------------------------------------------------------------------
+# 【二】停机阈值 · 按相机覆盖  [热更新]
 # ------------------------------------------------------------------
 # 上面 machine_stop_rules 是按类别的**全局**停机规则。这一段允许逐台相机
 # 覆盖，语义是**逐键覆盖**：只写出来的键生效，没写的键沿用全局。
@@ -1123,6 +1048,104 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+
+# ------------------------------------------------------------------
+# 热力图 / 掩膜配置
+# ------------------------------------------------------------------
+heatmap:
+  enabled: true
+  save_overlay: true
+  colormap: "jet"
+  overlay_alpha: 0.5
+  save_mask_overlay: true
+  mask_color: [0, 0, 255]
+  save_pure_heatmap: false
+
+# ------------------------------------------------------------------
+# 类别尺寸过滤（不纳入检测）  [热更新]
+# ------------------------------------------------------------------
+class_size_filter:
+  包边不重叠: {min_width: 170, min_height: 100}
+  小尾巴:     {min_width: 170}
+  单根包不进: {min_width: 100, min_height: 100}
+  纬线杂质:   {min_width: 70, min_height: 70}
+  油点线:     {min_height: 150}
+  飘絮: {min_width: 85, min_height: 85}
+
+# ------------------------------------------------------------------
+# 类别边缘距离过滤（洪泛切除区距离阈值，单位：像素）  [热更新]
+# ------------------------------------------------------------------
+class_edge_filter:
+  飘絮:       {max_distance_to_fabric: 150}
+  棉团:       {max_distance_to_fabric: 150}
+  单根包不进: {max_distance_to_fabric: 200}
+  短废纱线:   {max_distance_to_fabric: 200}
+  蚊虫小黑点: {max_distance_to_fabric: 150}
+
+
+# ------------------------------------------------------------------
+# 竖线误检过滤
+# [热更新] max_x_deviation / min_accumulate_count / time_window / target_*
+# [需重启] enabled —— 它决定过滤器对象是否被创建
+# ------------------------------------------------------------------
+vertical_line_filter:
+  enabled: false
+  target_cameras: ["camera1", "camera8"]
+  target_classes: ["纬线杂质", "飘絮"]
+  max_x_deviation: 50.0
+  min_accumulate_count: 3
+  time_window: 20.0
+
+# ------------------------------------------------------------------
+# YOLO 检测配置
+# ------------------------------------------------------------------
+yolo:
+  model_path: "./Modelfile/yolo_20260608.engine"
+  # 多模型切换：按布料是否含边缘选用不同模型；留空(null)则始终使用上面的 model_path
+  with_edge_model_path: null
+  without_edge_model_path: null
+  confidence: 0.1
+  image_size: 1280
+  iou_threshold: 0.5
+  patch_size: 640
+  num_workers: 5
+  # 采集队列长度。这是"缓冲"不是"性能"：队列越长，过载时端到端延迟越大。
+  # 派发线程会按相机去重只保留最新帧，因此不需要很长的队列。
+  queue_size: 32
+  dinomaly_use_fp16: true
+  use_cuda_stream: true
+  cuda_benchmark: true
+  pth_checkpoint: "./Modelfile/YoloDinomaly/best_acc.pth"
+  pth_device: "cuda:0"
+  pth_model_source_dir: "./Modelfile/YoloDinomaly"
+  mask_threshold: 0.7
+  # ★ 在途帧上限 —— 端到端延迟的决定性参数。
+  # 延迟 ≈ max_inflight_frames / 实际吞吐(帧/秒)。
+  # 原值 128：若吞吐为 20 帧/s，排队延迟就高达 6 秒，而且 128 帧 x 15MB
+  # 会占用近 2GB 内存。它的本意是内存保护，却被当成了性能参数。
+  # 实时场景应取 2~3 倍 num_workers：够填满流水线，又不至于堆积。
+  max_inflight_frames: 12
+  memory_high_watermark: 90
+  memory_critical_watermark: 95
+  post_workers: 6
+  upload_timeout: 10
+
+# ------------------------------------------------------------------
+# 并发与采样
+# ------------------------------------------------------------------
+# 说明：全局线程池的规模集中在这里，便于按现场 CPU/GPU 情况整体调参。
+# 叠加 yolo.num_workers 与 yolo.post_workers 后即为进程内工作线程总量，
+# 设置过大反而会加剧 GIL 争用与 GPU 显存竞争。
+concurrency:
+  warp_sample_interval: 2     # 每 N 帧提交一次经线分析（增大可降低 GPU 争用）
+  weft_sample_interval: 2     # 每 N 帧提交一次纬线分析
+  warp_workers: 2             # 经线分析线程数
+  weft_workers: 2             # 纬线分析线程数
+  save_workers: 2             # 经纬停机图落盘线程数
+  async_save_workers: 4       # 检测结果保存+上传线程数
+  infer_pool_workers: 2       # 管理器侧推理提交池
+  io_pool_workers: 4          # 管理器侧后处理 I/O 池
+  aux_io_workers: 2           # 主程序调试存图/推帧池
 
 # ------------------------------------------------------------------
 # 保存配置

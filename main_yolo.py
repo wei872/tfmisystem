@@ -891,16 +891,27 @@ def _print_camera_thresholds() -> None:
              f"8 台相机全部使用全局检测阈值 (default={g_default})")
     else:
         info("[阈值] 按相机覆盖已启用，以下为各相机**实际生效**的检测阈值：")
+        shadowed = []
         for name in names:
             eff = describe_camera_thresholds(name, CLASS_CONFIDENCE_THRESHOLDS)
             if name in overrides:
                 keys = ", ".join(f"{k}={v}" for k, v in
                                  sorted(eff.items(), key=lambda x: str(x[0])))
                 info(f"  {name:<9} [已覆盖] {keys}")
+                if "<default>" in eff:
+                    shadowed.append(name)
             else:
                 info(f"  {name:<9} [全局]   default={g_default}")
-        info("  ⚠ 若某台显示 [已覆盖] 且带 <default>，说明该相机级默认值已盖掉"
-             "全局的按类阈值，请确认这是你的意图。")
+        # 只在真的有相机配了 default 时才警告。原来这条是无条件打印的，
+        # 于是"一切正常"时也顶着 ⚠️，既让人以为出了事，又会淹没下面
+        # 真正需要看的交叉校验结论。
+        if shadowed:
+            info(f"  ⚠ {', '.join(shadowed)} 配了相机级 default_class_confidence："
+                 "该相机上所有**未逐类列出**的类都会改用这个默认值，"
+                 "全局的按类阈值被盖掉，请确认这是你的意图。")
+        else:
+            info("  ✓ 无相机配置 default_class_confidence，"
+                 "全局的按类阈值在各台均完整生效")
 
     # ---- 交叉校验：有效停机门槛是否被改变 ----
     # 有效停机门槛 = max(检测阈值, 停机 min_confidence)，因为停机判定吃的是
