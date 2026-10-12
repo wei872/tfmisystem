@@ -752,6 +752,8 @@ def _init_health_monitor() -> None:
         interval=float(LOGGING_CONFIG.get("health_interval", 30) or 0),
         rss_warn_mb=float(LOGGING_CONFIG.get("health_rss_warn_mb", 0) or 0),
         thread_warn=int(LOGGING_CONFIG.get("health_thread_warn", 0) or 0),
+        pool_growth_warn_mb=float(
+            LOGGING_CONFIG.get("health_pool_growth_warn_mb", 512) or 0),
         providers=[_camera_diag_provider, _detection_diag_provider],
     )
 
