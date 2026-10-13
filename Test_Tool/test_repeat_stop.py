@@ -825,3 +825,135 @@ class TestStopAuthorityIntegration:
                     f"{cam}_{i}.png", f"2026-01-01 00:00:0{i}.000",
                     {}, time.time())
             assert len(calls) == want, f"{cam}: 期望停机 {want} 次，实得 {calls}"
+
+
+# ==================================================================
+# §11 新增类别：单根包不进
+# ==================================================================
+class TestSingleYarnClass:
+    """单根包不进 的门槛结构和包边不良不同，必须单独验。
+
+    · 检测阈值 = 0.87，单次停机门槛 min_confidence = 0.5
+      → 0.5 那条**永远不是瓶颈**（有效门槛 = max = 0.87）
+    · 单次规则真正的闸是 min_height_mm = 47（= 498.6 px）
+    → 重复规则不看高度，抓的正是"反复出现但每次都不够 47 mm"的那些
+    """
+
+    CLS = "单根包不进"
+
+    @staticmethod
+    def _cfg():
+        import yaml
+        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def test_shipped_config(self):
+        r = self._cfg()["repeat_stop_rules"]["rules"][self.CLS]
+        assert r["enabled"] is True
+        assert r["count"] == 3
+        assert r["window_sec"] == pytest.approx(3.0)
+
+    def test_min_confidence_deliberately_absent(self):
+        """不写 min_confidence = 跟随检测阈值。
+
+        写一个 <= 0.87 的数等于没写；写死了反而会在将来调低检测阈值时
+        悄悄变成新瓶颈。这条测试是防止有人"顺手补上"一个数。
+        """
+        r = self._cfg()["repeat_stop_rules"]["rules"][self.CLS]
+        assert "min_confidence" not in r, (
+            "单根包不进 故意不写计数门槛，见 config.yaml 里的说明")
+
+    def test_single_shot_confidence_gate_is_never_binding(self):
+        """证明 0.5 那条确实是死条款：检测阈值 0.87 比它高。"""
+        cfg = self._cfg()
+        det = cfg["class_confidence_thresholds"][self.CLS]
+        stop = cfg["machine_stop_rules"]["rules"][self.CLS]["min_confidence"]
+        assert det > stop, (
+            f"检测阈值 {det} 未高于停机门槛 {stop}，"
+            f"上面的分析不再成立，请重新评估计数门槛")
+
+    def test_rule_resolves_for_authorised_cameras_only(self):
+        cfg = self._cfg()
+        rr = cfg["repeat_stop_rules"]
+        for i in range(1, 9):
+            cam = f"camera{i}"
+            assert st.effective_repeat_rule(self.CLS, cam, rr) is not None
+            assert st.repeat_stop_allowed(cam, rr) is (i in (1, 8))
+
+    def test_repeat_rule_catches_what_single_shot_lets_through(self, monkeypatch):
+        """⚠️ 本类新增有没有意义，全看这一条。
+
+        造一个 conf=0.88（过检测阈值 0.87）、高 100px（= 9.4mm，远小于
+        单次要求的 47mm）的框：
+          · 单次维度规则**不停机**（高度不够）
+          · 重复规则连出 3 帧 → **停机**
+        如果单次规则也停，说明这个框本来就会被停，新增等于没用。
+        """
+        monkeypatch.setattr(st, "REPEAT_STOP_RULES",
+                            self._cfg()["repeat_stop_rules"])
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+        svc = StopMachineService(machine_stop_path="/tmp/_rs_yarn",
+                                 launch_tag="t", analysis_mode="none")
+        stops = []
+        monkeypatch.setattr(svc, "_handle_stop",
+                            lambda *a, **kw: (stops.append(a[2]), "")[1])
+
+        box = DetectionBox(x1=10, y1=10, x2=60, y2=110,     # 高 100 px
+                           confidence=0.88, class_id=2, class_name=self.CLS)
+        px_to_mm = st.PIXEL_TO_MM
+        assert box.height * px_to_mm < 47.0, "这个框必须小于单次要求的高度"
+
+        # 1) 单次维度规则：不该停
+        single = svc.analyze_defect_dimension(
+            np.zeros((200, 200, 3), np.uint8), box, "camera1", "f.png")
+        assert single.triggered is False, "单次规则不该停这个框，否则本测试无意义"
+
+        # 2) 重复规则：连出 3 帧应该停
+        img = np.zeros((200, 200, 3), np.uint8)
+        assert svc.check_repeat_stops(img, "camera1", "f0.png",
+                                      {self.CLS: box}) is False
+        assert svc.check_repeat_stops(img, "camera1", "f1.png",
+                                      {self.CLS: box}) is False
+        assert svc.check_repeat_stops(img, "camera1", "f2.png",
+                                      {self.CLS: box}) is True
+        assert stops == ["camera1"]
+
+    def test_middle_camera_does_not_count_this_class_either(self, monkeypatch):
+        monkeypatch.setattr(st, "REPEAT_STOP_RULES",
+                            self._cfg()["repeat_stop_rules"])
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+        svc = StopMachineService(machine_stop_path="/tmp/_rs_yarn2",
+                                 launch_tag="t", analysis_mode="none")
+        stops = []
+        monkeypatch.setattr(svc, "_handle_stop",
+                            lambda *a, **kw: (stops.append(a[2]), "")[1])
+        box = DetectionBox(10, 10, 60, 110, 0.88, 2, self.CLS)
+        for i in range(5):
+            assert svc.check_repeat_stops(np.zeros((200, 200, 3), np.uint8),
+                                          "camera5", f"f{i}.png",
+                                          {self.CLS: box}) is False
+        assert stops == []
+        assert svc.repeat_tracker.get_stats()["occurrences"] == 0
+
+    def test_two_classes_do_not_share_a_window(self, monkeypatch):
+        """包边不良 和 单根包不进 必须各自独立计数。"""
+        monkeypatch.setattr(st, "REPEAT_STOP_RULES",
+                            self._cfg()["repeat_stop_rules"])
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+        svc = StopMachineService(machine_stop_path="/tmp/_rs_yarn3",
+                                 launch_tag="t", analysis_mode="none")
+        stops = []
+        monkeypatch.setattr(svc, "_handle_stop",
+                            lambda *a, **kw: (stops.append((a[2], a[1].class_name)), "")[1])
+        img = np.zeros((200, 200, 3), np.uint8)
+        a = DetectionBox(10, 10, 60, 60, 0.6, 1, "包边不良")
+        b = DetectionBox(10, 10, 60, 110, 0.88, 2, self.CLS)
+        # 交替出现：各自只攒到 2 次，都不该停
+        for i, bx in enumerate((a, b, a, b)):
+            assert svc.check_repeat_stops(img, "camera1", f"f{i}.png",
+                                          {bx.class_name: bx}) is False
+        assert stops == [], stops
+        snap = {(d["camera_name"], d["class_name"]): d["pending"]
+                for d in svc.repeat_tracker.snapshot()}
+        assert snap == {("camera1", "包边不良"): 2,
+                        ("camera1", self.CLS): 2}, snap

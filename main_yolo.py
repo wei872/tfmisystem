@@ -848,9 +848,12 @@ def _print_stop_rules() -> None:
         for cls, r in (REPEAT_STOP_RULES.get("rules", {}) or {}).items():
             if not isinstance(r, dict) or not r.get("enabled", True):
                 continue
+            # min_confidence 没写时不是"不限"——能走到这里的框都已经过了
+            # 检测阈值，所以实际含义是"跟随检测阈值"。写成"不限"会误导。
+            mc = r.get("min_confidence")
+            mc_txt = f"conf≥{mc}" if mc is not None else "conf 跟随检测阈值"
             parts.append(f"{cls}（{int(r.get('count', 0))} 次 / "
-                         f"{float(r.get('window_sec', 0)):.1f}s / "
-                         f"conf≥{r.get('min_confidence', '不限')}）")
+                         f"{float(r.get('window_sec', 0)):.1f}s / {mc_txt}）")
         joined = [n for n in names if repeat_stop_allowed(n)]
         skipped = [n for n in names if not repeat_stop_allowed(n)]
         if not parts:
