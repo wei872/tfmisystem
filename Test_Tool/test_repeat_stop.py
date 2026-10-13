@@ -383,19 +383,26 @@ class TestSiteScenario:
         # 但只有这两台有停机权
         assert rr["stop_allowed_cameras"] == ["camera1", "camera8"]
 
-    def test_all_eight_cameras_count(self):
-        """8 台都必须能取到规则（计数），否则"8 台都有"就没做到。"""
+    def test_rule_resolves_for_all_but_only_two_participate(self):
+        """规则写在 globals，所以 8 台都**能解析出**规则；
+        但只有 stop_allowed_cameras 里的相机**真的参与**。
+
+        这两件事必须分清：解析出规则 ≠ 参与。参与与否由白名单决定，
+        判定在计数之前就短路（见 §10）。
+        """
         import yaml
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        n_cam = len(cfg["cameras"]["sn_map"])
-        assert n_cam == 8
+        assert len(cfg["cameras"]["sn_map"]) == 8
+        rr = cfg["repeat_stop_rules"]
         for i in range(1, 9):
             cam = f"camera{i}"
-            r = st.effective_repeat_rule("包边不良", cam,
-                                         cfg["repeat_stop_rules"])
-            assert r is not None, f"{cam} 取不到重复规则"
+            r = st.effective_repeat_rule("包边不良", cam, rr)
+            assert r is not None, f"{cam} 解析不出规则"
             assert r["count"] == 3
+            participates = st.repeat_stop_allowed(cam, rr)
+            assert participates is (i in (1, 8)), \
+                f"{cam} 参与状态应为 {i in (1, 8)}，实得 {participates}"
 
     def test_counting_gate_is_looser_than_the_single_shot_gate(self):
         """⚠️ 这条是本功能有没有用的关键。
@@ -733,27 +740,43 @@ class TestStopAuthorityIntegration:
         assert self._hit(svc, "camera8") is True
         assert calls == ["camera8"]
 
-    def test_middle_cameras_count_but_never_stop(self, auth_service):
-        """⚠️ 核心：中间 6 台照样计数，但**绝不能**停机。"""
+    def test_middle_cameras_do_not_count_at_all(self, auth_service):
+        """⚠️ 核心：没停机权的相机**连计数都不做**。
+
+        攒够了也不能停，计数本身没有意义 —— 白占一份滑动窗口、
+        白刷日志。所以判定在计数之前就短路了。
+        """
         svc, calls = auth_service
         for i in (2, 3, 4, 5, 6, 7):
             cam = f"camera{i}"
             assert self._hit(svc, cam) is False, f"{cam} 不该返回已停机"
         assert calls == [], f"中间相机不该停机: {calls}"
-        # 但确实计过数了
         stats = svc.get_stats()
-        assert stats["repeat_stop_no_authority"] == 6, stats
         assert stats["repeat_stop_triggered"] == 0
+        # 关键：一次都没计过
+        tr_stats = svc.repeat_tracker.get_stats()
+        assert tr_stats["occurrences"] == 0, tr_stats
+        assert tr_stats["frames_seen"] == 0, tr_stats
 
-    def test_no_authority_window_still_rearms(self, auth_service):
-        """没权限的相机攒够后窗口也要清空，否则之后每帧都刷一条日志。"""
+    def test_unauthorized_camera_creates_no_window(self, auth_service):
+        """不给没权限的相机建滑动窗口 —— 否则 6 台 × N 类的 deque 白白常驻。"""
+        svc, _ = auth_service
+        self._hit(svc, "camera5")
+        assert svc.repeat_tracker.snapshot("camera5") == []
+        assert svc.repeat_tracker.snapshot() == [], "整个 tracker 应该是空的"
+
+    def test_frames_skipped_is_counted_for_diagnosis(self, auth_service):
+        """跳过的帧数还是要能看见，否则"为什么 camera5 不停机"无从查起。
+        这是个纯计数器，不建窗口、不判定。"""
+        svc, _ = auth_service
+        self._hit(svc, "camera5", n=3)
+        assert svc.get_stats()["repeat_stop_frames_skipped"] == 3
+
+    def test_authorized_cameras_still_count_and_stop(self, auth_service):
         svc, calls = auth_service
-        self._hit(svc, "camera3")
-        snap = svc.repeat_tracker.snapshot("camera3", "包边不良")
-        assert (snap[0]["pending"] if snap else 0) == 0
-        # 再攒 3 次应该再次"到阈值但无权限"，计数应累加到 2
-        self._hit(svc, "camera3")
-        assert svc.get_stats()["repeat_stop_no_authority"] == 2
+        assert self._hit(svc, "camera1") is True
+        assert calls == ["camera1"]
+        assert svc.repeat_tracker.get_stats()["occurrences"] == 3
 
     def test_whitelist_does_not_touch_single_shot_stops(self, monkeypatch):
         """⚠️ 白名单**只管【三】**。【二】单次停机在 8 台上的行为必须没变。

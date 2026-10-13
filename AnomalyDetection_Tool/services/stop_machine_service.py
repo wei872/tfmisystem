@@ -78,9 +78,8 @@ class StopMachineService:
             "dinomaly_infer_count": 0,
             "dinomaly_infer_time_total": 0.0,
             "repeat_stop_triggered": 0,
-            # 攒够了但这台相机没有停机权限（只计数、只打日志）。
-            # 这个数涨得快，说明该考虑给这台相机开权限了。
-            "repeat_stop_no_authority": 0,
+            # 没有停机权限的相机被跳过的帧数。纯计数，不建窗口、不判定。
+            "repeat_stop_frames_skipped": 0,
         }
 
         # 【三】重复停机：同一台相机上同类疵点在时间窗口内反复出现。
@@ -516,6 +515,11 @@ class StopMachineService:
                                去重**（每类一个框）—— 计数是"按帧"的，
                                同一帧同类出现 5 个框也只算 1 次。
                                代表框用于停机落盘/继电器，取置信度最高的那个。
+        ⚠️ 只有 ``repeat_stop_rules.stop_allowed_cameras`` 里的相机才参与
+           （现场是 camera1 / camera8）。其余相机在这里**第一行就返回**，
+           不建滑动窗口、不判定、不打每帧日志 —— 攒够了也不能停，
+           计数本身没有意义。
+
         :param frame_already_stopped: 本帧是否已由单次规则停过机。
                                       为 True 时**只计数不再停**（避免同一帧
                                       连发两次停机信号），但历史照样记，
@@ -525,18 +529,23 @@ class StopMachineService:
         if not boxes_by_class:
             return False
 
+        # ⚠️ 授权判断必须在**计数之前**。
+        #    没有停机权限的相机，计数本身就没有意义 —— 攒够了也不能停，
+        #    白占一份滑动窗口、白刷日志。所以这里直接返回，
+        #    不建窗口、不判定、不打每帧日志。
+        #    （只有 camera1 / camera8 参与，见 repeat_stop_rules.stop_allowed_cameras）
+        #    ⚠️ 这只管【三】重复触发，【二】单次停机在 8 台上的行为没动。
+        if not repeat_stop_allowed(camera_name):
+            with self._lock:
+                self._stats["repeat_stop_frames_skipped"] += 1
+            return False
+
         classes = list(boxes_by_class.keys())
         confs = {c: b.confidence for c, b in boxes_by_class.items()}
 
         hits = self._repeat_tracker.record_frame(camera_name, classes, confs)
         if not hits:
             return False
-
-        # 8 台都参与计数，但只有被授权的相机（现场是 camera1/camera8）
-        # 允许**真的**停机。没授权的照样打日志 —— 中间相机的重复情况
-        # 要看得见，否则无从判断该不该给它开权限。
-        # ⚠️ 这只管【三】重复触发，【二】单次停机在 8 台上的行为没动。
-        allowed = repeat_stop_allowed(camera_name)
 
         stopped = False
         for h in hits:
@@ -548,19 +557,6 @@ class StopMachineService:
                 log_lines.append(
                     f"  [重复触发] {cls} 在 {h['window_sec']:.1f}s 内累计 "
                     f"{h['count']} 次（跨度 {h['span_sec']:.2f}s）")
-
-            if not allowed:
-                with self._lock:
-                    self._stats["repeat_stop_no_authority"] += 1
-                info(f"[重复停机] {camera_name} 已达阈值（{cls} "
-                     f"{h['count']} 次 / {h['window_sec']:.1f}s），"
-                     f"但该相机不在 stop_allowed_cameras 里，**不停机**。"
-                     f"若这类疵点确实该停，请把 {camera_name} 加进白名单。")
-                if log_lines is not None:
-                    log_lines.append(
-                        f"  [无停机权限] {cls} 已攒够 {h['count']} 次，"
-                        f"但 {camera_name} 不在白名单")
-                continue
 
             if frame_already_stopped or stopped:
                 # 本帧已经停过了：计数照记（上面已经记完），但不再发第二次

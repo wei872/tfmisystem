@@ -977,10 +977,11 @@ def get_camera_repeat_rule_override(camera_name, class_name) -> Optional[Dict]:
 
 
 def repeat_stop_allowed(camera_name, repeat_rules=None) -> bool:
-    """这台相机**有没有权限**由【三】重复触发真的停机。
+    """这台相机**参不参与**【三】重复触发。
 
-    需求：8 台都参与计数（这样中间相机的重复情况在日志里看得见），
-    但只有指定的几台（现场是 camera1 / camera8）允许真的停机。
+    需求：只有指定的几台（现场是 camera1 / camera8）参与。其余相机
+    **连计数都不做** —— 攒够了也不能停，计数本身没有意义，
+    白占一份滑动窗口、白刷日志。所以调用方在计数**之前**就先问这里。
 
     读的是 ``repeat_stop_rules.stop_allowed_cameras``：
 
@@ -992,7 +993,7 @@ def repeat_stop_allowed(camera_name, repeat_rules=None) -> bool:
     ``rules.get(k) or 默认``——后者会把 ``[]`` 当成"没配"，
     于是"谁都不许停"被静默变成"全都许停"，方向正好反了。
 
-    ⚠️ 这个白名单**只管【三】重复触发**，不影响【二】单次停机规则。
+    ⚠️ 这个名单**只管【三】重复触发**，不影响【二】单次停机规则。
     单次停机在 8 台上的既有行为一个字都没改。
 
     :param camera_name: 相机名

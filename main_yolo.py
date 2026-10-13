@@ -795,6 +795,7 @@ def _print_stop_rules() -> None:
     """
     from AnomalyDetection_Tool.config.settings import (
         describe_camera_stop_rules, check_camera_stop_rule_impact,
+        REPEAT_STOP_RULES, repeat_stop_allowed,
     )
 
     info("=" * 60)
@@ -835,6 +836,34 @@ def _print_stop_rules() -> None:
                     info(f"    {cls}: {_format_stop_rule_parts(eff)}{mark}")
         info("  注意：已覆盖的项**不再跟随全局 machine_stop_rules 的修改**，"
              "要改请改对应相机那一段。")
+
+    # ---- 【三】重复触发：哪几台参与 ----
+    # 必须打出来：这个功能是"攒够 N 次才停"，现场看不出它有没有在跑。
+    # 尤其"只有部分相机参与"这件事，不打日志根本无从确认。
+    info("-" * 60)
+    if not REPEAT_STOP_RULES.get("enabled", False):
+        info("【三】重复触发停机：已关闭（repeat_stop_rules.enabled=false）")
+    else:
+        parts = []
+        for cls, r in (REPEAT_STOP_RULES.get("rules", {}) or {}).items():
+            if not isinstance(r, dict) or not r.get("enabled", True):
+                continue
+            parts.append(f"{cls}（{int(r.get('count', 0))} 次 / "
+                         f"{float(r.get('window_sec', 0)):.1f}s / "
+                         f"conf≥{r.get('min_confidence', '不限')}）")
+        joined = [n for n in names if repeat_stop_allowed(n)]
+        skipped = [n for n in names if not repeat_stop_allowed(n)]
+        if not parts:
+            info("【三】重复触发停机：已开启但没配任何类别规则，实际不生效")
+        elif not joined:
+            info("【三】重复触发停机：⚠ 已配规则，但 stop_allowed_cameras "
+                 "里没有任何在用的相机，实际不生效")
+        else:
+            info(f"【三】重复触发停机：{'；'.join(parts)}")
+            info(f"      参与相机：{', '.join(joined)}")
+            if skipped:
+                info(f"      不参与（连计数都不做）：{', '.join(skipped)}")
+            info("      与【二】单次停机并存，任一条满足即停机")
 
     info("按 'q' 退出")
     info("=" * 60)
