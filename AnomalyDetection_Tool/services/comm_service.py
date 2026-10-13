@@ -45,9 +45,9 @@ class CommService:
             import Communication_Tool.ThriftControl as thrift
             self._thrift_module = thrift
             self.thrift_available = True
-            info("[导入] ThriftControl ✓")
+            info("[导入] ThriftControl ")
         except ImportError as e:
-            error(f"[导入] ThriftControl ✗: {e}")
+            error(f"[导入] ThriftControl : {e}")
 
         # http_client（上传接口）
         # 原先经由 upload/upload_client.py 这个纯转发的一行文件中转，已删除。
@@ -56,18 +56,18 @@ class CommService:
                 upload_detection_info,  # noqa: F401
             )
             self.upload_available = True
-            info("[导入] http_client ✓")
+            info("[导入] http_client ")
         except ImportError as e:
-            error(f"[导入] http_client ✗: {e}")
+            error(f"[导入] http_client : {e}")
 
         # DefectTrigger（继电器）
         try:
             from Communication_Tool.DefectTrigger import relay_pulse
             self._relay_func = relay_pulse
             self.relay_available = True
-            info("[导入] DefectTrigger ✓")
+            info("[导入] DefectTrigger ")
         except (ImportError, AttributeError) as e:
-            error(f"[导入] DefectTrigger ✗: {e}")
+            error(f"[导入] DefectTrigger : {e}")
 
     def set_defect_stop(self) -> bool:
         """
@@ -107,9 +107,9 @@ class CommService:
 
     def status_summary(self) -> dict:
         return {
-            "thrift": "✓" if self.thrift_available else "✗",
-            "upload": "✓" if self.upload_available else "✗",
-            "relay": "✓" if self.relay_available else "✗",
+            "thrift": "" if self.thrift_available else "",
+            "upload": "" if self.upload_available else "",
+            "relay": "" if self.relay_available else "",
         }
 
 

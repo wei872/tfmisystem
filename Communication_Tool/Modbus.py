@@ -148,7 +148,7 @@ class ModbusClient:
                 info(f"已连接到PLC: {self.config.plc_host}:{self.config.plc_port}")
             return self._connected
         except Exception as e:
-            error(f"✗ 连接PLC失败: {e}")
+            error(f"连接PLC失败: {e}")
             self._connected = False
             return False
 
@@ -232,7 +232,7 @@ class ModbusClient:
             return not result.isError()
 
         except Exception as e:
-            error(f"✗ 写入WORD错误: {e}")
+            error(f"写入WORD错误: {e}")
             return False
 
     def write_dword(self, address: int, value: int) -> bool:
@@ -266,7 +266,7 @@ class ModbusClient:
             return not result.isError()
 
         except Exception as e:
-            error(f"✗ 写入DWORD错误: {e}")
+            error(f"写入DWORD错误: {e}")
             return False
 
     def read_hc0(self) -> Optional[int]:
@@ -575,7 +575,7 @@ class DisplayManager:
         direction = "→ 正转" if status['is_forward'] else "← 反转"
 
         # 运行状态
-        running_status = "✓ 运行中" if status['is_running'] else "✗ 未达速"
+        running_status = "运行中" if status['is_running'] else "未达速"
         idle_flag = " [织机停机-预览模式]" if status.get('is_idle') else ""
         defect_flag = " [缺陷逻辑停机]" if status.get('is_defect_stopped') else ""
 

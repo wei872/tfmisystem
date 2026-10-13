@@ -441,7 +441,7 @@ class GlobalReportScheduler:
         lat_density = 0.0
         lat_slope = 0.0
 
-        # ★★★ 修改点 4：camera1/camera8 强制跳过纬线检测 ★★★
+        # 修改点 4：camera1/camera8 强制跳过纬线检测 
         if camera_name not in ("camera1", "camera8"):
             weft_ok, weft_angle, weft_max_spacing, weft_ts = ctx.weft_cache.read()
 

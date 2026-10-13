@@ -22,9 +22,9 @@ class GPDController:
                 parity=serial.PARITY_NONE,
                 timeout=1
             )
-            print(f"✓ 串口 {port} 已成功打开")
+            print(f"串口 {port} 已成功打开")
         except Exception as e:
-            print(f"✗ 串口打开失败: {e}")
+            print(f"串口打开失败: {e}")
 
     def is_connected(self) -> bool:
         """检查串口是否已连接"""
@@ -51,7 +51,7 @@ class GPDController:
     def send_command(self, command: str) -> Optional[str]:
         """发送指令并接收响应"""
         if not self.is_connected():
-            print("✗ 串口未连接")
+            print("串口未连接")
             return None
 
         try:
@@ -69,7 +69,7 @@ class GPDController:
                 print("  (未收到响应)")
                 return None
         except Exception as e:
-            print(f"✗ 通讯错误: {e}")
+            print(f"通讯错误: {e}")
             return None
 
     def turn_on(self, channel: int) -> Optional[str]:
@@ -85,7 +85,7 @@ class GPDController:
     def set_brightness(self, channel: int, brightness: int) -> Optional[str]:
         """设置亮度 (0-4095)"""
         if not 0 <= brightness <= 4095:
-            print(f"✗ 亮度值超出范围: {brightness}")
+            print(f"亮度值超出范围: {brightness}")
             return None
         cmd = self.build_command('1', '3', channel, brightness)
         return self.send_command(cmd)

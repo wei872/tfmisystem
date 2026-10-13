@@ -51,6 +51,7 @@ from AnomalyDetection_Tool.upload.upload_task import UploadTask
 from AnomalyDetection_Tool.services.stop_machine_service import (
     StopMachineService,
 )
+from AnomalyDetection_Tool.services.normal_image_saver import get_normal_saver
 from AnomalyDetection_Tool.services.comm_service import comm_service
 from AnomalyDetection_Tool.stats.performance_tracker import (
     PerformanceTracker,
@@ -498,6 +499,19 @@ class YOLODetectionManager:
             if ws is not None and image is not None:
                 ws.push_image(camera_name, image)
             # ========================================
+
+            # ====== 【四】无缺陷帧：按前端下发的窗口定时存图 ======
+            # 只在这里挂：这一支就是"本帧没检出任何缺陷"，
+            # 正是"正常图片"的定义。有缺陷的帧走另一条路，不会进来。
+            # 整体兜死：存图出问题绝不能影响检测主流程。
+            try:
+                saver = get_normal_saver()
+                if saver is not None and image is not None \
+                        and saver.should_save(camera_name):
+                    saver.save(camera_name, image)
+            except Exception as e:
+                error(f"[正常图保存] {camera_name} | {filename} | 异常，已跳过: {e}")
+            # ========================================
             return
 
         t_post_start = time.time()
@@ -840,6 +854,14 @@ class YOLODetectionManager:
             stop_handler = getattr(p, "_stop_handler", None)
             if stop_handler is not None:
                 stop_handler.launch_tag = new_tag
+
+        # —— 【四】正常图片定时保存 ——
+        try:
+            ns = get_normal_saver()
+            if ns is not None:
+                ns.launch_tag = new_tag
+        except Exception as e:
+            error(f"[reset_launch_tag] 正常图保存器同步标签失败: {e}")
 
         info(f"[reset_launch_tag] 批次标签刷新: {old_tag} -> {new_tag}")
         return new_tag

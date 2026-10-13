@@ -97,7 +97,7 @@ def test_camera_class_beats_camera_default():
 
 def test_camera_default_shadows_global_class():
     """
-    ⚠ 这是最容易配错的一条，所以专门钉一个测试。
+    这是最容易配错的一条，所以专门钉一个测试。
 
     相机级 default 会盖掉全局的按类阈值：camera3 配了 0.15，
     那么全局精心调过的「油点线: 0.85」在 camera3 上也变成 0.15。

@@ -54,7 +54,7 @@ def get_warmup_weft_detector() -> WeftDetector:
 def run_warmup(worker_id: int = 0) -> None:
     """
     在后台线程中执行预热，不阻塞主链路。
-    ★ 预热时使用低优先级Stream，避免与YOLO模型加载竞争GPU资源。
+    预热时使用低优先级Stream，避免与YOLO模型加载竞争GPU资源。
     """
     try:
         dummy = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)

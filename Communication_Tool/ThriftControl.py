@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import json
 import threading
 import time
 from thrift.transport import TSocket
@@ -119,7 +120,7 @@ def setIsStop(value: bool, status: str, user: str = "Python") -> bool:
     """
     设置停止状态（线程安全）
     """
-    # ★ 修复1：加上 _defect_stop_time 的 global 声明
+    # 修复1：加上 _defect_stop_time 的 global 声明
     global _is_stop, _stop_reason, is_stop, _defect_stop_time
 
     with _state_lock:
@@ -147,12 +148,12 @@ def setIsStop(value: bool, status: str, user: str = "Python") -> bool:
         if status == "开始":
             _fire_start_callbacks()   # 通知外部开启新批次（例如刷新 launch_tag 重建批次目录）
     elif status == "Auto恢复":
-        PCL_reset(reset_distance=False)  # ★ 仅复位PLC触发状态，保留距离
+        PCL_reset(reset_distance=False)  # 仅复位PLC触发状态，保留距离
         info(f"[系统] ▶ 速度恢复，自动继续检测")
     elif status == "暂停":
         info(f"[系统] ⏸ 手动暂停，停止图片检测，必须手动点击'恢复'才能继续")
     elif status == "缺陷停机":
-        # ★ 修复1配套：现在能正确写入全局变量
+        # 修复1配套：现在能正确写入全局变量
         _defect_stop_time = time.time()
         info(f"[系统] 缺陷触发停机，等待速度恢复后自动恢复 (停机时刻: {_defect_stop_time})")
     elif status == "恢复":
@@ -183,7 +184,7 @@ def setDefectStop() -> bool:
     缺陷检测触发停机（供检测模块调用）
     与手动暂停区分，速度恢复后可自动继续
 
-    ★ 手动停止优先：若当前已是手动停止/暂停，则忽略本次缺陷停机。
+    手动停止优先：若当前已是手动停止/暂停，则忽略本次缺陷停机。
 
     原实现无条件调用 setIsStop(True, "缺陷停机")，会把 _stop_reason
     从 manual 覆盖成 defect。后果很严重：Modbus 的自动恢复状态机只认
@@ -211,6 +212,66 @@ class PythonServiceHandler:
 
     def ping(self):
         return "Python服务正常"
+
+    # ------------------------------------------------------------------
+    #  【四】正常图片定时保存：前端下发窗口
+    # ------------------------------------------------------------------
+    # 这三个方法必须由 Java 侧用同一份 IDL 重新生成后才能调到。
+    # IDL 见 lib/camera/thrift/simple_service.thrift。
+    #
+    # 任何异常都吞掉并返回失败值，绝不让一次坏调用掀掉整个 Thrift 服务线程
+    # —— 那个线程还负责停机信号，比存图重要得多。
+    def setNormalSaveWindow(self, start, duration_sec):
+        """开启一个"保存正常图片"的时间窗口。
+
+        :param start: 开始时刻。"" / None = 立即；
+                      epoch 秒（数字或数字字符串）；或 "HH:MM" / "HH:MM:SS"。
+        :param duration_sec: 持续时长（秒）。
+        :return: 成功 True，失败 False。
+        """
+        try:
+            from AnomalyDetection_Tool.services.normal_image_saver import (
+                get_normal_saver)
+            saver = get_normal_saver()
+            if saver is None:
+                error("[正常图保存] 未初始化（config.yaml 里 "
+                      "normal_image_save.enabled 可能是 false），"
+                      "setNormalSaveWindow 已忽略")
+                return False
+            saver.start_window(start=(start if start not in ("", None) else None),
+                               duration_sec=duration_sec)
+            return True
+        except Exception as e:
+            error(f"[正常图保存] setNormalSaveWindow 失败: {e}")
+            return False
+
+    def stopNormalSave(self):
+        """提前结束窗口。"""
+        try:
+            from AnomalyDetection_Tool.services.normal_image_saver import (
+                get_normal_saver)
+            saver = get_normal_saver()
+            if saver is None:
+                return False
+            saver.stop_window()
+            return True
+        except Exception as e:
+            error(f"[正常图保存] stopNormalSave 失败: {e}")
+            return False
+
+    def getNormalSaveStatus(self):
+        """查进度，返回 JSON 字符串（Thrift 里传结构体要改 IDL，
+        传 JSON 字符串最省事，Java 侧直接解析）。"""
+        try:
+            from AnomalyDetection_Tool.services.normal_image_saver import (
+                get_normal_saver)
+            saver = get_normal_saver()
+            if saver is None:
+                return json.dumps({"enabled": False, "reason": "not_initialized"})
+            return json.dumps(saver.get_status(), ensure_ascii=False)
+        except Exception as e:
+            error(f"[正常图保存] getNormalSaveStatus 失败: {e}")
+            return json.dumps({"enabled": False, "reason": str(e)})
 
 
 def PCL_reset(reset_distance=True):

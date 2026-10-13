@@ -58,7 +58,7 @@ class CudaStreamPool:
             return
         try:
             for _ in range(self._pool_size):
-                # ★ 低优先级Stream（priority=0）
+                # 低优先级Stream（priority=0）
                 # 当YOLO高优先级Stream有kernel时，此Stream的kernel延迟执行
                 stream = torch.cuda.Stream(
                     device=self._device_idx,

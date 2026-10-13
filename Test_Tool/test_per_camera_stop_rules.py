@@ -796,12 +796,12 @@ class TestRealStartupPrint:
         return buf
 
     def test_shipped_config_prints_all_consistent(self, main, lines, monkeypatch):
-        """出厂配置下必须打印 ✓ 一致，且不得出现 ⚠"""
+        """出厂配置下必须打印 一致，且不得出现 """
         monkeypatch.setattr(st, "CAMERA_STOP_RULE_OVERRIDES", {})
         main._print_stop_rules()
         txt = "\n".join(lines)
-        assert "✓ 按相机停机规则：8 台与全局完全一致" in txt
-        assert "⚠ 以下相机的停机规则" not in txt
+        assert "按相机停机规则：8 台与全局完全一致" in txt
+        assert "以下相机的停机规则" not in txt
         assert "多股线: conf>=0.7 + 宽>=30.0mm + 高>=30.0mm" in txt
 
     def test_override_prints_warning_and_effective_rules(
@@ -812,7 +812,7 @@ class TestRealStartupPrint:
         monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {})
         main._print_stop_rules()
         txt = "\n".join(lines)
-        assert "⚠ 以下相机的停机规则" in txt
+        assert "以下相机的停机规则" in txt
         assert "camera3 / 多股线 / min_confidence: 0.7 → 0.5" in txt
         assert "停机会变频繁" in txt
         # 关键：必须报有效门槛，而不是只报停机字段
@@ -843,17 +843,17 @@ class TestRealStartupPrint:
         })
         main._print_camera_thresholds()
         txt = "\n".join(lines)
-        assert "⚠ 以下覆盖**改变了停机行为**" in txt
+        assert "以下覆盖**改变了停机行为**" in txt
         assert "camera5 / 油点线" in txt
         assert "camera1 / 多股线" not in txt, "多股线由停机阈值 0.70 把关，不该报警"
         assert "camera2 / 多股线" not in txt, "多股线由停机阈值 0.70 把关，不该报警"
 
 
     def test_default_shadow_warning_is_conditional(self, main, lines, monkeypatch):
-        """⚠ 相机级 default 的警告必须是**有条件**的。
+        """相机级 default 的警告必须是**有条件**的。
 
         出厂配置里没有任何相机配 default_class_confidence，所以不该出现
-        这条 ⚠️——原来它是无条件打印的，"一切正常"时也顶着警告。
+        这条 ——原来它是无条件打印的，"一切正常"时也顶着警告。
         """
         monkeypatch.setattr(st, "CAMERA_STOP_RULE_OVERRIDES", {})
         monkeypatch.setattr(st, "CAMERA_THRESHOLD_OVERRIDES", {
@@ -861,7 +861,7 @@ class TestRealStartupPrint:
         main._print_camera_thresholds()
         txt = "\n".join(lines)
         assert "配了相机级 default_class_confidence" not in txt
-        assert "✓ 无相机配置 default_class_confidence" in txt
+        assert "无相机配置 default_class_confidence" in txt
 
     def test_default_shadow_warning_fires_when_configured(
             self, main, lines, monkeypatch):
@@ -871,7 +871,7 @@ class TestRealStartupPrint:
             "camera4": {"default_class_confidence": 0.15}})
         main._print_camera_thresholds()
         txt = "\n".join(lines)
-        assert "⚠ camera4 配了相机级 default_class_confidence" in txt
+        assert "camera4 配了相机级 default_class_confidence" in txt
         assert "<default>=0.15" in txt
 
 

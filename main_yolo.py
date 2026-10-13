@@ -46,6 +46,7 @@ from AnomalyDetection_Tool.config.settings import (
     SIMULATION_MODE, SIMULATION_FOLDER,
     FABRIC_WIDTH_CONFIG, CAMERA_SN_MAP, CAMERA_ACQ_CONFIG,
     SAVE_PATH, SEAVEIMAGE, PUSH,
+    NORMAL_IMAGE_SAVE,
     PLC_CONFIG, WEBSOCKET_CONFIG, LOGGING_CONFIG, CONCURRENCY_CONFIG,
     DEBUG_CONFIG,
 )
@@ -56,6 +57,7 @@ from AnomalyDetection_Tool.output.fabric_width_service import (
     get_fabric_detector,
     get_fabric_stats,
 )
+from AnomalyDetection_Tool.services.normal_image_saver import init_normal_saver
 from AnomalyDetection_Tool.services.WebSocketImageServer import (
     init_websocket_server,
     get_websocket_server,
@@ -198,7 +200,7 @@ def image_control(image, frame_info, camera_sn=""):
     """
     图像处理函数。
 
-    ⚠ 本函数运行在大恒 SDK 的采集线程上，**任何阻塞都会造成相机丢帧**。
+    本函数运行在大恒 SDK 的采集线程上，**任何阻塞都会造成相机丢帧**。
     因此这里只做分发：布幅检测、调试落盘、Java 推帧全部投递到线程池，
     YOLO 检测本身由 DetectionWorkerPool 内部排队消化。
 
@@ -814,10 +816,10 @@ def _print_stop_rules() -> None:
 
     info("-" * 60)
     if not changed:
-        info("✓ 按相机停机规则：8 台与全局完全一致"
+        info("按相机停机规则：8 台与全局完全一致"
              "（未配置或与 machine_stop_rules 逐项相同）")
     else:
-        info(f"⚠ 以下相机的停机规则**与全局不同**（共 {len(changed)} 处）：")
+        info(f"以下相机的停机规则**与全局不同**（共 {len(changed)} 处）：")
         for c in changed:
             info(f"  {c['camera']} / {c['class_name']} / {c['field']}: "
                  f"{c['global_value']} → {c['camera_value']}，{c['effect']}")
@@ -859,7 +861,7 @@ def _print_stop_rules() -> None:
         if not parts:
             info("【三】重复触发停机：已开启但没配任何类别规则，实际不生效")
         elif not joined:
-            info("【三】重复触发停机：⚠ 已配规则，但 stop_allowed_cameras "
+            info("【三】重复触发停机：已配规则，但 stop_allowed_cameras "
                  "里没有任何在用的相机，实际不生效")
         else:
             info(f"【三】重复触发停机：{'；'.join(parts)}")
@@ -936,14 +938,14 @@ def _print_camera_thresholds() -> None:
             else:
                 info(f"  {name:<9} [全局]   default={g_default}")
         # 只在真的有相机配了 default 时才警告。原来这条是无条件打印的，
-        # 于是"一切正常"时也顶着 ⚠️，既让人以为出了事，又会淹没下面
+        # 于是"一切正常"时也顶着 ，既让人以为出了事，又会淹没下面
         # 真正需要看的交叉校验结论。
         if shadowed:
-            info(f"  ⚠ {', '.join(shadowed)} 配了相机级 default_class_confidence："
+            info(f"  {', '.join(shadowed)} 配了相机级 default_class_confidence："
                  "该相机上所有**未逐类列出**的类都会改用这个默认值，"
                  "全局的按类阈值被盖掉，请确认这是你的意图。")
         else:
-            info("  ✓ 无相机配置 default_class_confidence，"
+            info("  无相机配置 default_class_confidence，"
                  "全局的按类阈值在各台均完整生效")
 
     # ---- 交叉校验：有效停机门槛是否被改变 ----
@@ -954,7 +956,7 @@ def _print_camera_thresholds() -> None:
 
     info("-" * 60)
     if changed:
-        info("⚠ 以下覆盖**改变了停机行为**"
+        info("以下覆盖**改变了停机行为**"
              "（有效停机门槛 = max(检测阈值, 停机阈值)）：")
         for c in changed:
             info(f"  {c['camera']} / {c['class_name']}: "
@@ -964,7 +966,7 @@ def _print_camera_thresholds() -> None:
         info("  若不希望影响停机，请把该类检测阈值保持在停机阈值之下"
              "（此时由停机阈值把关），或同步调整 machine_stop_rules。")
     else:
-        info("✓ 交叉校验：以上覆盖均未改变停机行为"
+        info("交叉校验：以上覆盖均未改变停机行为"
              "（各类的有效停机门槛 max(检测阈值, 停机阈值) 保持不变）")
     info("=" * 60)
 
@@ -1055,7 +1057,7 @@ def run_production_mode() -> int:
         _nic_rep = check_nic_filter_drivers(
             gige_patterns=LOGGING_CONFIG.get("nic_filter_patterns"))
 
-        # ⚠️ 硬性拦截：确认有冲突就**拒绝启动**。
+        # 硬性拦截：确认有冲突就**拒绝启动**。
         #
         # 判定门槛很关键 —— 只在**确实查到了、且确认有冲突**时才拦：
         #   conflicts 非空  ⇒  一定是 checked=True（analyse_nic_filters 在
@@ -1065,12 +1067,12 @@ def run_production_mode() -> int:
         # 会永远起不来，而这跟"装了两个过滤驱动"是两回事。
         _conflicts = _nic_rep.get("conflicts") or []
         if _conflicts:
-            _lines = ["✗ 拒绝启动：检测到同一张网卡上挂了多个 GigE Vision "
+            _lines = ["拒绝启动：检测到同一张网卡上挂了多个 GigE Vision "
                       "过滤驱动。"]
             for _c in _conflicts:
                 _lines.append(f"    网卡 {_c.get('nic')} "
                               f"({_c.get('driver_desc')}):")
-                # ⚠️ 只列**启用中**的 —— 已禁用的不算冲突（见 analyse_nic_filters）
+                # 只列**启用中**的 —— 已禁用的不算冲突（见 analyse_nic_filters）
                 for _f in (_c.get("gige_active") or _c.get("gige_filters") or []):
                     _lines.append(f"      - {_f.get('service')}  "
                                   f"({_f.get('display_name')})")
@@ -1214,6 +1216,24 @@ def main() -> int:
         preview_max_width=int(WEBSOCKET_CONFIG.get("preview_max_width", 960)),
         jpeg_quality=int(WEBSOCKET_CONFIG.get("jpeg_quality", 70)),
     )
+
+    # —— 【四】正常图片定时保存：只待命，等前端下发窗口 ——
+    try:
+        _nis = NORMAL_IMAGE_SAVE
+        if bool(_nis.get("enabled", False)):
+            init_normal_saver(
+                base_path=DETECTION_SAVE_PATH,
+                launch_tag=_detection_manager._launch_tag
+                           if _detection_manager is not None else "",
+                interval_sec=float(_nis.get("interval_sec", 5.0)),
+                max_per_camera=int(_nis.get("max_per_camera", 10)),
+                jpeg_quality=int(_nis.get("jpeg_quality", 90)),
+                save_subdir=str(_nis.get("save_subdir", "NormalSave")),
+            )
+        else:
+            info("[正常图保存] 已在 config.yaml 关闭（normal_image_save.enabled=false）")
+    except Exception as e:
+        error(f"[正常图保存] 初始化失败，功能不可用（不影响检测）: {e}")
 
     _init_health_monitor()
 

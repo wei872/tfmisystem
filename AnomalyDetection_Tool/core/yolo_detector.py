@@ -91,7 +91,7 @@ class YOLODetector:
 
         if self._is_cuda and self.use_cuda_stream:
             idx = self._parse_device_idx(self.device)
-            # ★ 关键优化：YOLO推理使用高优先级Stream（priority=-1）
+            # 关键优化：YOLO推理使用高优先级Stream（priority=-1）
             # CUDA Stream优先级范围：负数=高优先级，0=默认优先级
             # 高优先级Stream中的kernel会被优先调度，抢占低优先级Stream
             try:

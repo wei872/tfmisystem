@@ -131,7 +131,7 @@ _MAX_STAGGER_INDEX = 7
 def _camera_index_from_name(name) -> int:
     """从相机业务名里取序号，用于触发错峰：camera1 -> 0, camera8 -> 7。
 
-    ⚠️ **解析不出来时返回 0**（即"不错峰"），不猜、不报错。
+    **解析不出来时返回 0**（即"不错峰"），不猜、不报错。
        错峰的失败模式必须是"回到原来的同时触发"，绝不能因为一个名字
        解析不出来就把相机启动搞挂。
 
@@ -141,7 +141,7 @@ def _camera_index_from_name(name) -> int:
     """
     if not name:
         return 0
-    # ⚠️ **必须整名匹配 cameraN，不能用 re.search 抓第一串数字**。
+    # **必须整名匹配 cameraN，不能用 re.search 抓第一串数字**。
     #    camera_name 缺省时会退化成序列号（`camera_name or st_serial_number`），
     #    而 "KBA26070032" 用 search 会解析出 26070032 → TriggerDelay 变成
     #    天文数字，相机等于永远不出图。实测过这个坑。
@@ -300,7 +300,7 @@ class CameraOperation:
                                分配，1GbE 单链路要 305 ms 才传得完。这种瞬时尖峰
                                是电源过流/整机卡死的高频诱因。
 
-                               ⚠️ **有几何代价**：错峰后各相机看到的布面纵向位置
+                               **有几何代价**：错峰后各相机看到的布面纵向位置
                                不再对齐。10 m/min = 166.7 mm/s，所以
                                ``7 × 步长(µs) × 0.0001667 mm/µs`` 就是 camera8
                                相对 camera1 的布面偏移。步长 500 µs ≈ 0.58 mm，
@@ -344,7 +344,7 @@ class CameraOperation:
                     f"（camera_name={self.camera_name!r}），本台按 0 处理（不错峰）。")
             self._stagger_index = 0
 
-        # ⚠️ 截断的是**步长**，不是单台延时。
+        # 截断的是**步长**，不是单台延时。
         #    之前按单台截断（delay > 20000 就压到 20000），后果是顶部几台被压成
         #    同一个值：实测 trigger_stagger_us=4000 时
         #      camera6/7/8 = 20000/20000/20000  →  间距 0，又变回同时触发。
@@ -480,7 +480,7 @@ class CameraOperation:
         trigger_delay_us == 0 时直接返回 False（不错峰是默认行为，不该去碰相机）。
 
         :return: True = 确实写进相机了；False = 没写（不错峰，或相机不支持）。
-                 ⚠️ 调用方**必须**用这个返回值决定日志怎么写。之前不看返回值，
+                 调用方**必须**用这个返回值决定日志怎么写。之前不看返回值，
                  结果相机不支持该特征、下发被跳过，启动日志却照样打
                  "TriggerDelay=3500us" —— 现场会以为错峰生效了，其实没有。
         """
@@ -682,7 +682,7 @@ class CameraOperation:
 
             self.b_open_device = True
 
-            # ⚠️ 日志必须反映**实际下发结果**，不能反映"我们打算设多少"。
+            # 日志必须反映**实际下发结果**，不能反映"我们打算设多少"。
             #    相机不支持 TriggerDelay 时下发会被跳过，此时若照打
             #    "TriggerDelay=3500us"，现场会以为错峰生效了 —— 而实际 8 台
             #    仍在同时推流。这个谎报比不打印危险得多。
@@ -804,7 +804,7 @@ class CameraOperation:
     def _on_capture(self, raw_image) -> None:
         """SDK 采集线程入口。
 
-        ⚠ 运行在大恒 SDK 的 C 线程上：
+        运行在大恒 SDK 的 C 线程上：
           - 这里抛出的任何异常都会穿透到 ctypes 边界（gxipy 自己没有 try 包），
             所以**整体用 try/except 兜死**；
           - 任何阻塞都会造成丢帧，所以只做"取数组 + 转 BGR + 分发"。
@@ -1047,7 +1047,7 @@ class CameraOperation:
 
             ret = self._set_enum("TriggerSource", source, warn_only=True)
 
-            # ⚠️ 切完触发源**必须重下发 TriggerDelay**。见 _apply_trigger_delay
+            # 切完触发源**必须重下发 TriggerDelay**。见 _apply_trigger_delay
             #    的说明：丢了的后果是软触发（停机预览）路径悄悄退回同时推流。
             if ret == 0:
                 self._apply_trigger_delay()

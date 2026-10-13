@@ -362,7 +362,7 @@ class DetectionWorkerPool:
 
         except Exception as e:
             task.infer_end = time.time()
-            # ✅ 打印完整堆栈，方便定位根因
+            # 打印完整堆栈，方便定位根因
             error(
                 f"[Pool] 推理失败: {e}\n"
                 f"{traceback.format_exc()}"

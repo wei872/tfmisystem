@@ -221,17 +221,17 @@ class WebSocketImageServer:
                         frame_count += 1
 
                         if frame_count == 1:
-                            info(f"[WebSocket] ✓ 首帧 | 客户端#{conn_id} | {camera_id}")
+                            info(f"[WebSocket] 首帧 | 客户端#{conn_id} | {camera_id}")
                         elif frame_count % 100 == 0:
-                            info(f"[WebSocket] ✓ 累计{frame_count}帧 | "
+                            info(f"[WebSocket] 累计{frame_count}帧 | "
                                  f"客户端#{conn_id} | {camera_id}")
 
                     except websockets.exceptions.ConnectionClosed as e:
-                        info(f"[WebSocket] ✗ 连接关闭 | 客户端#{conn_id} "
+                        info(f"[WebSocket] 连接关闭 | 客户端#{conn_id} "
                              f"| {camera_id} | code={e.code}")
                         return
                     except Exception as e:
-                        error(f"[WebSocket] ✗ 发送失败 | 客户端#{conn_id} "
+                        error(f"[WebSocket] 发送失败 | 客户端#{conn_id} "
                               f"| {camera_id} | {type(e).__name__}: {e}")
                         return
 

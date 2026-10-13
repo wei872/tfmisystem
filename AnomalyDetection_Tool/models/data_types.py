@@ -194,7 +194,7 @@ class ClassThresholdConfig:
       6. 全局 default_threshold_provider
       7. 全局 default_threshold
 
-    ⚠️ 注意第 3 条：相机级 default 会**盖掉全局的按类阈值**。也就是说给
+    注意第 3 条：相机级 default 会**盖掉全局的按类阈值**。也就是说给
     camera3 配了 ``default_class_confidence: 0.15``，那么全局里精心调过的
     ``油点线: 0.85`` 在 camera3 上也会变成 0.15。这是"覆盖块遮蔽全局块"的
     标准语义，但容易配错，所以 settings.describe_camera_thresholds() 会在

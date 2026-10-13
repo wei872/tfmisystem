@@ -45,7 +45,7 @@ class TestCameraIndex:
         assert fn(" camera2 ") == 1
 
     def test_serial_number_must_not_be_parsed_as_index(self):
-        """⚠️ 关键回归：camera_name 缺省会退化成序列号。
+        """关键回归：camera_name 缺省会退化成序列号。
         用 re.search 抓第一串数字时，"KBA26070032" 会解析成 26070032，
         TriggerDelay 变成天文数字 → 相机触发后一直等、永远不出图。"""
         fn, _ = self._fn()
@@ -78,7 +78,7 @@ class TestClusterBursts:
 
     def test_unsorted_input_is_handled(self):
         """同一次触发的到达记录不保证有序（8 条 SDK 线程并发追加）。
-        ⚠️ 间隔要用**亚毫秒**：聚类阈值 _BURST_GAP_SEC 是 0.1s，
+        间隔要用**亚毫秒**：聚类阈值 _BURST_GAP_SEC 是 0.1s，
         用几百毫秒的间隔本来就该被拆成多次触发。"""
         items = [(1000.0005, "camera3"), (1000.0, "camera1"),
                  (1000.0002, "camera2")]
@@ -184,7 +184,7 @@ class TestTriggerDelayWiring:
     """用假 SDK + 桩 _set_float 验证**接线**：Open_device 和 Set_trigger_source
     两处都必须下发 TriggerDelay。
 
-    ⚠️ 假 SDK 的 C 层没有浮点特征（没有 gx_get_float_feature），所以这里把
+    假 SDK 的 C 层没有浮点特征（没有 gx_get_float_feature），所以这里把
     _set_float 打桩来记录调用。**相机真的收下了多少**这件事在本沙箱里验不了，
     只能靠现场日志确认。"""
 
@@ -214,7 +214,7 @@ class TestTriggerDelayWiring:
         assert cam.trigger_delay_applied is True
 
     def test_set_trigger_source_reapplies_the_delay(self, monkeypatch):
-        """⚠️ 关键：软触发是织机**停机预览**时才切过去的。如果切触发源时
+        """关键：软触发是织机**停机预览**时才切过去的。如果切触发源时
         TriggerDelay 丢了，8 台会悄悄退回同时推流，而这恰好是最不容易被
         注意到的一条路径（停机时没人盯检测节拍）。"""
         cam, calls = self._make(monkeypatch)
@@ -302,7 +302,7 @@ class TestStaggerStepClamp:
     def _read_const(cls):
         """从源码里读 _MAX_TRIGGER_DELAY_US。
 
-        ⚠️ 不要硬编码这个数。它由"单帧传输时间"反推，将来分辨率或网口速率变了
+        不要硬编码这个数。它由"单帧传输时间"反推，将来分辨率或网口速率变了
         就会改；硬编码会让测试在上限调整后**继续通过**，等于失效。
         """
         src = open(os.path.join(
@@ -348,7 +348,7 @@ class TestStaggerStepClamp:
             assert max(d) <= self.MAX_DELAY, f"step={step} 超上限: {d}"
 
     def test_oversized_step_is_reduced_not_collapsed(self):
-        """⚠️ 核心回归：超配时**降步长**，绝不能让任何两台的间距变成 0。
+        """核心回归：超配时**降步长**，绝不能让任何两台的间距变成 0。
 
         输入从 MAX_STEP 推导，不写死 —— 否则上限一改，这些数就落到合法区间里，
         测试会**空转通过**。
@@ -462,7 +462,7 @@ class TestNoSimultaneousBurstWithoutDroppingFrames:
             比步长还大
         两种拓扑下间隔都 >= 步长。所以只要步长 > 转换耗时，8 个转换就不会重叠。
 
-        ⚠️ 注意这不是"跨度 > 传输时间"。那个判据是错的：它把"链路占用时长"
+        注意这不是"跨度 > 传输时间"。那个判据是错的：它把"链路占用时长"
         和"到达时刻间隔"混为一谈了。
         """
         step_us = self.cfg["cameras"]["acquisition"]["trigger_stagger_us"]

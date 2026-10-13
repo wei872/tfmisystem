@@ -46,7 +46,7 @@ _NIC_CLASS_KEY = (
 )
 _SERVICES_KEY = r"SYSTEM\CurrentControlSet\Services"
 
-# ⚠️ 网卡类键下面的子键**不全是网卡实例**。除了 0000/0001/... 之外还有
+# 网卡类键下面的子键**不全是网卡实例**。除了 0000/0001/... 之外还有
 #    Properties、Configuration 等非实例键。真机日志实证过：不加这个过滤，
 #    日志里会冒出「网卡 Configuration (名称未知)」「网卡 Properties (名称未知)」。
 _NIC_INSTANCE_RE = re.compile(r"^\d{4}$")
@@ -60,7 +60,7 @@ _MAX_SERVICE_KEYS = 8192
 # ------------------------------------------------------------------
 # 数据来源
 # ------------------------------------------------------------------
-# ⚠️ 这是本模块**最关键**的一点，也是真机日志逼出来的教训：
+# 这是本模块**最关键**的一点，也是真机日志逼出来的教训：
 #
 #   `UpperBindings` / `LowerBindings` 是 **NDIS 5.x 时代**中间驱动/协议驱动
 #   的绑定机制。**NDIS 6 轻量过滤驱动（GigE Vision 过滤驱动就是这一类）
@@ -75,14 +75,14 @@ _MAX_SERVICE_KEYS = 8192
 #      FilterClass / FilterRunOrder）—— 抓"装了但没绑定"的情况，这对判断
 #      "海康 MVS 到底卸干净没有"更重要
 #   3. UpperBindings / LowerBindings（保留，兼容老的 NDIS 5 驱动）
-# ⚠️ **不要**用 `Get-NetAdapterBinding -Class Filter`：真机实证该 cmdlet
+# **不要**用 `Get-NetAdapterBinding -Class Filter`：真机实证该 cmdlet
 #    **没有 -Class 参数**（"找不到与参数名称 Class 匹配的参数"）。
 #    也不要在 Select-Object 里取 Class —— 无法确认输出对象有这个属性，
 #    而一旦没有，Python 侧 `row["Class"] == "filter"` 会把**所有**记录都
 #    过滤掉，变成静默的假阴性。
 #    所以这里取全部绑定项，"是不是 NDIS 过滤驱动"改由注册表 Services 扫描
 #    （FilterClass / FilterRunOrder）来判定 —— 那个判据是可靠的。
-# ⚠️ 输出走 **base64**，这是为了根除中文乱码。
+# 输出走 **base64**，这是为了根除中文乱码。
 #
 #   Windows PowerShell 5.1 在 stdout 被重定向时用的是**控制台/OEM 代码页**
 #   （中文机器 cp936），不是 UTF-8。真机实证：直接取文本会把"以太网"变成
@@ -102,12 +102,12 @@ _PS_TIMEOUT_SEC = 20
 # ------------------------------------------------------------------
 # GigE Vision 过滤驱动的名字特征（大小写不敏感子串匹配）
 # ------------------------------------------------------------------
-# ⚠️ 这份表**不保证完整**，尤其是海康的确切服务名随 MVS 版本变过。
+# 这份表**不保证完整**，尤其是海康的确切服务名随 MVS 版本变过。
 #    所以本模块的设计是"名字匹配只做高亮，完整列表一律打印"——
 #    即使这张表漏了某个驱动，操作员也能从日志里看出来。
 #    现场发现漏了就往 config.yaml 的 logging.nic_filter_patterns 里加。
 #
-# ⚠️ **顺序有意义**：_matches 返回第一个命中的特征串，而它会被打进日志
+# **顺序有意义**：_matches 返回第一个命中的特征串，而它会被打进日志
 #    （"命中 'xxx'"）。厂商特征必须排在通用特征前面，否则日志只会说
 #    "命中 'gige'" 而不说是哪家的 —— 而"是哪家"正是操作员决定卸谁所需要的信息。
 DEFAULT_GIGE_PATTERNS: Sequence[str] = (
@@ -119,7 +119,7 @@ DEFAULT_GIGE_PATTERNS: Sequence[str] = (
     "mvgige",
     "mv_gige",
     "mvs",
-    # 大恒 Galaxy。⚠️ gxgv 必须在最前：真机上的 ComponentID 是
+    # 大恒 Galaxy。gxgv 必须在最前：真机上的 ComponentID 是
     # ms_GxGVLWFilter，不含 gxgige/gxiapi/galaxy 任何一个。
     "gxgv",
     "gvlwfilter",
@@ -127,7 +127,7 @@ DEFAULT_GIGE_PATTERNS: Sequence[str] = (
     "gxgige",
     "gxiapi",
     "galaxy",
-    # ⚠️ 真机实证补的（用户生产机 PowerShell 输出里实际存在，而原表漏了）：
+    # 真机实证补的（用户生产机 PowerShell 输出里实际存在，而原表漏了）：
     #   HKR_neuGEVFilter  "Neu GigEVision Image Filter Driver"  <- 海康机器人
     #   MVTec_Hgevstrm    "MVTec GigE Vision Streaming Filter"  <- HALCON 厂商
     "hkr",           # HikRobot 前缀
@@ -426,7 +426,7 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
                     continue
                 name = str(row.get("Name") or "").strip()
                 idesc = str(row.get("InterfaceDescription") or "").strip()
-                # ⚠️ 合并键必须和注册表那边一致，否则**同一块物理网卡会被拆成
+                # 合并键必须和注册表那边一致，否则**同一块物理网卡会被拆成
                 #    两条记录**：PowerShell 给的是连接名（"以太网 2"），注册表
                 #    给的是 DriverDesc（"Realtek PCIe GbE Family Controller"）。
                 #    两边能对上的是 InterfaceDescription == DriverDesc，所以
@@ -440,7 +440,7 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
                     "conn_name": name, "sources": set(), "filters": []})
                 rec["driver_desc"] = rec["driver_desc"] or idesc
                 rec["sources"].add("netadapterbinding")
-                # ⚠️ **顺序是要害**：PowerShell 给的 DisplayName 必须在
+                # **顺序是要害**：PowerShell 给的 DisplayName 必须在
                 #    _classify() **之前**合进 meta。真机实证：注册表里读不到
                 #    HKR_neuGEVFilter / MVTec_Hgevstrm 的 DisplayName，于是
                 #    haystack 只剩服务名（"hkr_neugevfilter" 里没有 "gige"），
@@ -467,7 +467,7 @@ def enumerate_nic_filters(reg: Optional[_Registry] = None,
     except Exception:
         keys = []
     for sub in keys:
-        # ⚠️ 必须过滤：类键下还有 Properties / Configuration 等非实例子键
+        # 必须过滤：类键下还有 Properties / Configuration 等非实例子键
         if not _NIC_INSTANCE_RE.match(str(sub)):
             continue
         try:
@@ -527,7 +527,7 @@ def analyse_nic_filters(nics: Optional[List[Dict]]) -> Dict:
     for nic in nics:
         filters = nic.get("filters") or []
         gige = [f for f in filters if f.get("matched_gige")]
-        # ⚠️ **判定只看启用中的**。真机实证：在 ncpa.cpl 里取消勾选后，
+        # **判定只看启用中的**。真机实证：在 ncpa.cpl 里取消勾选后，
         #    绑定**依然存在**、Get-NetAdapterBinding 依然会列出来，只是
         #    Enabled 变成 False —— 那时它已经不在收包路径上，不构成卡死风险。
         #    原来的代码把已禁用的一起算，于是用户明明按正确步骤禁用并重启了，
@@ -641,7 +641,7 @@ def report_nic_filters(report: Optional[Dict] = None,
 
     try:
         if conflicts:
-            warn("[网卡过滤驱动] ⚠ 发现 {} 张网卡上同时挂了多个疑似 "
+            warn("[网卡过滤驱动] 发现 {} 张网卡上同时挂了多个疑似 "
                  "GigE Vision 过滤驱动 —— 这是整机网络栈卡死/电脑死机的"
                  "高频原因，务必只保留大恒 Galaxy 的那一个：".format(
                      len(conflicts)))
@@ -664,9 +664,9 @@ def report_nic_filters(report: Optional[Dict] = None,
                  "绑定项仍会出现在清单里，但会被标成 [已禁用]，不再算冲突。")
             warn("  详见 docs/SDK迁移_海康转大恒.md 的现场部署步骤。")
         elif result["singles"]:
-            log("[网卡过滤驱动] ✓ 未发现重复的 GigE 过滤驱动（每张网卡最多 1 个）")
+            log("[网卡过滤驱动] 未发现重复的 GigE 过滤驱动（每张网卡最多 1 个）")
             for s in result["singles"]:
-                # ⚠️ 取 gige_active[0] 而不是 gige_filters[0]：
+                # 取 gige_active[0] 而不是 gige_filters[0]：
                 #    后者可能是**已禁用**的那个，于是日志会把一个已经不在
                 #    收包路径上的驱动说成"这张卡上唯一在用的 GigE 驱动"。
                 act = s.get("gige_active") or s["gige_filters"]
@@ -674,14 +674,14 @@ def report_nic_filters(report: Optional[Dict] = None,
                     s["nic"], s["driver_desc"] or "名称未知",
                     _fmt_filter(act[0])))
         elif not ps_ok:
-            # ⚠️ 这种情况**不能**说"没有 GigE 过滤驱动"。
+            # 这种情况**不能**说"没有 GigE 过滤驱动"。
             # 只拿到注册表时，Upper/LowerBindings 覆盖不到 NDIS 6 轻量过滤
             # 驱动，"全空"极可能是数据源不够而不是真的没有。必须如实说明，
-            # 并给出可手工核对的命令 —— 否则就是拿一个假的 ✓ 骗人。
-            warn("[网卡过滤驱动] ⚠ 未能通过 Get-NetAdapterBinding 取到网卡绑定"
+            # 并给出可手工核对的命令 —— 否则就是拿一个假的 骗人。
+            warn("[网卡过滤驱动] 未能通过 Get-NetAdapterBinding 取到网卡绑定"
                  "数据（PowerShell 不可用 / 被策略禁用 / 超时），"
                  "只查到了注册表里的遗留绑定项。")
-            warn("  ⚠ 因此下面清单里的\"无\"**不能**当作\"这张卡没有过滤驱动\"："
+            warn("  因此下面清单里的\"无\"**不能**当作\"这张卡没有过滤驱动\"："
                  "注册表的 UpperBindings/LowerBindings 覆盖不到 NDIS 6 轻量"
                  "过滤驱动，而 GigE Vision 过滤驱动正是这一类。")
             warn("  请手工核对（不需要管理员权限）：")
@@ -689,7 +689,7 @@ def report_nic_filters(report: Optional[Dict] = None,
                  "Get-NetAdapterBinding -Class Filter | "
                  "Format-Table Name, InterfaceDescription, ComponentID, Enabled\"")
         else:
-            log("[网卡过滤驱动] ✓ 各网卡上均未发现疑似 GigE 过滤驱动"
+            log("[网卡过滤驱动] 各网卡上均未发现疑似 GigE 过滤驱动"
                 "（数据来源：Get-NetAdapterBinding，权威）。")
             log("  如果现场确实在用 GigE 相机却看到这条，请把上面清单里的驱动名"
                 "补进 config.yaml 的 logging.nic_filter_patterns。")
@@ -784,7 +784,7 @@ def check_nic_filter_drivers(gige_patterns=None) -> Dict:
 # 绝对不能动的驱动：大恒自己的过滤驱动。
 # 这是硬约束，不是可配置项——把它关掉等于让本项目自己收不到图。
 KEEP_PATTERNS: Sequence[str] = (
-    # ⚠️ 真机实证（用户 PowerShell 输出）：大恒的过滤驱动实际叫
+    # 真机实证（用户 PowerShell 输出）：大恒的过滤驱动实际叫
     #    ComponentID  = ms_GxGVLWFilter
     #    DisplayName  = "GigE Vision LightWeight Filter"
     #    ImagePath    = ...\GxGVLWFilter.sys
@@ -851,7 +851,7 @@ def plan_disable(report: Optional[Dict] = None,
         if only_conflicting_nics and nic_name not in conflicting:
             continue
         filters = nic.get("filters") or []
-        # ⚠️ 用**下标**而不是字典相等来标记身份。同一张网卡上完全可能出现两条
+        # 用**下标**而不是字典相等来标记身份。同一张网卡上完全可能出现两条
         #    字段一模一样的驱动记录，用 `f in keepable` 会互相误判。
         # 已禁用（Enabled=False）的既不算冲突、也没必要再动一次，
         # 所以整个计划里都不出现。enabled 为 None（来源给不出）时按启用处理。
@@ -888,7 +888,7 @@ def plan_disable(report: Optional[Dict] = None,
                     rec, reason="保留项：禁掉它这张网卡上就没有 GigE 过滤驱动了，"
                                 "相机会收不到图"))
                 continue
-            # ⚠️ 描述为空就**拒绝**，不要生成命令。
+            # 描述为空就**拒绝**，不要生成命令。
             #    生成的命令会是 `-eq ''`，在 PowerShell 里匹配不到任何网卡，
             #    于是"执行成功"但什么都没改 —— 正是要避免的静默失效。
             #    宁可不做，也不要让操作员以为做了。
@@ -946,7 +946,7 @@ def disable_filter_bindings(confirm: bool = False,
         return out
 
     if not out["admin"]:
-        print("\n[网卡过滤驱动] ✗ 当前不是管理员权限，无法修改网卡绑定。"
+        print("\n[网卡过滤驱动] 当前不是管理员权限，无法修改网卡绑定。"
               "请用管理员身份重新打开命令行。", file=sys.stderr)
         out["error"] = "not_admin"
         return out
@@ -955,7 +955,7 @@ def disable_filter_bindings(confirm: bool = False,
         print("\n[网卡过滤驱动] 没有需要禁用的驱动。")
         return out
 
-    print("\n[网卡过滤驱动] ⚠ 执行后网卡会短暂 reset，所有 GigE 相机会断线重连。"
+    print("\n[网卡过滤驱动] 执行后网卡会短暂 reset，所有 GigE 相机会断线重连。"
           "请确认产线已停。")
     if runner is None:
         runner = _run_powershell
@@ -974,14 +974,14 @@ def disable_filter_bindings(confirm: bool = False,
         print("  → 完成" if rc == 0 else f"  → 失败 (rc={rc}) {e}")
 
     print("\n[网卡过滤驱动] 全部执行完毕。建议**重启本机**让 NDIS 绑定彻底干净，"
-          "然后重新启动本程序确认日志里出现 ✓。")
+          "然后重新启动本程序确认日志里出现 。")
     return out
 
 
 def _decode_console(raw: bytes) -> str:
     """把子进程输出按**正确的**代码页解码。
 
-    ⚠️ 真机实证的坑（本模块自己踩的回归）：
+    真机实证的坑（本模块自己踩的回归）：
       Windows PowerShell 5.1 在 stdout 被重定向时，用的是**控制台/OEM 代码页**，
       中文机器是 cp936(GBK)，**不是 UTF-8**。之前这里写死 encoding="utf-8"，
       于是"以太网"变成"?̫?"、"Microsoft 网络客户端"变成"Microsoft ????ͻ???"。
@@ -1037,11 +1037,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\n读不到注册表里的网卡绑定信息，无法继续。")
         return 2
     for c in rep.get("conflicts") or []:
-        print(f"\n⚠ 冲突网卡 {c.get('nic')} ({c.get('driver_desc')}):")
+        print(f"\n冲突网卡 {c.get('nic')} ({c.get('driver_desc')}):")
         for f in c.get("filters") or []:
             print(f"    {_fmt_filter(f)}")
     if not rep.get("conflicts"):
-        print("✓ 未发现同一张网卡上有多个 GigE 过滤驱动，无需处理。")
+        print("未发现同一张网卡上有多个 GigE 过滤驱动，无需处理。")
 
     res = disable_filter_bindings(confirm=yes,
                                   only_conflicting_nics=not all_nics)

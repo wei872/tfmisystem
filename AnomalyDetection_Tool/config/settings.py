@@ -618,7 +618,7 @@ DEFAULT_DETECT_CONFIG = _get("default_detect", {
 # 停机规则
 # ================================================================
 
-# 🔥 热更新：改 config.yaml 里的阈值后约 2 秒生效，无需重启
+# 热更新：改 config.yaml 里的阈值后约 2 秒生效，无需重启
 MACHINE_STOP_RULES = _LiveDict("machine_stop_rules", {})
 
 # ----------------------------------------------------------------
@@ -649,21 +649,21 @@ HEATMAP_CONFIG = _get("heatmap", {})
 # 类别尺寸过滤（不纳入检测）
 # ================================================================
 
-# 🔥 热更新
+# 热更新
 CLASS_SIZE_FILTER = _LiveDict("class_size_filter", {})
 
 # ================================================================
 # 类别边缘距离过滤
 # ================================================================
 
-# 🔥 热更新
+# 热更新
 CLASS_EDGE_FILTER = _LiveDict("class_edge_filter", {})
 
 # ================================================================
 # 竖线误检过滤
 # ================================================================
 
-# 🔥 阈值热更新；但 enabled 决定过滤器是否被创建，改它仍需重启
+# 阈值热更新；但 enabled 决定过滤器是否被创建，改它仍需重启
 VERTICAL_LINE_FILTER = _LiveDict("vertical_line_filter", {})
 
 # ================================================================
@@ -699,8 +699,16 @@ YOLO_CONFIG = _get("yolo", {
 # 类别置信度阈值
 # ================================================================
 
-# 🔥 热更新
+# 热更新
 CLASS_CONFIDENCE_THRESHOLDS = _LiveDict("class_confidence_thresholds", {})
+
+
+# ================================================================
+#  【四】正常图片定时保存
+# ================================================================
+# 前端下发「开始时刻 + 持续时长」后，在这段时间内定时保存**无缺陷**帧，
+# 每台相机每个窗口最多 max_per_camera 张。没下发窗口就一张都不存。
+NORMAL_IMAGE_SAVE = _LiveDict("normal_image_save", {})
 
 # 标量无法就地更新（Python 的数字是不可变对象，import 拿到的是值的副本），
 # 因此对外提供访问器；模块级常量保留为启动时快照，仅供兼容旧调用点。
@@ -708,7 +716,7 @@ DEFAULT_CLASS_CONFIDENCE = _get("default_class_confidence", 0.1)
 
 
 def get_default_class_confidence() -> float:
-    """🔥 热更新：默认类别置信度阈值"""
+    """热更新：默认类别置信度阈值"""
     if _maybe_reload():
         _refresh_live_sections()
     val = _CFG.get("default_class_confidence", DEFAULT_CLASS_CONFIDENCE)
@@ -726,7 +734,7 @@ CAMERA_THRESHOLD_OVERRIDES = _LiveDict("camera_threshold_overrides", {})
 
 
 def get_camera_threshold_override(camera_name) -> Optional[Dict]:
-    """🔥 热更新：取某台相机的阈值覆盖块；没有则返回 None。
+    """热更新：取某台相机的阈值覆盖块；没有则返回 None。
 
     返回的是 config.yaml 里 ``camera_threshold_overrides.<camera_name>``
     那一段原样内容（dict），结构见 config.yaml 里的注释。
@@ -744,7 +752,7 @@ def get_camera_threshold_override(camera_name) -> Optional[Dict]:
 
 
 def get_camera_default_confidence(camera_name):
-    """🔥 热更新：某台相机的默认置信度阈值；没配则返回 None（不是 0！）
+    """热更新：某台相机的默认置信度阈值；没配则返回 None（不是 0！）
 
     返回 None 让调用方能区分"这台相机没配默认值"和"配成了 0"。
     """
@@ -813,7 +821,7 @@ _STOP_RULE_STR_KEYS = ("trigger_mode",)
 
 
 def get_camera_stop_rule_override(camera_name, class_name) -> Optional[Dict]:
-    """🔥 热更新：取某台相机对某个类的停机规则覆盖块；没有则返回 None。
+    """热更新：取某台相机对某个类的停机规则覆盖块；没有则返回 None。
 
     返回 None 的三种情况都当作"这台相机对该类没有覆盖"，一律回落全局：
     没配这台相机 / 配了但 ``rules`` 不是 dict / 配了但该类那一项不是 dict。
@@ -913,7 +921,7 @@ def effective_stop_rule(class_name, camera_name=None, stop_rules=None) -> Option
 # 与单次停机规则**并存**：两条任一条满足就停机。
 # 需求原话：「在一台相机上，连续几秒检测到相同类型的疵点就停机」。
 #
-# ⚠️ 这里的 min_confidence 是**计数门槛**，与单次停机规则的 min_confidence
+# 这里的 min_confidence 是**计数门槛**，与单次停机规则的 min_confidence
 #    是两回事，不要混。单次规则问"这一个疵点够不够严重"，重复规则问
 #    "这类疵点是不是一直在出现"。若复用单次门槛，那些每次都差一点的
 #    疵点永远计不进来，本功能等于没开。
@@ -955,7 +963,7 @@ def _sanitise_repeat_rule_block(block, where: str) -> Dict:
 
 
 def get_camera_repeat_rule_override(camera_name, class_name) -> Optional[Dict]:
-    """🔥 热更新：取某台相机对某个类的重复停机覆盖块；没有则 None。
+    """热更新：取某台相机对某个类的重复停机覆盖块；没有则 None。
 
     与 get_camera_stop_rule_override 同样的三种"当作没有"情况：
     没配这台相机 / rules 不是 dict / 该类那一项不是 dict。
@@ -989,11 +997,11 @@ def repeat_stop_allowed(camera_name, repeat_rules=None) -> bool:
     * **空列表 ``[]``** -> 谁都不许停（只计数、只打日志）
     * **非空列表**     -> 只有列出的相机许停
 
-    ⚠️ "键不存在"和"空列表"必须区分开。用 ``in`` 判断而不是
+    "键不存在"和"空列表"必须区分开。用 ``in`` 判断而不是
     ``rules.get(k) or 默认``——后者会把 ``[]`` 当成"没配"，
     于是"谁都不许停"被静默变成"全都许停"，方向正好反了。
 
-    ⚠️ 这个名单**只管【三】重复触发**，不影响【二】单次停机规则。
+    这个名单**只管【三】重复触发**，不影响【二】单次停机规则。
     单次停机在 8 台上的既有行为一个字都没改。
 
     :param camera_name: 相机名
@@ -1417,12 +1425,12 @@ WARP_DENSITY_STOP_TRIGGER = _warp.get("stop_trigger", 0.45)
 
 
 def get_warp_trigger() -> bool:
-    """🔥 热更新：经线异常是否触发停机"""
+    """热更新：经线异常是否触发停机"""
     return bool(_live_value("warp_density", "trigger", WARP_TRIGGER))
 
 
 def get_warp_stop_trigger() -> float:
-    """🔥 热更新：经线均匀度停机阈值（低于此值触发）"""
+    """热更新：经线均匀度停机阈值（低于此值触发）"""
     return float(_live_value("warp_density", "stop_trigger",
                              WARP_DENSITY_STOP_TRIGGER))
 
@@ -1440,18 +1448,18 @@ LAT_SLOPE_ANGLE_THRESHOLD = _weft.get("lat_slope_angle_threshold", 5.0)
 
 
 def get_weft_trigger() -> bool:
-    """🔥 热更新：纬线异常是否触发停机"""
+    """热更新：纬线异常是否触发停机"""
     return bool(_live_value("weft_density", "trigger", WEFT_TRIGGER))
 
 
 def get_weft_stop_trigger() -> float:
-    """🔥 热更新：纬线最大间距停机阈值（超过此值触发）"""
+    """热更新：纬线最大间距停机阈值（超过此值触发）"""
     return float(_live_value("weft_density", "stop_trigger",
                              WEFT_DENSITY_STOP_TRIGGER))
 
 
 def get_lat_slope_threshold() -> float:
-    """🔥 热更新：纬斜角度停机阈值（超过此值触发）"""
+    """热更新：纬斜角度停机阈值（超过此值触发）"""
     return float(_live_value("weft_density", "lat_slope_angle_threshold",
                              LAT_SLOPE_ANGLE_THRESHOLD))
 SAVE_WEFT = _weft.get("save_weft", False)

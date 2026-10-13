@@ -300,7 +300,7 @@ class TestReporting:
 
     def test_conflict_warns_and_names_both_drivers(self):
         txt = "\n".join(self._collect(reg=reg_with_two_gige_filters()))
-        assert "⚠" in txt
+        assert "张网卡上同时挂了多个疑似" in txt          # 原来靠图标断言，图标已去掉，改断言文案
         assert "MVGIgEFilter" in txt and "GXGigEFilter" in txt
         assert "Hikvision" in txt or "hikvision" in txt.lower()
         # 建议文案改过：真机实证**取消勾选就够了**（Enabled=False 即不在收包
@@ -317,15 +317,15 @@ class TestReporting:
                 "DriverDesc": "NIC", "UpperBindings": ["GXGigEFilter"]},
                 SVC + r"\GXGigEFilter": {"DisplayName": "Daheng Galaxy"}})
         txt = "\n".join(self._collect(reg=reg))
-        assert "✓ 未发现重复" in txt
-        assert "⚠" not in txt
+        assert "未发现重复" in txt
+        assert "张网卡上同时挂了多个疑似" not in txt   # 无冲突时不该出现冲突文案
 
     def test_not_checked_says_so_without_error(self):
         """查不到时必须安静说明原因，不能报错——失败模式是「没查成」。"""
         lines = self._collect(reg=RaisingReg())
         txt = "\n".join(lines)
         assert "未能读取" in txt or "跳过检查" in txt
-        assert "⚠" not in txt
+        assert "张网卡上同时挂了多个疑似" not in txt   # 没查成时不该报冲突
 
     def test_full_list_always_printed(self):
         txt = "\n".join(self._collect(reg=reg_with_two_gige_filters()))
@@ -484,7 +484,7 @@ class TestPlanDisable:
     def test_empty_service_name_is_ignored_entirely(self):
         """空服务名连 GigE 判定都过不了（haystack 为空），所以正确行为是
         **整个忽略**，不进 action、不进 blocked、也不崩。
-        ⚠️ 必须造出 ≥2 个 GigE 过滤驱动才构成冲突，否则整张网卡会被跳过，
+        必须造出 ≥2 个 GigE 过滤驱动才构成冲突，否则整张网卡会被跳过，
         这条测试就什么都测不到了。"""
         reg = FakeReg(
             subkeys={NIC_KEY: ["0001"]},
@@ -558,7 +558,7 @@ class TestDisableExecution:
             return 0, "", ""
 
         # 用真实注册表读不到，这里让 plan 走注入的假注册表
-        real = nfc.enumerate_nic_filters          # ⚠️ 先抓住原函数，
+        real = nfc.enumerate_nic_filters          # 先抓住原函数，
         monkeypatch.setattr(nfc, "enumerate_nic_filters",   # 否则 lambda 里
                             lambda reg=None, **k: real(     # 调自己会无限递归
                                 reg=reg_with_two_gige_filters()))
@@ -577,7 +577,7 @@ class TestDisableExecution:
             calls.append(cmd)
             return 0, "Enabled : False", ""     # 本来就是关的
 
-        real = nfc.enumerate_nic_filters          # ⚠️ 先抓住原函数，
+        real = nfc.enumerate_nic_filters          # 先抓住原函数，
         monkeypatch.setattr(nfc, "enumerate_nic_filters",   # 否则 lambda 里
                             lambda reg=None, **k: real(     # 调自己会无限递归
                                 reg=reg_with_two_gige_filters()))
@@ -750,7 +750,7 @@ class TestDataSources:
         过滤驱动，只有 Get-NetAdapterBinding 能拿到。"""
         reg = FakeReg(                       # 注册表这边**什么都没有**
             subkeys={NIC_KEY: ["0000"]},
-            # ⚠️ DriverDesc 必须和 PowerShell 的 InterfaceDescription **同串**：
+            # DriverDesc 必须和 PowerShell 的 InterfaceDescription **同串**：
             #    真机上这两个值来自同一个 INF，是一样的。合并键就靠这个对齐。
             values={NIC_KEY + r"\0000": {
                         "DriverDesc": "Realtek PCIe GbE Family Controller"},
@@ -877,7 +877,7 @@ class TestInstalledFilterScan:
 
 
 class TestHonestDegradation:
-    """只有遗留来源时，日志**不能**给出一个假的 ✓。
+    """只有遗留来源时，日志**不能**给出一个假的 。
 
     这是真机日志暴露的问题：一张 Realtek GbE 报"无"，而 Windows 8+ 上这块卡
     至少绑着 WFP Lightweight Filter。全空 = 数据源不够，不是真的没有。"""
@@ -895,7 +895,7 @@ class TestHonestDegradation:
         finally:
             nfc.enumerate_via_powershell = orig
         txt = "\n".join(out)
-        assert "✓" not in txt, "只有遗留来源却给了 ✓ —— 这是骗人"
+        assert "未发现重复" not in txt, "只有遗留来源却宣称没冲突 —— 这是骗人"
         assert "不能" in txt and "NDIS 6" in txt, txt
         assert "Get-NetAdapterBinding" in txt      # 必须给出手工核对命令
 
@@ -935,7 +935,7 @@ class TestReportWithPowerShell:
         rep = nfc.report_nic_filters(reg=reg, use_powershell=True,
                                      ps_runner=_ps_runner(rows), log_fn=out.append)
         txt = "\n".join(out)
-        assert "✓" in txt
+        assert "未发现重复" in txt          # 权威来源生效，应报"未发现重复"
         assert "WFP Lightweight Filter" in txt   # 权威来源确实生效了
         assert rep["sources"] == ["netadapterbinding", "registry"]
         assert len(rep["all_filters"]) == 1, "同一块卡被拆成两条了"
@@ -946,7 +946,7 @@ class TestReportWithPowerShell:
         rep = nfc.report_nic_filters(reg=reg, use_powershell=True,
                                      ps_runner=_ps_runner(rows), log_fn=out.append)
         assert len(rep["conflicts"]) == 1
-        assert "⚠" in "\n".join(out)
+        assert "张网卡上同时挂了多个疑似" in "\n".join(out)
 
     def test_installed_but_unbound_is_reported(self):
         """装了但没绑定的 GigE 过滤驱动也要报出来。"""
@@ -1114,7 +1114,7 @@ class TestBase64Transport:
         assert got is None
 
     def test_classification_uses_the_powershell_display_name(self):
-        """⚠️ 这条是**专门钉顺序**的，必须和特征表覆盖度解耦。
+        """这条是**专门钉顺序**的，必须和特征表覆盖度解耦。
 
         上面几条测试其实盖不住顺序 bug：因为 DEFAULT_GIGE_PATTERNS 里补的
         'hkr' / 'gevstrm' 光靠**服务名**就能匹配上，于是把 DisplayName 合并
@@ -1215,7 +1215,7 @@ class TestDisabledFiltersAreNotConflicts:
         assert len(rep["all_filters"][0]["gige_disabled"]) == 2
 
     def test_singles_reports_the_active_one_not_a_disabled_one(self):
-        """日志里 ✓ 那行必须报**启用中**的那个。
+        """日志里 那行必须报**启用中**的那个。
         原来取 gige_filters[0]，会把一个已经不在收包路径上的驱动
         说成"这张卡上唯一在用的 GigE 驱动"。"""
         reg, payload = self._reg_and_rows({"HKR_neuGEVFilter": False,

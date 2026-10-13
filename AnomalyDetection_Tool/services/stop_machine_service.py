@@ -329,11 +329,11 @@ class StopMachineService:
             if min_w > 0:
                 parts.append(
                     f"宽={real_w_mm:.2f}mm(阈值={min_w}mm,"
-                    f"{'✓' if w_triggered else '✗'})")
+                    f"{'' if w_triggered else ''})")
             if min_h > 0:
                 parts.append(
                     f"高={real_h_mm:.2f}mm(阈值={min_h}mm,"
-                    f"{'✓' if h_triggered else '✗'})")
+                    f"{'' if h_triggered else ''})")
             log_lines.append(
                 f"  [{tag}] {box.class_name} "
                 + " ".join(parts)
@@ -515,7 +515,7 @@ class StopMachineService:
                                去重**（每类一个框）—— 计数是"按帧"的，
                                同一帧同类出现 5 个框也只算 1 次。
                                代表框用于停机落盘/继电器，取置信度最高的那个。
-        ⚠️ 只有 ``repeat_stop_rules.stop_allowed_cameras`` 里的相机才参与
+        只有 ``repeat_stop_rules.stop_allowed_cameras`` 里的相机才参与
            （现场是 camera1 / camera8）。其余相机在这里**第一行就返回**，
            不建滑动窗口、不判定、不打每帧日志 —— 攒够了也不能停，
            计数本身没有意义。
@@ -529,12 +529,12 @@ class StopMachineService:
         if not boxes_by_class:
             return False
 
-        # ⚠️ 授权判断必须在**计数之前**。
+        # 授权判断必须在**计数之前**。
         #    没有停机权限的相机，计数本身就没有意义 —— 攒够了也不能停，
         #    白占一份滑动窗口、白刷日志。所以这里直接返回，
         #    不建窗口、不判定、不打每帧日志。
         #    （只有 camera1 / camera8 参与，见 repeat_stop_rules.stop_allowed_cameras）
-        #    ⚠️ 这只管【三】重复触发，【二】单次停机在 8 台上的行为没动。
+        #    这只管【三】重复触发，【二】单次停机在 8 台上的行为没动。
         if not repeat_stop_allowed(camera_name):
             with self._lock:
                 self._stats["repeat_stop_frames_skipped"] += 1

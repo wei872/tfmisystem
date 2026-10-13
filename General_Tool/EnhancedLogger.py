@@ -140,7 +140,7 @@ class SafeEnhancedLogger:
         """
         获取调用者信息（module / lineno / funcName）。
 
-        ⚠ 性能：本函数在**每一条**日志上都会被调用，包括相机 SDK 的采集线程。
+        性能：本函数在**每一条**日志上都会被调用，包括相机 SDK 的采集线程。
         原实现用的是 inspect.stack()，实测单次 0.19~0.62ms（随栈深线性增长，
         本项目 detect_image→pipeline→tasks 嵌套 25 帧以上时约 0.4ms），
         而 logging 自带的 findCaller 只要 0.0008ms —— 相差 250~750 倍。

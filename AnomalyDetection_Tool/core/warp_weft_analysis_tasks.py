@@ -27,7 +27,7 @@ import numpy as np
 from General_Tool.EnhancedLogger import info, error
 from AnomalyDetection_Tool.config.settings import (
     WEFT_OUTPUT_DIR, SAVE_WEFT,
-    # 🔥 经纬停机阈值改用访问器读取，支持 config.yaml 热更新（无需重启）
+    # 经纬停机阈值改用访问器读取，支持 config.yaml 热更新（无需重启）
     get_warp_trigger, get_warp_stop_trigger,
     get_weft_trigger, get_weft_stop_trigger,
     get_lat_slope_threshold,
@@ -103,7 +103,7 @@ class AnalysisTasks:
             _, w = image.shape[:2]
             cut_ratio, cut_side = self._calc_cut_ratio(camera_name, w)
 
-            # ★ 低优先级Stream包裹经线分析的GPU操作
+            # 低优先级Stream包裹经线分析的GPU操作
             # 若WarpDensityDetector内部有GPU调用，会在低优先级Stream中执行
             # YOLO推理（高优先级）运行时，此处的GPU kernel会被延迟到YOLO空闲后执行
             with self._stream_pool.acquire(timeout=1.0) as stream_ctx:
@@ -189,7 +189,7 @@ class AnalysisTasks:
             self._weft_detector.save_annotated = SAVE_WEFT
             self._weft_detector.output_dir = pathlib.Path(WEFT_OUTPUT_DIR)
 
-            # ★ 低优先级Stream包裹纬线检测的GPU操作
+            # 低优先级Stream包裹纬线检测的GPU操作
             # WeftDetector内部的GPU操作（use_gpu=True）在低优先级Stream中执行
             # 相比YOLO高优先级Stream，GPU调度器会优先保障YOLO的kernel完成
             with self._stream_pool.acquire(timeout=1.0) as stream_ctx:

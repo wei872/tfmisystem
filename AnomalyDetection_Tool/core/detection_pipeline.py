@@ -151,9 +151,9 @@ class DetectionPipeline:
                 class_thresholds_by_id
                 if class_thresholds_by_id is not None else {}),
             default_threshold=default_class_threshold,
-            # 🔥 默认阈值改为动态读取，支持热更新
+            # 默认阈值改为动态读取，支持热更新
             default_threshold_provider=get_default_class_confidence,
-            # 🔥 按相机覆盖。**必须是 provider（调用时按 camera_name 查），
+            # 按相机覆盖。**必须是 provider（调用时按 camera_name 查），
             # 不能在构造时取一份快照**：pipeline 是每 worker 线程一个
             # （detection_worker_pool._get_or_create_pipeline 用线程本地存储），
             # num_workers=5 而相机 8 台，一个 pipeline 会服务多台相机，

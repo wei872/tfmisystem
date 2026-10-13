@@ -189,7 +189,7 @@ class TestSlidingWindow:
         assert tr.get_stats()["triggered"] == 1
 
     def test_trigger_clears_the_window(self):
-        """⚠️ 关键：触发后必须清空，否则之后**每一帧**都会重复触发。"""
+        """关键：触发后必须清空，否则之后**每一帧**都会重复触发。"""
         tr, clk = self._t()
         for _ in range(3):
             tr.record_frame("camera3", ["包边不良"], {"包边不良": 0.6})
@@ -213,7 +213,7 @@ class TestSlidingWindow:
         assert tr.get_stats()["triggered"] == 2
 
     def test_per_frame_dedup_same_class_many_boxes(self):
-        """⚠️ 按帧计数：同一帧同类出现 5 个框也只算 1 次。
+        """按帧计数：同一帧同类出现 5 个框也只算 1 次。
 
         按框算的话，单帧误检 3 个就会立刻误停 —— 这是本功能最容易写错的地方。
         """
@@ -405,7 +405,7 @@ class TestSiteScenario:
                 f"{cam} 参与状态应为 {i in (1, 8)}，实得 {participates}"
 
     def test_counting_gate_is_looser_than_the_single_shot_gate(self):
-        """⚠️ 这条是本功能有没有用的关键。
+        """这条是本功能有没有用的关键。
 
         「包边不良」的单次停机门槛是 min_confidence=0.9。如果计数门槛也取 0.9，
         第 1 次就单次停机了，永远攒不到第 3 次 —— 本功能对这个类等于没开。
@@ -595,7 +595,7 @@ class TestRealPipeline:
                            {}, time.time())
 
     def test_five_boxes_in_one_frame_count_once(self, manager):
-        """⚠️ 主流程里的按帧去重：单帧 5 个同类框只算 1 次。"""
+        """主流程里的按帧去重：单帧 5 个同类框只算 1 次。"""
         dm, calls = manager
         self._frame(dm, 0, [_box()] * 5)
         stats = dm._stop_service.repeat_tracker.get_stats()
@@ -647,7 +647,7 @@ class TestStopAuthority:
         assert st.repeat_stop_allowed("camera5", {"enabled": True}) is True
 
     def test_empty_list_means_none_allowed(self):
-        """⚠️ [] 必须是"谁都不许停"，不能被当成"没配"。
+        """[] 必须是"谁都不许停"，不能被当成"没配"。
 
         用 rules.get(k) or 默认 会把 [] 当成没配，于是"谁都不许停"
         被静默变成"全都许停"，方向正好反了。
@@ -741,7 +741,7 @@ class TestStopAuthorityIntegration:
         assert calls == ["camera8"]
 
     def test_middle_cameras_do_not_count_at_all(self, auth_service):
-        """⚠️ 核心：没停机权的相机**连计数都不做**。
+        """核心：没停机权的相机**连计数都不做**。
 
         攒够了也不能停，计数本身没有意义 —— 白占一份滑动窗口、
         白刷日志。所以判定在计数之前就短路了。
@@ -779,7 +779,7 @@ class TestStopAuthorityIntegration:
         assert svc.repeat_tracker.get_stats()["occurrences"] == 3
 
     def test_whitelist_does_not_touch_single_shot_stops(self, monkeypatch):
-        """⚠️ 白名单**只管【三】**。【二】单次停机在 8 台上的行为必须没变。
+        """白名单**只管【三】**。【二】单次停机在 8 台上的行为必须没变。
 
         这条是防止有人把授权判断误加到 analyze_defect_area /
         analyze_defect_dimension 里 —— 那会让中间 6 台突然失去单次停机能力。
@@ -881,7 +881,7 @@ class TestSingleYarnClass:
             assert st.repeat_stop_allowed(cam, rr) is (i in (1, 8))
 
     def test_repeat_rule_catches_what_single_shot_lets_through(self, monkeypatch):
-        """⚠️ 本类新增有没有意义，全看这一条。
+        """本类新增有没有意义，全看这一条。
 
         造一个 conf=0.88（过检测阈值 0.87）、高 100px（= 9.4mm，远小于
         单次要求的 47mm）的框：
@@ -963,7 +963,7 @@ class TestSingleYarnClass:
 # §12 按相机覆盖 camera_repeat_stop_overrides
 # ==================================================================
 class TestPerCameraRepeatOverride:
-    """逐键覆盖全局规则。⚠️ 只对白名单里的相机有意义。"""
+    """逐键覆盖全局规则。只对白名单里的相机有意义。"""
 
     CLS = "包边不良"
 
@@ -1023,7 +1023,7 @@ class TestPerCameraRepeatOverride:
         assert stops == ["camera1"]
 
     def test_override_for_unlisted_camera_is_dead_config(self, monkeypatch):
-        """⚠️ 钉住 config.yaml 注释里那句警告。
+        """钉住 config.yaml 注释里那句警告。
 
         给白名单外的相机配覆盖，规则能正确解析出来，但**完全不起作用**
         —— 因为计数之前就被短路了。这条测试防止有人照着旧注释
@@ -1057,7 +1057,7 @@ class TestPerCameraRepeatOverride:
         assert cfg.get("camera_repeat_stop_overrides", {}) == {}
 
     def test_missing_override_key_behaves_like_empty(self, monkeypatch):
-        """⚠️ 钉住"这个键可以省略"：键不存在时，行为必须和 {} 完全一致。
+        """钉住"这个键可以省略"：键不存在时，行为必须和 {} 完全一致。
 
         实测过：删掉这个键后 CAMERA_REPEAT_STOP_OVERRIDES 取默认 {}，
         camera1/camera8 照常停机、白名单外相机照常不参与。
