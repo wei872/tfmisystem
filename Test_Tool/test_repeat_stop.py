@@ -957,3 +957,113 @@ class TestSingleYarnClass:
                 for d in svc.repeat_tracker.snapshot()}
         assert snap == {("camera1", "包边不良"): 2,
                         ("camera1", self.CLS): 2}, snap
+
+
+# ==================================================================
+# §12 按相机覆盖 camera_repeat_stop_overrides
+# ==================================================================
+class TestPerCameraRepeatOverride:
+    """逐键覆盖全局规则。⚠️ 只对白名单里的相机有意义。"""
+
+    CLS = "包边不良"
+
+    @staticmethod
+    def _base_rules():
+        return {"enabled": True,
+                "stop_allowed_cameras": ["camera1", "camera8"],
+                "rules": {"包边不良": {"enabled": True, "count": 3,
+                                       "window_sec": 3.0,
+                                       "min_confidence": 0.5}}}
+
+    def _svc(self, monkeypatch, ovr):
+        monkeypatch.setattr(st, "REPEAT_STOP_RULES", self._base_rules())
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", ovr)
+        svc = StopMachineService(machine_stop_path="/tmp/_rs_ovr",
+                                 launch_tag="t", analysis_mode="none")
+        stops = []
+        monkeypatch.setattr(svc, "_handle_stop",
+                            lambda *a, **kw: (stops.append(a[2]), "")[1])
+        return svc, stops
+
+    def test_override_applies_to_one_camera_only(self, monkeypatch):
+        svc, stops = self._svc(monkeypatch, {
+            "camera1": {"rules": {self.CLS: {"count": 2}}}})
+        img = np.zeros((64, 64, 3), np.uint8)
+        box = _box()
+        svc.check_repeat_stops(img, "camera1", "f0.png", {self.CLS: box})
+        assert stops == []
+        svc.check_repeat_stops(img, "camera1", "f1.png", {self.CLS: box})
+        assert stops == ["camera1"], "camera1 应 2 次就停"
+
+    def test_unoverridden_camera_keeps_global(self, monkeypatch):
+        """覆盖一台不能影响另一台。"""
+        svc, stops = self._svc(monkeypatch, {
+            "camera1": {"rules": {self.CLS: {"count": 2}}}})
+        img = np.zeros((64, 64, 3), np.uint8)
+        box = _box()
+        for i in range(2):                       # camera8 全局是 3 次
+            assert svc.check_repeat_stops(img, "camera8", f"f{i}.png",
+                                          {self.CLS: box}) is False
+        assert stops == [], "camera8 不该被 camera1 的覆盖影响"
+        assert svc.check_repeat_stops(img, "camera8", "f2.png",
+                                      {self.CLS: box}) is True
+
+    def test_override_can_disable_a_class_on_one_camera(self, monkeypatch):
+        svc, stops = self._svc(monkeypatch, {
+            "camera8": {"rules": {self.CLS: {"enabled": False}}}})
+        img = np.zeros((64, 64, 3), np.uint8)
+        box = _box()
+        for i in range(5):
+            assert svc.check_repeat_stops(img, "camera8", f"f{i}.png",
+                                          {self.CLS: box}) is False
+        assert stops == []
+        # camera1 不受影响
+        for i in range(3):
+            svc.check_repeat_stops(img, "camera1", f"g{i}.png", {self.CLS: box})
+        assert stops == ["camera1"]
+
+    def test_override_for_unlisted_camera_is_dead_config(self, monkeypatch):
+        """⚠️ 钉住 config.yaml 注释里那句警告。
+
+        给白名单外的相机配覆盖，规则能正确解析出来，但**完全不起作用**
+        —— 因为计数之前就被短路了。这条测试防止有人照着旧注释
+        去给 camera5 配参数，然后疑惑为什么没反应。
+        """
+        svc, stops = self._svc(monkeypatch, {
+            "camera5": {"rules": {self.CLS: {"count": 2}}}})
+        # 规则确实被覆盖了
+        r = st.effective_repeat_rule(self.CLS, "camera5")
+        assert r is not None and r["count"] == 2
+        # 但一点用都没有
+        img = np.zeros((64, 64, 3), np.uint8)
+        box = _box()
+        for i in range(4):
+            assert svc.check_repeat_stops(img, "camera5", f"f{i}.png",
+                                          {self.CLS: box}) is False
+        assert stops == []
+        assert svc.repeat_tracker.get_stats()["occurrences"] == 0, \
+            "白名单外的相机连计数都不该做"
+
+    def test_shipped_config_override_section_is_empty(self):
+        import yaml
+        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        assert cfg["camera_repeat_stop_overrides"] == {}
+
+    def test_config_comment_does_not_suggest_a_dead_example(self):
+        """注释里的例子必须用白名单里的相机，否则照着配就是死配置。"""
+        import yaml
+        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
+            text = f.read()
+        seg = text[text.index("camera_repeat_stop_overrides:"):]
+        seg = text[text.rindex("# 【三】停机 · 重复触发 · 按相机覆盖"):
+                   text.index("camera_repeat_stop_overrides:")]
+        allowed = set(yaml.safe_load(text)["repeat_stop_rules"]
+                      ["stop_allowed_cameras"])
+        # 注释里出现的 cameraN 必须都在白名单里
+        import re
+        mentioned = set(re.findall(r"camera\d", seg))
+        bad = mentioned - allowed
+        assert not bad, (
+            f"注释里举了白名单外的相机 {sorted(bad)} 作为覆盖示例，"
+            f"照着配是死配置。白名单={sorted(allowed)}")

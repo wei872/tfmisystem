@@ -1150,13 +1150,32 @@ repeat_stop_rules:
       # min_confidence 故意不写，见上面说明
 
 # 【三】停机 · 重复触发 · 按相机覆盖  [热更新]
+# ------------------------------------------------------------------
+# 作用：让**某一台相机**用和上面全局不同的参数。逐键覆盖，
+#       没写的键回落全局值。当前留空 = 参与的相机都用同一套参数。
+#
 # 结构：camera_repeat_stop_overrides.<相机>.rules.<类别>
-# 逐键覆盖全局，没写的键回落全局值。当前留空 —— 参与的相机用同一套参数。
-# 例：只想让 camera5 更敏感，就写
-#   camera5:
-#     rules:
-#       包边不良:
-#         count: 2
+#
+# ⚠️⚠️ 只有**在 stop_allowed_cameras 白名单里的相机**，覆盖才有意义。
+#    白名单外的相机在计数之前就被短路了（见上面说明），给它配覆盖是
+#    **死配置** —— 实测给白名单外的相机配 count=2，规则能正确解析出来，
+#    但连喂 4 帧 occurrences 仍是 0、不停机（判定在计数之前就短路了）。
+#    （这条已由 test_override_for_unlisted_camera_is_dead_config 钉住）
+#
+# 例：想让 camera1 比 camera8 更敏感（2 次就停），写
+#   camera_repeat_stop_overrides:
+#     camera1:
+#       rules:
+#         包边不良:
+#           count: 2
+#   -> 实测 camera1 喂 2 帧就停，camera8 仍按全局 3 次。
+#
+# 例：想让某台在白名单里的相机**完全不参与**这个类，写
+#   camera_repeat_stop_overrides:
+#     camera8:
+#       rules:
+#         单根包不进:
+#           enabled: false
 camera_repeat_stop_overrides: {}
 
 # ------------------------------------------------------------------
