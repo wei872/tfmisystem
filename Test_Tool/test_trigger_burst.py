@@ -296,9 +296,28 @@ class TestStaggerStepClamp:
     这恰好是错峰要防的那件事，而且没有任何告警。
     """
 
-    MAX_DELAY = 20000
     MAX_INDEX = 7
-    MAX_STEP = MAX_DELAY // MAX_INDEX          # 2857
+
+    @classmethod
+    def _read_const(cls):
+        """从源码里读 _MAX_TRIGGER_DELAY_US。
+
+        ⚠️ 不要硬编码这个数。它由"单帧传输时间"反推，将来分辨率或网口速率变了
+        就会改；硬编码会让测试在上限调整后**继续通过**，等于失效。
+        """
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Camera_Tool", "CameraOperation.py"), encoding="utf-8").read()
+        c0 = src.index("_MAX_TRIGGER_DELAY_US = ")
+        return int(src[c0 + len("_MAX_TRIGGER_DELAY_US = "):].split("\n")[0])
+
+    @property
+    def MAX_DELAY(self):
+        return self._read_const()
+
+    @property
+    def MAX_STEP(self):
+        return self._read_const() // self.MAX_INDEX
 
     def _delays(self, step):
         """返回 camera1..camera8 的 trigger_delay_us（不碰相机，只算）。"""
@@ -329,8 +348,13 @@ class TestStaggerStepClamp:
             assert max(d) <= self.MAX_DELAY, f"step={step} 超上限: {d}"
 
     def test_oversized_step_is_reduced_not_collapsed(self):
-        """⚠️ 核心回归：超配时**降步长**，绝不能让任何两台的间距变成 0。"""
-        for step in (3000, 4000, 10000, 999999):
+        """⚠️ 核心回归：超配时**降步长**，绝不能让任何两台的间距变成 0。
+
+        输入从 MAX_STEP 推导，不写死 —— 否则上限一改，这些数就落到合法区间里，
+        测试会**空转通过**。
+        """
+        for step in (self.MAX_STEP + 1, self.MAX_STEP * 2,
+                     self.MAX_DELAY, 999999):
             d = self._delays(step)
             gaps = [d[i + 1] - d[i] for i in range(self.MAX_INDEX)]
             assert 0 not in gaps, f"step={step} 出现间距 0（错峰静默失效）: {d}"
@@ -340,7 +364,7 @@ class TestStaggerStepClamp:
 
     def test_camera678_are_never_simultaneous(self):
         """专门盯住修复前出事的那三台。"""
-        for step in (4000, 999999):
+        for step in (self.MAX_STEP + 1, 999999):
             d = self._delays(step)
             top3 = d[5:8]                       # camera6/7/8
             assert len(set(top3)) == 3, \
@@ -392,3 +416,131 @@ class TestStaggerStepClamp:
         assert isinstance(step, int), type(step)
         assert 0 < step <= self.MAX_STEP, \
             f"trigger_stagger_us={step} 超出步长上限 {self.MAX_STEP}"
+
+
+# ------------------------------------- §7 用户给的两条硬约束：不错峰不算，漏检不算
+class TestNoSimultaneousBurstWithoutDroppingFrames:
+    """把需求本身钉成测试。两条必须**同时**成立：
+
+      A. 8 台不能同时到达（跨度 > 单帧在网线上的传输时间）
+      B. 不接受漏检（不能靠降并发/丢帧去换 A）
+
+    只满足 A 不满足 B 的做法（降 max_inflight_frames）在这里会失败。
+    """
+
+    # 现场分辨率。帧高不在 config.yaml 里（由相机上报），这里用现场机型值。
+    WIDTH, HEIGHT = 2440, 2048
+    GBPS = 1e9                      # 1 GbE
+
+    @property
+    def frame_bytes(self):
+        return self.WIDTH * self.HEIGHT          # Bayer 8bit，1 字节/像素
+
+    @property
+    def tx_ms(self):
+        """单帧在 1GbE 上的传输时间。"""
+        return self.frame_bytes * 8 / self.GBPS * 1000.0
+
+    @property
+    def cfg(self):
+        import yaml
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "config.yaml"), encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    # 实测：2440x2048 Bayer->BGR（cv2.cvtColor）= 2.62 ms（开发机 CPU）。
+    # 现场机器可能更慢，所以要求步长 >= 2 倍。
+    MEASURED_CVT_MS = 2.62
+    REQUIRED_MARGIN = 2.0
+
+    def test_step_exceeds_bgr_conversion_time(self):
+        """A 的核心判据：**步长** > 单帧 Bayer->BGR 耗时。
+
+        为什么看步长而不是总跨度：各台的到达时刻正好相差一个步长。
+          · 8 台各走独立网卡 -> 到达间隔 = 步长
+          · 8 台共用一张网卡 -> 链路把它们串起来，间隔 ≈ 40 ms（单帧传输时间），
+            比步长还大
+        两种拓扑下间隔都 >= 步长。所以只要步长 > 转换耗时，8 个转换就不会重叠。
+
+        ⚠️ 注意这不是"跨度 > 传输时间"。那个判据是错的：它把"链路占用时长"
+        和"到达时刻间隔"混为一谈了。
+        """
+        step_us = self.cfg["cameras"]["acquisition"]["trigger_stagger_us"]
+        need_us = self.MEASURED_CVT_MS * self.REQUIRED_MARGIN * 1000.0
+        assert step_us >= need_us, (
+            f"trigger_stagger_us={step_us}us < 转换耗时 "
+            f"{self.MEASURED_CVT_MS}ms × {self.REQUIRED_MARGIN} = {need_us:.0f}us，"
+            f"8 个 Bayer->BGR 仍会重叠")
+
+    def test_step_leaves_margin_over_measured_conversion(self):
+        """把实测值本身也钉住，免得将来改了分辨率却不知道要重测。"""
+        import cv2
+        import numpy as np
+        bayer = np.zeros((self.HEIGHT, self.WIDTH), np.uint8)
+        for _ in range(3):
+            cv2.cvtColor(bayer, cv2.COLOR_BayerGB2BGR)
+        n = 5
+        t = time.perf_counter()
+        for _ in range(n):
+            cv2.cvtColor(bayer, cv2.COLOR_BayerGB2BGR)
+        actual_ms = (time.perf_counter() - t) / n * 1000.0
+        step_ms = self.cfg["cameras"]["acquisition"]["trigger_stagger_us"] / 1000.0
+        assert step_ms > actual_ms, (
+            f"本机实测转换 {actual_ms:.2f} ms 已 >= 步长 {step_ms:.2f} ms，"
+            f"错峰失效；请上调 trigger_stagger_us 或更新 MEASURED_CVT_MS")
+
+    def test_span_still_fits_inside_one_trigger_period(self):
+        """跨度 + 传输时间 必须 < 触发周期，否则与下一次触发的帧相撞。
+
+        触发是位置触发（每 80.224 mm 一次）。按 10 m/min 算。
+        """
+        step = self.cfg["cameras"]["acquisition"]["trigger_stagger_us"]
+        n = len(self.cfg["cameras"]["sn_map"])
+        span_ms = step * (n - 1) / 1000.0
+        period_ms = 80.224 / (10 * 1000 / 60.0) * 1000.0     # 481.3 ms
+        assert span_ms + self.tx_ms < period_ms, (
+            f"跨度 {span_ms:.1f} ms + 传输 {self.tx_ms:.1f} ms "
+            f">= 触发周期 {period_ms:.1f} ms")
+
+    def test_max_inflight_frames_is_not_reduced(self):
+        """B：并发闸不能被降下来换峰值。
+
+        blocking_submit 默认 False，worker_pool.submit() 满了是**丢帧**
+        （记 semaphore_dropped），也就是漏检。低于 8 就一定会丢。
+        """
+        n = len(self.cfg["cameras"]["sn_map"])
+        v = self.cfg["yolo"]["max_inflight_frames"]
+        assert v >= n, (f"max_inflight_frames={v} < 相机数 {n}，"
+                        f"一次触发必然丢帧漏检")
+
+    def test_stagger_does_not_drop_any_frame(self):
+        """B：错峰这条路径本身不产生任何丢帧。
+
+        只验证相机侧：8 台都成功启动、都拿到各自的延时、没有一台被跳过。
+        """
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool.CameraOperation import CameraOperation
+        step = self.cfg["cameras"]["acquisition"]["trigger_stagger_us"]
+        sn = self.cfg["cameras"]["sn_map"]
+        B.reset()
+        for s in sn:
+            B.add_camera(s, "MER2-500-14GM", "192.168.1.10", 32, 24,
+                         fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        mgr = gx.DeviceManager()
+        delays, cams = [], []
+        for serial, name in sn.items():
+            c = CameraOperation(
+                mgr, {"index": 1, "sn": serial, "model_name": "MER2-500-14GM",
+                      "ip": "192.168.1.10"},
+                camera_name=name, trigger_stagger_us=step,
+                trigger_source=self.cfg["cameras"]["acquisition"]["trigger_source"])
+            c._set_float = lambda n_, v_, readback=True: 0
+            assert c.Open_device() == 0, f"{name} 启动失败"
+            delays.append(c.trigger_delay_us)
+            cams.append(c)
+        assert len(set(delays)) == len(delays), f"有延时重复，说明两台会同时触发: {sorted(delays)}"
+        assert min(delays) == 0 and max(delays) == step * 7
+        # 除基准台外都必须真的下发成功
+        assert all(c.trigger_delay_applied for c in cams if c.trigger_delay_us > 0)
