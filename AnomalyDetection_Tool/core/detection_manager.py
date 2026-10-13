@@ -525,6 +525,13 @@ class YOLODetectionManager:
         ba_list = []
         frame_stopped = False
         log_lines = []  # 收集每帧的分析日志，统一输出
+        # 【三】重复停机：按类收集本帧的代表框（置信度最高的那个）。
+        # 必须**按类去重**——重复停机是"按帧计数"的，同一帧同类出现多个框
+        # 只算 1 次，否则单帧误检几个就会立刻误停。
+        # 注意这里收的是 result.boxes 全量（已过检测阈值过滤），
+        # 不受 frame_stopped 影响：本帧停没停机，历史都得记全，
+        # 否则窗口会缺帧、后面很难攒够次数。
+        best_box_by_class = {}
 
         for i, box in enumerate(result.boxes):
             if frame_stopped:
@@ -564,6 +571,10 @@ class YOLODetectionManager:
             if ar.triggered:
                 frame_stopped = True
 
+            prev = best_box_by_class.get(box.class_name)
+            if prev is None or box.confidence > prev.confidence:
+                best_box_by_class[box.class_name] = box
+
             entry = BoxAnalysisEntry(
                 box=box, index=i,
                 is_stop=ar.triggered,
@@ -571,6 +582,23 @@ class YOLODetectionManager:
                 area_result=ar,
             )
             ba_list.append(entry)
+
+        # ---- 【三】重复触发停机判定（按相机 + 按类，时间窗口内反复出现）----
+        # 放在框循环之后、计时日志之前：它是**独立**的第三条停机路径，
+        # 与上面两条单次规则并存，任一条满足就停机。
+        # 整体兜死：这条路径出任何问题都不能影响检测主流程。
+        repeat_stopped = False
+        try:
+            repeat_stopped = self._stop_service.check_repeat_stops(
+                image, camera_name, filename, best_box_by_class,
+                camera_sn=camera_sn,
+                capture_timestamp=capture_timestamp,
+                frame_already_stopped=frame_stopped,
+                log_lines=log_lines)
+        except Exception as e:
+            error(f"[重复停机] {camera_name} | {filename} | 判定异常，已跳过: {e}")
+        if repeat_stopped:
+            frame_stopped = True
 
         t_analysis_end = time.time()
         perf_analysis_end = time.perf_counter()

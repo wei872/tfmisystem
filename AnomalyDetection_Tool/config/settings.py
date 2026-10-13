@@ -907,6 +907,129 @@ def effective_stop_rule(class_name, camera_name=None, stop_rules=None) -> Option
     return base
 
 
+# ================================================================
+#  【三】停机 · 重复触发（同一台相机上同类疵点在时间窗口内反复出现）
+# ================================================================
+# 与单次停机规则**并存**：两条任一条满足就停机。
+# 需求原话：「在一台相机上，连续几秒检测到相同类型的疵点就停机」。
+#
+# ⚠️ 这里的 min_confidence 是**计数门槛**，与单次停机规则的 min_confidence
+#    是两回事，不要混。单次规则问"这一个疵点够不够严重"，重复规则问
+#    "这类疵点是不是一直在出现"。若复用单次门槛，那些每次都差一点的
+#    疵点永远计不进来，本功能等于没开。
+
+REPEAT_STOP_RULES = _LiveDict("repeat_stop_rules", {})
+CAMERA_REPEAT_STOP_OVERRIDES = _LiveDict("camera_repeat_stop_overrides", {})
+
+_REPEAT_RULE_BOOL_KEYS = ("enabled",)
+_REPEAT_RULE_NUMERIC_KEYS = ("min_confidence", "window_sec")
+# count 必须是整数：3.7 次没有意义，而且 int(3.7)=3 会静默吞掉笔误。
+_REPEAT_RULE_INT_KEYS = ("count",)
+
+
+def _sanitise_repeat_rule_block(block, where: str) -> Dict:
+    """剔除重复停机覆盖块里的非法值，逐项告警。
+
+    非法项**丢弃**（回落全局值），而不是让整块失效——否则一个笔误会让
+    这台相机所有重复停机配置静默消失，更难查。
+    """
+    out = {}
+    for k, v in (block or {}).items():
+        if k in _REPEAT_RULE_BOOL_KEYS:
+            out[k] = bool(v)
+        elif k in _REPEAT_RULE_INT_KEYS:
+            f = _safe_float(v)
+            if f is None:
+                warning(f"[配置] {where}.{k} = {v!r} 不是数字，已忽略该项")
+            else:
+                out[k] = int(f)
+        elif k in _REPEAT_RULE_NUMERIC_KEYS:
+            f = _safe_float(v)
+            if f is None:
+                warning(f"[配置] {where}.{k} = {v!r} 不是数字，已忽略该项")
+            else:
+                out[k] = f
+        else:
+            warning(f"[配置] {where}.{k} 不是可覆盖的重复停机字段，已忽略")
+    return out
+
+
+def get_camera_repeat_rule_override(camera_name, class_name) -> Optional[Dict]:
+    """🔥 热更新：取某台相机对某个类的重复停机覆盖块；没有则 None。
+
+    与 get_camera_stop_rule_override 同样的三种"当作没有"情况：
+    没配这台相机 / rules 不是 dict / 该类那一项不是 dict。
+    （YAML 少写一个冒号就会让整块变成字符串且不报错，必须防。）
+    """
+    if not camera_name or not class_name:
+        return None
+    try:
+        cam = CAMERA_REPEAT_STOP_OVERRIDES.get(str(camera_name))
+    except Exception:
+        return None
+    if not isinstance(cam, dict):
+        return None
+    rules = cam.get("rules")
+    if not isinstance(rules, dict):
+        return None
+    block = rules.get(str(class_name))
+    return block if isinstance(block, dict) else None
+
+
+def effective_repeat_rule(class_name, camera_name=None, repeat_rules=None):
+    """算出**某台相机上某个类实际生效**的重复停机规则。
+
+    合并顺序：全局 ``repeat_stop_rules.rules.<类>`` → 按相机覆盖（逐键覆盖）。
+    返回**副本**，调用方改它不会污染配置本体。
+
+    返回 None 表示"这台相机上这个类不做重复判定"，可能是：
+      * 总开关 ``repeat_stop_rules.enabled`` 为 false（最高优先）；
+      * 该类既没有全局规则也没有按相机规则；
+      * 全局或按相机把 ``enabled`` 置为 false；
+      * count < 2 或 window_sec <= 0（退化成单次判定，不归这里管）。
+
+    :param camera_name: 相机名。传 None 时只看全局规则。
+    :param repeat_rules: 规则 dict，默认取 REPEAT_STOP_RULES。测试时注入。
+    """
+    rules = REPEAT_STOP_RULES if repeat_rules is None else repeat_rules
+    try:
+        if not rules.get("enabled", False):
+            return None
+        global_rules = rules.get("rules", {}) or {}
+        base_rule = global_rules.get(class_name)
+    except Exception:
+        warning(f"[重复停机] 读取 {class_name} 的全局规则失败，按不判定处理")
+        return None
+
+    if isinstance(base_rule, dict):
+        base = dict(base_rule)
+    elif base_rule is None:
+        base = {}
+    else:
+        warning(f"[重复停机] {class_name} 的全局规则不是字典"
+                f"（{type(base_rule).__name__}），已忽略")
+        base = {}
+
+    ovr = get_camera_repeat_rule_override(camera_name, class_name)
+    if ovr:
+        base.update(_sanitise_repeat_rule_block(
+            ovr, f"camera_repeat_stop_overrides.{camera_name}.rules.{class_name}"))
+
+    if not base or not base.get("enabled", True):
+        return None
+
+    # 退化保护：count<2 就是"出现即停"，那是单次停机规则的职责。
+    # 在这里放行会导致同一个疵点被两条路径各停一次，日志也会打架。
+    try:
+        if int(base.get("count", 0)) < 2 or float(base.get("window_sec", 0)) <= 0:
+            return None
+    except (TypeError, ValueError):
+        warning(f"[重复停机] {class_name} 的 count/window_sec 不是数字，已忽略")
+        return None
+    return base
+
+
+
 def stop_rule_min_confidence(rule):
     """取一条停机规则的置信度门槛，**含隐式默认值**。
 

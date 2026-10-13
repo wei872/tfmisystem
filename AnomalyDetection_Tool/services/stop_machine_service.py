@@ -17,15 +17,17 @@ from General_Tool.EnhancedLogger import info, error
 from AnomalyDetection_Tool.config.settings import (
     MACHINE_STOP_RULES, STOP_ANALYSIS_MODE, PIXEL_TO_MM,
     MACHINE_STOP_PATH, validate_analysis_mode, effective_stop_rule,
+    effective_repeat_rule,
 )
 from AnomalyDetection_Tool.models.data_types import (
-    DetectionBox, AreaAnalysisResult, BoxAnalysisEntry,
+    DetectionBox, AreaAnalysisResult,
 )
 from AnomalyDetection_Tool.output.machine_stop_saver import (
     MachineStopSaver,
 )
 from AnomalyDetection_Tool.services.comm_service import comm_service
 from AnomalyDetection_Tool.services.relay_service import relay_service
+from AnomalyDetection_Tool.services.repeat_stop_tracker import RepeatStopTracker
 
 
 class StopMachineService:
@@ -75,7 +77,12 @@ class StopMachineService:
             "machine_stop_triggered": 0,
             "dinomaly_infer_count": 0,
             "dinomaly_infer_time_total": 0.0,
+            "repeat_stop_triggered": 0,
         }
+
+        # 【三】重复停机：同一台相机上同类疵点在时间窗口内反复出现。
+        # 规则每次现取（effective_repeat_rule），所以 config.yaml 热更新立刻生效。
+        self._repeat_tracker = RepeatStopTracker(effective_repeat_rule)
 
         # 延迟初始化参数
         self._pth_checkpoint = pth_checkpoint
@@ -482,6 +489,91 @@ class StopMachineService:
                     self._saver_path, launch_tag=self._saver_launch_tag)
                 info(f"[停机保存] 已创建保存器: {self._saver_path}")
         return self.machine_stop_saver
+
+    # ================================================================
+    #  【三】重复触发停机（按相机 + 按类，时间窗口内反复出现）
+    # ================================================================
+    def check_repeat_stops(
+            self,
+            image: np.ndarray,
+            camera_name: str,
+            filename: str,
+            boxes_by_class: Dict[str, DetectionBox],
+            camera_sn: str = "",
+            capture_timestamp: str = "",
+            frame_already_stopped: bool = False,
+            log_lines: Optional[List[str]] = None) -> bool:
+        """记录本帧检出，判断有没有哪个类在窗口内攒够了次数。
+
+        与 ``analyze_defect_area`` / ``analyze_defect_dimension`` **并存**：
+        那两条是"这一个疵点够不够严重"，这条是"这类疵点是不是一直在出现"。
+        任一条满足就停机。
+
+        :param boxes_by_class: ``{类名: 本帧该类的代表框}``。**必须已经按帧
+                               去重**（每类一个框）—— 计数是"按帧"的，
+                               同一帧同类出现 5 个框也只算 1 次。
+                               代表框用于停机落盘/继电器，取置信度最高的那个。
+        :param frame_already_stopped: 本帧是否已由单次规则停过机。
+                                      为 True 时**只计数不再停**（避免同一帧
+                                      连发两次停机信号），但历史照样记，
+                                      否则窗口会缺一帧、后面很难攒够。
+        :return: 本帧是否由重复规则触发了停机。
+        """
+        if not boxes_by_class:
+            return False
+
+        classes = list(boxes_by_class.keys())
+        confs = {c: b.confidence for c, b in boxes_by_class.items()}
+
+        hits = self._repeat_tracker.record_frame(camera_name, classes, confs)
+        if not hits:
+            return False
+
+        stopped = False
+        for h in hits:
+            cls = h["class_name"]
+            box = boxes_by_class.get(cls)
+            if box is None:
+                continue
+            if log_lines is not None:
+                log_lines.append(
+                    f"  [重复触发] {cls} 在 {h['window_sec']:.1f}s 内累计 "
+                    f"{h['count']} 次（跨度 {h['span_sec']:.2f}s）")
+
+            if frame_already_stopped or stopped:
+                # 本帧已经停过了：计数照记（上面已经记完），但不再发第二次
+                # 停机动作 —— 继电器和落盘重复触发只会制造混乱。
+                if log_lines is not None:
+                    log_lines.append(f"  [跳过动作] {cls} 本帧已停机")
+                continue
+
+            rule = effective_repeat_rule(cls, camera_name) or {}
+            result = AreaAnalysisResult(
+                triggered=True,
+                analyzed=False,
+                rule_used=rule,
+                debug_info={
+                    "stop_reason": "repeat",
+                    "repeat_count": h["count"],
+                    "repeat_window_sec": h["window_sec"],
+                    "repeat_span_sec": h["span_sec"],
+                },
+            )
+            with self._lock:
+                self._stats["repeat_stop_triggered"] += 1
+            self._handle_stop(
+                image, box, camera_name, filename, result, rule,
+                camera_sn=camera_sn,
+                capture_timestamp=capture_timestamp,
+                box_index=0)
+            stopped = True
+
+        return stopped
+
+    @property
+    def repeat_tracker(self) -> RepeatStopTracker:
+        """暴露给上层做统计/排查（snapshot 里能看到各窗口攒了几次）。"""
+        return self._repeat_tracker
 
     @staticmethod
     def get_stop_rule(class_name: str,
