@@ -17,7 +17,7 @@ from General_Tool.EnhancedLogger import info, error
 from AnomalyDetection_Tool.config.settings import (
     MACHINE_STOP_RULES, STOP_ANALYSIS_MODE, PIXEL_TO_MM,
     MACHINE_STOP_PATH, validate_analysis_mode, effective_stop_rule,
-    effective_repeat_rule,
+    effective_repeat_rule, repeat_stop_allowed,
 )
 from AnomalyDetection_Tool.models.data_types import (
     DetectionBox, AreaAnalysisResult,
@@ -78,6 +78,9 @@ class StopMachineService:
             "dinomaly_infer_count": 0,
             "dinomaly_infer_time_total": 0.0,
             "repeat_stop_triggered": 0,
+            # 攒够了但这台相机没有停机权限（只计数、只打日志）。
+            # 这个数涨得快，说明该考虑给这台相机开权限了。
+            "repeat_stop_no_authority": 0,
         }
 
         # 【三】重复停机：同一台相机上同类疵点在时间窗口内反复出现。
@@ -529,6 +532,12 @@ class StopMachineService:
         if not hits:
             return False
 
+        # 8 台都参与计数，但只有被授权的相机（现场是 camera1/camera8）
+        # 允许**真的**停机。没授权的照样打日志 —— 中间相机的重复情况
+        # 要看得见，否则无从判断该不该给它开权限。
+        # ⚠️ 这只管【三】重复触发，【二】单次停机在 8 台上的行为没动。
+        allowed = repeat_stop_allowed(camera_name)
+
         stopped = False
         for h in hits:
             cls = h["class_name"]
@@ -539,6 +548,19 @@ class StopMachineService:
                 log_lines.append(
                     f"  [重复触发] {cls} 在 {h['window_sec']:.1f}s 内累计 "
                     f"{h['count']} 次（跨度 {h['span_sec']:.2f}s）")
+
+            if not allowed:
+                with self._lock:
+                    self._stats["repeat_stop_no_authority"] += 1
+                info(f"[重复停机] {camera_name} 已达阈值（{cls} "
+                     f"{h['count']} 次 / {h['window_sec']:.1f}s），"
+                     f"但该相机不在 stop_allowed_cameras 里，**不停机**。"
+                     f"若这类疵点确实该停，请把 {camera_name} 加进白名单。")
+                if log_lines is not None:
+                    log_lines.append(
+                        f"  [无停机权限] {cls} 已攒够 {h['count']} 次，"
+                        f"但 {camera_name} 不在白名单")
+                continue
 
             if frame_already_stopped or stopped:
                 # 本帧已经停过了：计数照记（上面已经记完），但不再发第二次

@@ -373,11 +373,29 @@ class TestSiteScenario:
         import yaml
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        r = cfg["camera_repeat_stop_overrides"]["camera3"]["rules"]["包边不良"]
+        rr = cfg["repeat_stop_rules"]
+        assert rr["enabled"] is True
+        # 规则配在全局 -> 8 台相机都按它计数
+        r = rr["rules"]["包边不良"]
         assert r["count"] == 3
         assert r["window_sec"] == pytest.approx(3.0)
         assert r["enabled"] is True
-        assert cfg["repeat_stop_rules"]["enabled"] is True
+        # 但只有这两台有停机权
+        assert rr["stop_allowed_cameras"] == ["camera1", "camera8"]
+
+    def test_all_eight_cameras_count(self):
+        """8 台都必须能取到规则（计数），否则"8 台都有"就没做到。"""
+        import yaml
+        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        n_cam = len(cfg["cameras"]["sn_map"])
+        assert n_cam == 8
+        for i in range(1, 9):
+            cam = f"camera{i}"
+            r = st.effective_repeat_rule("包边不良", cam,
+                                         cfg["repeat_stop_rules"])
+            assert r is not None, f"{cam} 取不到重复规则"
+            assert r["count"] == 3
 
     def test_counting_gate_is_looser_than_the_single_shot_gate(self):
         """⚠️ 这条是本功能有没有用的关键。
@@ -389,19 +407,10 @@ class TestSiteScenario:
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         single = cfg["machine_stop_rules"]["rules"]["包边不良"]["min_confidence"]
-        repeat = (cfg["camera_repeat_stop_overrides"]["camera3"]
-                  ["rules"]["包边不良"]["min_confidence"])
+        repeat = cfg["repeat_stop_rules"]["rules"]["包边不良"]["min_confidence"]
         assert repeat < single, (
             f"计数门槛 {repeat} 必须 < 单次停机门槛 {single}，"
             f"否则重复规则永远不会先于单次规则触发")
-
-    def test_only_camera3_is_configured(self):
-        """其余 7 台行为必须完全不变。"""
-        import yaml
-        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        assert list(cfg["camera_repeat_stop_overrides"]) == ["camera3"]
-        assert cfg["repeat_stop_rules"]["rules"] == {}, "全局应留空"
 
     def test_realistic_frame_cadence(self):
         """现场节拍：10 m/min 下每台约 2.08 帧/秒 → 每帧间隔约 481 ms。
@@ -620,3 +629,176 @@ class TestRealPipeline:
                             "_rule_provider", boom)
         self._frame(dm, 0, [_box()])            # 不该抛
         assert calls == []
+
+
+# ==================================================================
+# §10 停机授权白名单：8 台都计数，只有 camera1 / camera8 能停机
+# ==================================================================
+class TestStopAuthority:
+    def test_key_absent_means_all_allowed(self):
+        """向后兼容：没配这个键 -> 不限制。"""
+        assert st.repeat_stop_allowed("camera5", {"enabled": True}) is True
+
+    def test_empty_list_means_none_allowed(self):
+        """⚠️ [] 必须是"谁都不许停"，不能被当成"没配"。
+
+        用 rules.get(k) or 默认 会把 [] 当成没配，于是"谁都不许停"
+        被静默变成"全都许停"，方向正好反了。
+        """
+        rules = {"enabled": True, "stop_allowed_cameras": []}
+        for i in range(1, 9):
+            assert st.repeat_stop_allowed(f"camera{i}", rules) is False
+
+    def test_only_listed_cameras_allowed(self):
+        rules = {"enabled": True,
+                 "stop_allowed_cameras": ["camera1", "camera8"]}
+        expect = {1: True, 2: False, 3: False, 4: False,
+                  5: False, 6: False, 7: False, 8: True}
+        for i, want in expect.items():
+            got = st.repeat_stop_allowed(f"camera{i}", rules)
+            assert got is want, f"camera{i}: 期望 {want} 实得 {got}"
+
+    def test_unknown_camera_is_not_allowed(self):
+        rules = {"enabled": True,
+                 "stop_allowed_cameras": ["camera1", "camera8"]}
+        assert st.repeat_stop_allowed("camera99", rules) is False
+        assert st.repeat_stop_allowed("", rules) is False
+        assert st.repeat_stop_allowed(None, rules) is False
+
+    def test_serial_number_is_not_mistaken_for_a_name(self):
+        """相机名退化成了序列号时，不该碰巧匹配上白名单。"""
+        rules = {"enabled": True,
+                 "stop_allowed_cameras": ["camera1", "camera8"]}
+        assert st.repeat_stop_allowed("KBA26070032", rules) is False
+
+    def test_none_value_means_all_allowed(self):
+        """写了键但没给值（YAML 里 `stop_allowed_cameras:` 空着）。"""
+        assert st.repeat_stop_allowed(
+            "camera5", {"enabled": True, "stop_allowed_cameras": None}) is True
+
+    def test_garbage_value_fails_closed(self):
+        """不是列表就**不许停** —— 宁可漏停，不可误停。"""
+        for bad in ("camera1", 3, {"camera1": True}):
+            assert st.repeat_stop_allowed(
+                "camera1",
+                {"enabled": True, "stop_allowed_cameras": bad}) is False, bad
+
+    def test_shipped_config_authorises_exactly_camera1_and_8(self):
+        import yaml
+        with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        rr = cfg["repeat_stop_rules"]
+        got = {i: st.repeat_stop_allowed(f"camera{i}", rr) for i in range(1, 9)}
+        assert got == {1: True, 2: False, 3: False, 4: False,
+                       5: False, 6: False, 7: False, 8: True}, got
+
+
+@pytest.fixture
+def auth_service(monkeypatch):
+    """8 台都配规则，但只有 camera1/camera8 有停机权。"""
+    rules = {"enabled": True,
+             "stop_allowed_cameras": ["camera1", "camera8"],
+             "rules": {"包边不良": {"enabled": True, "count": 3,
+                                    "window_sec": 3.0,
+                                    "min_confidence": 0.5}}}
+    monkeypatch.setattr(st, "REPEAT_STOP_RULES", rules)
+    monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+    svc = StopMachineService(machine_stop_path="/tmp/_rs_auth",
+                             launch_tag="t", analysis_mode="none")
+    calls = []
+    monkeypatch.setattr(
+        svc, "_handle_stop",
+        lambda image, box, cam, fn, result, rule, **kw:
+        (calls.append(cam), "")[1])
+    return svc, calls
+
+
+class TestStopAuthorityIntegration:
+    IMG = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    def _hit(self, svc, cam, n=3):
+        out = None
+        for i in range(n):
+            out = svc.check_repeat_stops(self.IMG, cam, f"f{i}.png",
+                                         {"包边不良": _box()})
+        return out
+
+    def test_camera1_can_stop(self, auth_service):
+        svc, calls = auth_service
+        assert self._hit(svc, "camera1") is True
+        assert calls == ["camera1"]
+
+    def test_camera8_can_stop(self, auth_service):
+        svc, calls = auth_service
+        assert self._hit(svc, "camera8") is True
+        assert calls == ["camera8"]
+
+    def test_middle_cameras_count_but_never_stop(self, auth_service):
+        """⚠️ 核心：中间 6 台照样计数，但**绝不能**停机。"""
+        svc, calls = auth_service
+        for i in (2, 3, 4, 5, 6, 7):
+            cam = f"camera{i}"
+            assert self._hit(svc, cam) is False, f"{cam} 不该返回已停机"
+        assert calls == [], f"中间相机不该停机: {calls}"
+        # 但确实计过数了
+        stats = svc.get_stats()
+        assert stats["repeat_stop_no_authority"] == 6, stats
+        assert stats["repeat_stop_triggered"] == 0
+
+    def test_no_authority_window_still_rearms(self, auth_service):
+        """没权限的相机攒够后窗口也要清空，否则之后每帧都刷一条日志。"""
+        svc, calls = auth_service
+        self._hit(svc, "camera3")
+        snap = svc.repeat_tracker.snapshot("camera3", "包边不良")
+        assert (snap[0]["pending"] if snap else 0) == 0
+        # 再攒 3 次应该再次"到阈值但无权限"，计数应累加到 2
+        self._hit(svc, "camera3")
+        assert svc.get_stats()["repeat_stop_no_authority"] == 2
+
+    def test_whitelist_does_not_touch_single_shot_stops(self, monkeypatch):
+        """⚠️ 白名单**只管【三】**。【二】单次停机在 8 台上的行为必须没变。
+
+        这条是防止有人把授权判断误加到 analyze_defect_area /
+        analyze_defect_dimension 里 —— 那会让中间 6 台突然失去单次停机能力。
+        """
+        import inspect
+        from AnomalyDetection_Tool.services import stop_machine_service as sms
+        for fn in (sms.StopMachineService.analyze_defect_area,
+                   sms.StopMachineService.analyze_defect_dimension):
+            src = inspect.getsource(fn)
+            assert "repeat_stop_allowed" not in src, \
+                f"{fn.__name__} 不该受重复停机白名单影响"
+
+    def test_real_pipeline_camera3_does_not_stop(self, monkeypatch):
+        """走真实 _process_result：camera3 攒够 3 次也不停机。"""
+        rules = {"enabled": True,
+                 "stop_allowed_cameras": ["camera1", "camera8"],
+                 "rules": {"包边不良": {"enabled": True, "count": 3,
+                                        "window_sec": 3.0,
+                                        "min_confidence": 0.5}}}
+        monkeypatch.setattr(st, "REPEAT_STOP_RULES", rules)
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+        dm = YOLODetectionManager({"yolo": {"queue_size": 4,
+                                            "max_inflight_frames": 4,
+                                            "num_workers": 1,
+                                            "post_workers": 1,
+                                            "image_size": 640}},
+                                  "/tmp/_rs_auth2", None,
+                                  machine_stop_path="/tmp/_rs_auth2_stop")
+        dm._stop_service = StopMachineService(
+            machine_stop_path="/tmp/_rs_auth2_stop", launch_tag="t",
+            analysis_mode="none")
+        calls = []
+        monkeypatch.setattr(dm._stop_service, "_handle_stop",
+                            lambda *a, **kw: (calls.append(a[2]), "")[1])
+        monkeypatch.setattr(dm, "_submit_async", lambda fn, *a: None)
+        monkeypatch.setattr(dm, "_perf_tracker", _NoopPerf())
+
+        for cam, want in (("camera3", 0), ("camera5", 0), ("camera1", 1)):
+            calls.clear()
+            for i in range(3):
+                dm._process_result(
+                    _FakeResult([_box()]), self.IMG, cam, "SN",
+                    f"{cam}_{i}.png", f"2026-01-01 00:00:0{i}.000",
+                    {}, time.time())
+            assert len(calls) == want, f"{cam}: 期望停机 {want} 次，实得 {calls}"

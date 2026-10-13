@@ -976,6 +976,45 @@ def get_camera_repeat_rule_override(camera_name, class_name) -> Optional[Dict]:
     return block if isinstance(block, dict) else None
 
 
+def repeat_stop_allowed(camera_name, repeat_rules=None) -> bool:
+    """这台相机**有没有权限**由【三】重复触发真的停机。
+
+    需求：8 台都参与计数（这样中间相机的重复情况在日志里看得见），
+    但只有指定的几台（现场是 camera1 / camera8）允许真的停机。
+
+    读的是 ``repeat_stop_rules.stop_allowed_cameras``：
+
+    * **键不存在** -> 全部允许（向后兼容，老配置不受影响）
+    * **空列表 ``[]``** -> 谁都不许停（只计数、只打日志）
+    * **非空列表**     -> 只有列出的相机许停
+
+    ⚠️ "键不存在"和"空列表"必须区分开。用 ``in`` 判断而不是
+    ``rules.get(k) or 默认``——后者会把 ``[]`` 当成"没配"，
+    于是"谁都不许停"被静默变成"全都许停"，方向正好反了。
+
+    ⚠️ 这个白名单**只管【三】重复触发**，不影响【二】单次停机规则。
+    单次停机在 8 台上的既有行为一个字都没改。
+
+    :param camera_name: 相机名
+    :param repeat_rules: 规则 dict，默认取 REPEAT_STOP_RULES。测试时注入。
+    """
+    rules = REPEAT_STOP_RULES if repeat_rules is None else repeat_rules
+    try:
+        if "stop_allowed_cameras" not in rules:
+            return True                     # 没配 = 不限制
+        allowed = rules.get("stop_allowed_cameras")
+    except Exception:
+        warning("[重复停机] 读取 stop_allowed_cameras 失败，按不允许停机处理")
+        return False                        # 读坏了就**不许停**，宁可漏停不误停
+    if allowed is None:                     # 写了键但没给值
+        return True
+    if not isinstance(allowed, (list, tuple, set)):
+        warning(f"[重复停机] stop_allowed_cameras = {allowed!r} 不是列表，"
+                f"按不允许停机处理")
+        return False
+    return str(camera_name) in {str(c) for c in allowed}
+
+
 def effective_repeat_rule(class_name, camera_name=None, repeat_rules=None):
     """算出**某台相机上某个类实际生效**的重复停机规则。
 
