@@ -285,3 +285,110 @@ class TestTriggerDelayWiring:
         assert "未生效" in txt, txt
         # 不能出现"干净的成功串"（没有未生效标记的那种）
         assert "BufferCount=10, TriggerDelay=3500us)" not in txt, txt
+
+
+# ------------------------------------------- §6 截断必须截**步长**，保持间距均匀
+class TestStaggerStepClamp:
+    """回归：截断单台延时会把顶部几台压成同一个值 → 间距 0 → 错峰**静默**失效。
+
+    实测（修复前）trigger_stagger_us=4000 时：
+        camera6/7/8 = 20000/20000/20000  →  间距 0，这三台又变回同时触发。
+    这恰好是错峰要防的那件事，而且没有任何告警。
+    """
+
+    MAX_DELAY = 20000
+    MAX_INDEX = 7
+    MAX_STEP = MAX_DELAY // MAX_INDEX          # 2857
+
+    def _delays(self, step):
+        """返回 camera1..camera8 的 trigger_delay_us（不碰相机，只算）。"""
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool.CameraOperation import CameraOperation
+        B.reset()
+        out = []
+        for i in range(1, 9):
+            B.add_camera("SN%d" % i, "MER2", "192.168.1.%d" % (10 + i),
+                         32, 24, fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        mgr = gx.DeviceManager()
+        for i in range(1, 9):
+            c = CameraOperation(
+                mgr, {"index": 1, "sn": "SN%d" % i, "model_name": "MER2",
+                      "ip": "192.168.1.%d" % (10 + i)},
+                camera_name="camera%d" % i, trigger_stagger_us=step)
+            out.append(c.trigger_delay_us)
+        return out
+
+    def test_spacing_is_uniform_at_every_step(self):
+        for step in (200, 500, 2000, self.MAX_STEP):
+            d = self._delays(step)
+            gaps = [d[i + 1] - d[i] for i in range(self.MAX_INDEX)]
+            assert len(set(gaps)) == 1, f"step={step} 间距不均匀: {gaps}"
+            assert gaps[0] == step, f"step={step} 间距={gaps[0]}"
+            assert max(d) <= self.MAX_DELAY, f"step={step} 超上限: {d}"
+
+    def test_oversized_step_is_reduced_not_collapsed(self):
+        """⚠️ 核心回归：超配时**降步长**，绝不能让任何两台的间距变成 0。"""
+        for step in (3000, 4000, 10000, 999999):
+            d = self._delays(step)
+            gaps = [d[i + 1] - d[i] for i in range(self.MAX_INDEX)]
+            assert 0 not in gaps, f"step={step} 出现间距 0（错峰静默失效）: {d}"
+            assert len(set(gaps)) == 1, f"step={step} 间距不均匀: {gaps}"
+            assert gaps[0] == self.MAX_STEP, f"step={step} 未降到上限: {gaps}"
+            assert max(d) <= self.MAX_DELAY
+
+    def test_camera678_are_never_simultaneous(self):
+        """专门盯住修复前出事的那三台。"""
+        for step in (4000, 999999):
+            d = self._delays(step)
+            top3 = d[5:8]                       # camera6/7/8
+            assert len(set(top3)) == 3, \
+                f"step={step} camera6/7/8 延时相同={top3}，又同时触发了"
+
+    def test_oversized_step_warns(self, monkeypatch):
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool import CameraOperation as co
+        B.reset()
+        B.add_camera("SNW", "MER2", "192.168.1.30", 32, 24,
+                     fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        logs = []
+        monkeypatch.setattr(co, "warning", lambda m: logs.append(m))
+        co.CameraOperation(
+            gx.DeviceManager(),
+            {"index": 1, "sn": "SNW", "model_name": "MER2", "ip": "192.168.1.30"},
+            camera_name="camera8", trigger_stagger_us=999999)
+        assert any("过大" in m for m in logs), logs
+
+    def test_out_of_range_index_falls_back_to_zero(self, monkeypatch):
+        """索引必须落在 0..7。越界一律按 0（这台不错峰），
+        绝不能算出一个让相机永远不出图的延时。"""
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool import CameraOperation as co
+        B.reset()
+        B.add_camera("SNX", "MER2", "192.168.1.31", 32, 24,
+                     fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        logs = []
+        monkeypatch.setattr(co, "warning", lambda m: logs.append(m))
+        monkeypatch.setattr(co, "_camera_index_from_name", lambda n: 99)
+        c = co.CameraOperation(
+            gx.DeviceManager(),
+            {"index": 1, "sn": "SNX", "model_name": "MER2", "ip": "192.168.1.31"},
+            camera_name="camera9", trigger_stagger_us=2857)
+        assert c.trigger_delay_us == 0, c.trigger_delay_us
+        assert any("超出" in m for m in logs), logs
+
+    def test_shipped_config_value_is_within_ceiling(self):
+        """config.yaml 里出厂值必须 ≤ 步长上限，否则一开机就告警。"""
+        import yaml
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "config.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        step = cfg["cameras"]["acquisition"]["trigger_stagger_us"]
+        assert isinstance(step, int), type(step)
+        assert 0 < step <= self.MAX_STEP, \
+            f"trigger_stagger_us={step} 超出步长上限 {self.MAX_STEP}"

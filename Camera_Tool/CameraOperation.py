@@ -107,6 +107,10 @@ except Exception:                      # 探针不可用时退化成空操作
 
 # TriggerDelay 硬上限（微秒）。见 __init__ 里的说明：算错的后果是相机永远不出图。
 _MAX_TRIGGER_DELAY_US = 20000
+# 最大相机序号（camera1..camera8）。错峰跨度 = 7 × 步长，所以步长上限是
+# _MAX_TRIGGER_DELAY_US // 7 = 2857us。见 __init__ 里对步长（而不是对单台
+# 延时）做截断的说明。
+_MAX_STAGGER_INDEX = 7
 
 
 def _camera_index_from_name(name) -> int:
@@ -315,6 +319,32 @@ class CameraOperation:
         # ---- 触发错峰（TriggerDelay）----
         self.trigger_stagger_us = max(0, int(trigger_stagger_us or 0))
         self._stagger_index = _camera_index_from_name(self.camera_name)
+
+        # 索引必须落在 0.._MAX_STAGGER_INDEX。名字解析不出来时
+        # _camera_index_from_name 已经返回 0（= 这台不错峰），这里再兜一层，
+        # 防止将来解析逻辑改动后算出离谱的索引 —— 那个故障是"相机永远不出图"。
+        if not 0 <= self._stagger_index <= _MAX_STAGGER_INDEX:
+            warning(f"设备 {self.st_serial_number} 解析出的相机序号 "
+                    f"{self._stagger_index} 超出 0..{_MAX_STAGGER_INDEX}"
+                    f"（camera_name={self.camera_name!r}），本台按 0 处理（不错峰）。")
+            self._stagger_index = 0
+
+        # ⚠️ 截断的是**步长**，不是单台延时。
+        #    之前按单台截断（delay > 20000 就压到 20000），后果是顶部几台被压成
+        #    同一个值：实测 trigger_stagger_us=4000 时
+        #      camera6/7/8 = 20000/20000/20000  →  间距 0，又变回同时触发。
+        #    这恰好是错峰要防的那件事，而且是**静默**失效。
+        #    按步长截断则间距始终均匀，只是跨度到顶。
+        if self.trigger_stagger_us > 0:
+            _max_step = _MAX_TRIGGER_DELAY_US // _MAX_STAGGER_INDEX
+            if self.trigger_stagger_us > _max_step:
+                warning(f"设备 {self.st_serial_number} trigger_stagger_us="
+                        f"{self.trigger_stagger_us}us 过大：8 台总跨度会超过上限 "
+                        f"{_MAX_TRIGGER_DELAY_US}us，导致顶部几台延时相同、"
+                        f"错峰失效。已降到 {_max_step}us（跨度 "
+                        f"{_max_step * _MAX_STAGGER_INDEX}us）。")
+                self.trigger_stagger_us = _max_step
+
         self.trigger_delay_us = self._stagger_index * self.trigger_stagger_us
         # 是否**真的写进相机了**。和 trigger_delay_us 是两回事：
         # 后者是"我们想设多少"，前者是"相机收下了没有"。
