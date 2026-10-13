@@ -1313,6 +1313,9 @@ CAMERA_ACQ_CONFIG: Dict[str, Any] = _cameras.get("acquisition", {}) or {}
 # ================================================================
 
 _debug = _get("debug", {})
+# 整个 debug 段也导出去：触发突发探针的开关在里面（burst_probe 等）。
+# 只导 SAVE_PATH / SEAVEIMAGE / PUSH 三个的话，新加的诊断项每次都要改这里。
+DEBUG_CONFIG: Dict[str, Any] = _debug
 SAVE_PATH = _debug.get("save_path", r"G:/fabric_ex_data")
 SEAVEIMAGE = _debug.get("save_image", False)
 PUSH = _debug.get("push_to_java", False)

@@ -33,6 +33,7 @@ CameraRegistry / Modbus.TriggerControlSystem / BackgroundTaskManager 无需改�
 
 import os
 import socket
+import re
 import struct
 import sys
 import threading
@@ -95,6 +96,44 @@ def _netmask_to_int(netmask) -> int:
         return ((1 << prefix) - 1) << (32 - prefix)
     except Exception:
         return 0
+
+
+try:
+    from General_Tool.TriggerBurstProbe import record_arrival as _tbp_record
+except Exception:                      # 探针不可用时退化成空操作
+    def _tbp_record(camera_name, ts=None):
+        return None
+
+
+# TriggerDelay 硬上限（微秒）。见 __init__ 里的说明：算错的后果是相机永远不出图。
+_MAX_TRIGGER_DELAY_US = 20000
+
+
+def _camera_index_from_name(name) -> int:
+    """从相机业务名里取序号，用于触发错峰：camera1 -> 0, camera8 -> 7。
+
+    ⚠️ **解析不出来时返回 0**（即"不错峰"），不猜、不报错。
+       错峰的失败模式必须是"回到原来的同时触发"，绝不能因为一个名字
+       解析不出来就把相机启动搞挂。
+
+    为什么用名字而不是枚举顺序：枚举顺序取决于 SDK 发现设备的先后，
+    每次开机可能不同；那样 camera3 这次拿 500us、下次拿 3000us，
+    现场就完全没法复现问题。名字是稳定的。
+    """
+    if not name:
+        return 0
+    # ⚠️ **必须整名匹配 cameraN，不能用 re.search 抓第一串数字**。
+    #    camera_name 缺省时会退化成序列号（`camera_name or st_serial_number`），
+    #    而 "KBA26070032" 用 search 会解析出 26070032 → TriggerDelay 变成
+    #    天文数字，相机等于永远不出图。实测过这个坑。
+    m = re.fullmatch(r"\s*camera[_\-]?(\d+)\s*", str(name), re.IGNORECASE)
+    if not m:
+        return 0
+    try:
+        idx = int(m.group(1))
+    except Exception:
+        return 0
+    return max(0, idx - 1)      # camera1 -> 0
 
 
 def _ip_to_int(ip: str) -> int:
@@ -217,7 +256,8 @@ class CameraOperation:
 
     def __init__(self, device_manager, device_info: dict, camera_name: str = None,
                  buffer_count: int = 10, packet_size: int = 0,
-                 heartbeat_timeout_ms: int = 0, trigger_source: str = "Line0"):
+                 heartbeat_timeout_ms: int = 0, trigger_source: str = "Line0",
+                 trigger_stagger_us: int = 0):
         """
         :param device_manager: gxipy 的 DeviceManager 实例（全局共用一个）
         :param device_info:    DeviceManager.update_all_device_list() 返回的
@@ -231,6 +271,21 @@ class CameraOperation:
                                      链路被拔/交换机抖动时，超时太长会让
                                      SDK 长时间阻塞在读包里，看起来就是"卡死"。
         :param trigger_source: 初始触发源，"Line0"(硬触发) 或 "Software"
+        :param trigger_stagger_us: **错峰步长**（微秒）。0 = 不错峰（保持原行为）。
+                               >0 时本机按相机序号错开 TriggerDelay：
+                               camera1=0、camera2=1×步长、…、camera8=7×步长。
+
+                               为什么需要：8 台相机接同一根 Line0 触发线，一次触发
+                               8 台**同时**开始推流。按现场分辨率算，一次突发是
+                               38.1 MB 上线 + 114.4 MB 在 8 条 SDK 回调线程上同时
+                               分配，1GbE 单链路要 305 ms 才传得完。这种瞬时尖峰
+                               是电源过流/整机卡死的高频诱因。
+
+                               ⚠️ **有几何代价**：错峰后各相机看到的布面纵向位置
+                               不再对齐。10 m/min = 166.7 mm/s，所以
+                               ``7 × 步长(µs) × 0.0001667 mm/µs`` 就是 camera8
+                               相对 camera1 的布面偏移。步长 500 µs ≈ 0.58 mm，
+                               2000 µs ≈ 2.33 mm。取值要现场按检测要求定。
         """
         self.device_manager = device_manager
         self.device_info = dict(device_info or {})
@@ -256,6 +311,20 @@ class CameraOperation:
         self.buffer_count = max(1, int(buffer_count or 1))
         self.packet_size = int(packet_size or 0)
         self.heartbeat_timeout_ms = int(heartbeat_timeout_ms or 0)
+
+        # ---- 触发错峰（TriggerDelay）----
+        self.trigger_stagger_us = max(0, int(trigger_stagger_us or 0))
+        self._stagger_index = _camera_index_from_name(self.camera_name)
+        self.trigger_delay_us = self._stagger_index * self.trigger_stagger_us
+        # 硬上限：TriggerDelay 算错（名字解析异常、配置写了离谱的值）的后果是
+        # 相机在触发后一直等、永远不出图 —— 这个故障现场极难查。
+        # 20 ms 已经远超任何合理的错峰需求，超过就截断并告警。
+        if self.trigger_delay_us > _MAX_TRIGGER_DELAY_US:
+            warning(f"设备 {self.st_serial_number} 计算出的 TriggerDelay="
+                    f"{self.trigger_delay_us}us 超过上限 "
+                    f"{_MAX_TRIGGER_DELAY_US}us，已截断。"
+                    f"请检查 trigger_stagger_us 配置和相机名 {self.camera_name!r}")
+            self.trigger_delay_us = _MAX_TRIGGER_DELAY_US
 
         # 用户回调：签名 handler(image_bgr: np.ndarray, frame_info: dict) -> None
         self._user_callback = None
@@ -310,6 +379,38 @@ class CameraOperation:
                 warning(f"设备 {self.st_serial_number} 不支持特征 {name}，跳过")
                 return -1
             self._feature_control.get_int_feature(name).set(int(value))
+            return 0
+        except Exception as e:
+            warning(f"设备 {self.st_serial_number} 设置 {name}={value} 失败: {e}")
+            return -1
+
+    def _set_float(self, name: str, value: float,
+                   readback: bool = True) -> int:
+        """设置浮点特征（特征不存在时只告警，不致命）。
+
+        和 :meth:`_set_int` 同一条纪律：**绝不抛异常、绝不挡住相机启动**。
+
+        :param readback: 设置后回读确认。GigE 相机的特征写入存在"返回成功但
+                         实际被相机夹到合法区间"的情况（``_apply_packet_size``
+                         就是为这个才回读的），浮点特征同样要验。
+        :return: 0 成功；-1 失败或不支持
+        """
+        try:
+            if not self._feature_control.is_implemented(name):
+                warning(f"设备 {self.st_serial_number} 不支持特征 {name}，跳过")
+                return -1
+            feat = self._feature_control.get_float_feature(name)
+            feat.set(float(value))
+            if readback:
+                try:
+                    got = float(feat.get())
+                    # 浮点比较留 1% 容差：相机可能按内部步进取整
+                    if abs(got - float(value)) > max(abs(float(value)) * 0.01, 1.0):
+                        warning(f"设备 {self.st_serial_number} {name} 设为 "
+                                f"{value} 但回读为 {got}（被相机夹到合法区间），"
+                                f"错峰效果可能与预期不同")
+                except Exception as e:
+                    warning(f"设备 {self.st_serial_number} 回读 {name} 失败: {e}")
             return 0
         except Exception as e:
             warning(f"设备 {self.st_serial_number} 设置 {name}={value} 失败: {e}")
@@ -492,6 +593,14 @@ class CameraOperation:
             self._set_enum("TriggerMode", "On")
             self._set_enum("TriggerSource", self.trigger_source)
 
+            # ---- 触发错峰：TriggerDelay 按相机序号递增 ----
+            # 必须在 TriggerSelector=FrameStart 之后设，否则会写到别的触发通道上
+            # （和上面 TriggerMode/TriggerSource 是同一个坑）。
+            # 失败只告警不影响启动 —— 错峰的失败模式是"回到不错峰"，
+            # 也就是现在的行为，不是"相机起不来"。
+            if self.trigger_delay_us > 0:
+                self._set_float("TriggerDelay", float(self.trigger_delay_us))
+
             # ---- 采集缓冲节点数：必须在 stream_on 之前设置 ----
             try:
                 self._data_stream.set_acquisition_buffer_number(self.buffer_count)
@@ -502,7 +611,8 @@ class CameraOperation:
 
             info(f"设备 [{self.st_serial_number}] ({self.st_mode_name} @ {self.st_ip_address}) "
                  f"启动成功！(TriggerSelector=FrameStart, TriggerMode=On, "
-                 f"TriggerSource={self.trigger_source}, BufferCount={self.buffer_count})")
+                 f"TriggerSource={self.trigger_source}, BufferCount={self.buffer_count}"
+                 f"{f', TriggerDelay={self.trigger_delay_us}us' if self.trigger_delay_us > 0 else ''})")
 
             CameraRegistry.register_camera(self.camera_name, self)
             return 0
@@ -640,6 +750,14 @@ class CameraOperation:
                 "camera_sn": self.st_serial_number,
                 "camera_name": self.camera_name,
             }
+
+            # ---- 触发突发探针：只记一次到达时间，热路径上必须极便宜 ----
+            # 放在 _to_bgr **之前**：要测的是"相机什么时候把帧送上来"，
+            # 不是"我们什么时候转完色"。探针没启用时是一次属性判断，零成本。
+            try:
+                _tbp_record(self.camera_name)
+            except Exception:
+                pass
 
             image = self._to_bgr(raw_image)
             if image is None:

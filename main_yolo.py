@@ -32,7 +32,7 @@ from Communication_Tool.ThriftControl import PythonJavaClient, start_python_serv
 import Communication_Tool.ThriftControl
 from Test_Tool.TestTool import press_any_key_exit
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from General_Tool.EnhancedLogger import init_logger, info, debug, error
+from General_Tool.EnhancedLogger import init_logger, info, debug, warning, error
 from General_Tool.HealthMonitor import (
     init_health_monitor, shutdown_health_monitor,
 )
@@ -47,6 +47,7 @@ from AnomalyDetection_Tool.config.settings import (
     FABRIC_WIDTH_CONFIG, CAMERA_SN_MAP, CAMERA_ACQ_CONFIG,
     SAVE_PATH, SEAVEIMAGE, PUSH,
     PLC_CONFIG, WEBSOCKET_CONFIG, LOGGING_CONFIG, CONCURRENCY_CONFIG,
+    DEBUG_CONFIG,
 )
 from AnomalyDetection_Tool.core.detection_manager import YOLODetectionManager
 from AnomalyDetection_Tool.utils.font_utils import load_chinese_font
@@ -1004,6 +1005,19 @@ def run_production_mode() -> int:
     # 卡死的高频原因，而这种卡死从 Python 侧完全看不出来（进程还活着，
     # 整台机器不动了）。趁还能打日志的时候先说清楚。
     # 内部保证不抛异常、不阻塞——查不到就只是日志里说没查成。
+    # ==================== 触发突发探针 ====================
+    # 必须在开相机之前启动：探针要在第一帧到达之前就绪，否则漏掉最初的突发。
+    # 内部保证不抛异常、不阻塞；关掉时 record_arrival 直接 return。
+    if DEBUG_CONFIG.get("burst_probe", True):
+        try:
+            from General_Tool.TriggerBurstProbe import init_probe
+            init_probe(
+                enabled=True,
+                report_interval=float(DEBUG_CONFIG.get("burst_report_interval", 30)),
+                min_burst_cameras=int(DEBUG_CONFIG.get("burst_min_cameras", 2)))
+        except Exception as _e:
+            warning(f"[触发突发] 探针初始化失败（已忽略，不影响启动）: {_e!r}")
+
     if LOGGING_CONFIG.get("nic_filter_check", True):
         from General_Tool.NicFilterCheck import check_nic_filter_drivers
         _nic_rep = check_nic_filter_drivers(
@@ -1100,6 +1114,8 @@ def run_production_mode() -> int:
             packet_size=int(CAMERA_ACQ_CONFIG.get("packet_size", 0)),
             heartbeat_timeout_ms=int(CAMERA_ACQ_CONFIG.get("heartbeat_timeout_ms", 0)),
             trigger_source=str(CAMERA_ACQ_CONFIG.get("trigger_source", "Line0")),
+            # 触发错峰步长（微秒）。0 = 不错峰。见 config.yaml 里的代价说明。
+            trigger_stagger_us=int(CAMERA_ACQ_CONFIG.get("trigger_stagger_us", 0)),
         ))
         info(f"  添加相机 {strSN} -> {CAMERA_SN_MAP[strSN]} "
              f"({dev_info.get('model_name', '')} @ {dev_info.get('ip', '')})")
