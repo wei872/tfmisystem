@@ -1044,24 +1044,46 @@ class TestPerCameraRepeatOverride:
         assert svc.repeat_tracker.get_stats()["occurrences"] == 0, \
             "白名单外的相机连计数都不该做"
 
-    def test_shipped_config_override_section_is_empty(self):
+    def test_shipped_config_has_no_active_override(self):
+        """出厂状态：没有任何按相机覆盖在生效。
+
+        这个键**允许整个不写** —— settings 里
+        ``CAMERA_REPEAT_STOP_OVERRIDES = _LiveDict(..., {})`` 缺键就取 {}。
+        所以"键不存在"和"键为 {}"必须都算通过。
+        """
         import yaml
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        assert cfg["camera_repeat_stop_overrides"] == {}
+        assert cfg.get("camera_repeat_stop_overrides", {}) == {}
+
+    def test_missing_override_key_behaves_like_empty(self, monkeypatch):
+        """⚠️ 钉住"这个键可以省略"：键不存在时，行为必须和 {} 完全一致。
+
+        实测过：删掉这个键后 CAMERA_REPEAT_STOP_OVERRIDES 取默认 {}，
+        camera1/camera8 照常停机、白名单外相机照常不参与。
+        这条测试防止将来有人把缺键当成配置错误。
+        """
+        # settings 里声明的默认值就是 {}，所以缺键 == 空字典
+        assert st.CAMERA_REPEAT_STOP_OVERRIDES._default == {}
+        # 且缺键时 get 返回 None（= 没有覆盖，回落全局）
+        monkeypatch.setattr(st, "CAMERA_REPEAT_STOP_OVERRIDES", {})
+        assert st.get_camera_repeat_rule_override("camera1", "包边不良") is None
+        assert st.get_camera_repeat_rule_override(None, "包边不良") is None
 
     def test_config_comment_does_not_suggest_a_dead_example(self):
-        """注释里的例子必须用白名单里的相机，否则照着配就是死配置。"""
+        """注释里的例子必须用白名单里的相机，否则照着配就是死配置。
+
+        扫的是整个【三】段（用法说明现在并在 repeat_stop_rules 的注释里，
+        不再有独立的 camera_repeat_stop_overrides 段）。
+        """
+        import re
         import yaml
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             text = f.read()
-        seg = text[text.index("camera_repeat_stop_overrides:"):]
-        seg = text[text.rindex("# 【三】停机 · 重复触发 · 按相机覆盖"):
-                   text.index("camera_repeat_stop_overrides:")]
+        seg = text[text.index("# 【三】停机 · 重复触发"):
+                   text.index("heatmap:")]
         allowed = set(yaml.safe_load(text)["repeat_stop_rules"]
                       ["stop_allowed_cameras"])
-        # 注释里出现的 cameraN 必须都在白名单里
-        import re
         mentioned = set(re.findall(r"camera\d", seg))
         bad = mentioned - allowed
         assert not bad, (
