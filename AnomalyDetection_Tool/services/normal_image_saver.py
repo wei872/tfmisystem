@@ -18,8 +18,14 @@
 * **落盘在独立线程**。绝不在检测线程里写磁盘 —— 那会把推理节拍拖垮。
 
 * **每台相机的 10 张是硬上限**，按窗口计。窗口重新开始才清零。
-  这个上限存在的理由：一次窗口 8 台 × 10 张 = 80 张，
-  2440x2048 的 JPEG 约 1 MB 一张，最多 80 MB，不会把盘写满。
+
+* **存 PNG（无损）**。体积代价要心里有数 —— 实测 2440x2048 的真实纹理图：
+      PNG c1  13.02 MB / 488 ms      JPEG q90  2.96 MB / 32 ms
+  一次窗口 8 台 × 10 张 = 80 张，PNG 约 **1.0 GB**，JPEG 只要 0.23 GB。
+  所以 10 张这个上限不是随手定的，是拿磁盘换无损：80 张封顶约 1 GB，
+  一天开几十次窗口就是几十 GB，**现场要有人清盘**。
+  编码 488 ms 走独立线程，不占检测节拍；但 8 台同时开存时是 8 个线程
+  各占 0.5 s CPU，比 JPEG 重 15 倍。
 """
 
 import os
@@ -35,7 +41,11 @@ from General_Tool.EnhancedLogger import info, warning
 DEFAULT_MAX_PER_CAMERA = 10
 # 同一台相机两次保存的最小间隔（秒）
 DEFAULT_INTERVAL_SEC = 5.0
-DEFAULT_JPEG_QUALITY = 90
+# PNG 压缩级别 0-9。实测压缩级别对布面这种高频纹理几乎没用：
+#   c1 = 13.02 MB / 488 ms，c9 = 12.99 MB / 509 ms —— 多花 20 ms 只省 0.03 MB。
+# 所以默认给 1（最快的那一档里体积已经到底）。
+# 磁盘 I/O 是瓶颈时可降到 0：143 ms / 14.32 MB，快 3.4 倍，每张只大 1.3 MB。
+DEFAULT_PNG_COMPRESSION = 1
 
 
 class NormalImageSaver:
@@ -46,14 +56,15 @@ class NormalImageSaver:
                  launch_tag: str = "",
                  interval_sec: float = DEFAULT_INTERVAL_SEC,
                  max_per_camera: int = DEFAULT_MAX_PER_CAMERA,
-                 jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+                 png_compression: int = DEFAULT_PNG_COMPRESSION,
                  save_subdir: str = "NormalSave",
                  clock=time.time):
         self.base_path = base_path
         self.launch_tag = launch_tag or ""
         self.interval_sec = max(0.1, float(interval_sec))
         self.max_per_camera = max(1, int(max_per_camera))
-        self.jpeg_quality = int(jpeg_quality)
+        # 0-9 夹住：越界值 cv2 会当成别的压缩策略，行为不可预期
+        self.png_compression = min(9, max(0, int(png_compression)))
         self.save_subdir = save_subdir or "NormalSave"
         self._clock = clock
 
@@ -182,7 +193,7 @@ class NormalImageSaver:
                              camera_name, self.save_subdir)
             os.makedirs(d, exist_ok=True)
             ts = datetime.fromtimestamp(now).strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            path = os.path.join(d, f"{ts}_{camera_name}_{idx:02d}.jpg")
+            path = os.path.join(d, f"{ts}_{camera_name}_{idx:02d}.png")
         except Exception as e:
             with self._lock:
                 self._stats["save_failed"] += 1
@@ -197,13 +208,27 @@ class NormalImageSaver:
     def _write(self, path: str, image, camera_name: str) -> None:
         try:
             import cv2
-            ok = cv2.imwrite(path, image,
-                             [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            # 先写 .tmp 再原子改名。**不要**直接写目标名：
+            # cv2.imwrite 一创建文件，os.path.exists() 就为真了，但字节还没
+            # 写完 —— 现场有人边存边翻文件夹就会看到半个 PNG。
+            # os.replace 在同一文件系统上是原子的，读者要么看不到、要么看到完整的。
+            # 临时名必须以 .png 结尾 —— cv2.imwrite 是**靠扩展名选编码器**的，
+            # 叫 foo.png.tmp 它会认不出格式直接返回 False。
+            tmp = path + ".part.png"
+            ok = cv2.imwrite(tmp, image,
+                             [int(cv2.IMWRITE_PNG_COMPRESSION),
+                              self.png_compression])
             if not ok:
                 raise RuntimeError("cv2.imwrite 返回 False")
+            os.replace(tmp, path)
             with self._lock:
                 self._stats["saved"] += 1
         except Exception as e:
+            try:
+                if os.path.exists(path + ".part.png"):
+                    os.remove(path + ".part.png")   # 别把半成品留在盘上
+            except OSError:
+                pass
             with self._lock:
                 self._stats["save_failed"] += 1
                 # 落盘失败要把占位退回去，否则这台相机会白白少一张配额
@@ -261,14 +286,14 @@ _saver_lock = threading.Lock()
 def init_normal_saver(base_path: str, launch_tag: str = "",
                       interval_sec: float = DEFAULT_INTERVAL_SEC,
                       max_per_camera: int = DEFAULT_MAX_PER_CAMERA,
-                      jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+                      png_compression: int = DEFAULT_PNG_COMPRESSION,
                       save_subdir: str = "NormalSave") -> NormalImageSaver:
     global _saver
     with _saver_lock:
         _saver = NormalImageSaver(
             base_path=base_path, launch_tag=launch_tag,
             interval_sec=interval_sec, max_per_camera=max_per_camera,
-            jpeg_quality=jpeg_quality, save_subdir=save_subdir)
+            png_compression=png_compression, save_subdir=save_subdir)
     info(f"[正常图保存] 已就绪：每台最多 {max_per_camera} 张，"
          f"间隔 {interval_sec:.1f} 秒，目录 <save_path>/<launch_tag>/"
          f"<相机>/{save_subdir}/。等待前端下发窗口。")

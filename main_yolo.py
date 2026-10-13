@@ -1227,7 +1227,7 @@ def main() -> int:
                            if _detection_manager is not None else "",
                 interval_sec=float(_nis.get("interval_sec", 5.0)),
                 max_per_camera=int(_nis.get("max_per_camera", 10)),
-                jpeg_quality=int(_nis.get("jpeg_quality", 90)),
+                png_compression=int(_nis.get("png_compression", 1)),
                 save_subdir=str(_nis.get("save_subdir", "NormalSave")),
             )
         else:

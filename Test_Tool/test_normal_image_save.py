@@ -278,16 +278,16 @@ class TestSave:
     def _img(self):
         return np.full((60, 80, 3), 128, dtype=np.uint8)
 
-    def test_writes_a_jpg_under_the_expected_path(self, tmp_path):
+    def test_writes_a_png_under_the_expected_path(self, tmp_path):
         t = [1_700_000_000.0]
         s = NormalImageSaver(str(tmp_path), launch_tag="L1",
                              clock=lambda: t[0])
         s.start_window(start=1_700_000_000.0, duration_sec=100.0)
         assert s.should_save("camera3") is True
         path = s.save("camera3", self._img())
-        assert path.endswith(".jpg")
+        assert path.endswith(".png")
         assert os.path.join("L1", "camera3", "NormalSave") in path
-        assert path.endswith("_camera3_01.jpg")     # 序号来自 should_save
+        assert path.endswith("_camera3_01.png")     # 序号来自 should_save
         for _ in range(100):
             if os.path.exists(path):
                 break
@@ -295,6 +295,46 @@ class TestSave:
         assert os.path.exists(path), f"没落盘: {path}"
         assert os.path.getsize(path) > 100
         assert s.get_status()["stats"]["saved"] == 1
+
+    def test_png_is_lossless(self, tmp_path):
+        """选 PNG 的全部理由就是无损 —— 读回来必须逐像素相同。
+
+        这条是防止有人日后为了省磁盘把它换回 JPEG：JPEG 是有损的，
+        换回去这条立刻失败。
+        """
+        import cv2
+        rng = np.random.default_rng(3)
+        img = rng.integers(0, 256, (64, 96, 3), dtype=np.uint8)   # 高频纹理
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: 1_700_000_000.0)
+        s.start_window(start=1_700_000_000.0, duration_sec=100.0)
+        s.should_save("camera1")
+        path = s.save("camera1", img)
+        for _ in range(100):
+            if os.path.exists(path):
+                break
+            time.sleep(0.02)
+        back = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        assert back is not None, f"读不回来: {path}"
+        assert np.array_equal(back, img), "PNG 竟然有损，是不是被换成 JPEG 了"
+
+    def test_compression_is_clamped_to_valid_range(self, tmp_path):
+        """越界的压缩级别要夹到 0-9，不能原样丢给 cv2。"""
+        assert NormalImageSaver(str(tmp_path), png_compression=-5).png_compression == 0
+        assert NormalImageSaver(str(tmp_path), png_compression=99).png_compression == 9
+        assert NormalImageSaver(str(tmp_path), png_compression=3).png_compression == 3
+
+    def test_default_compression_is_one(self):
+        """默认必须是 1：实测 c9 比 c1 多花 20 ms 只省 0.03 MB，不划算。"""
+        assert nis.DEFAULT_PNG_COMPRESSION == 1
+        assert NormalImageSaver("x").png_compression == 1
+
+    def test_no_jpeg_left_in_the_saver(self):
+        """源码里不该再出现 JPEG 编码路径。"""
+        import inspect
+        src = inspect.getsource(nis)
+        assert "IMWRITE_JPEG" not in src
+        assert ".jpg" not in src
 
     def test_custom_subdir(self, tmp_path):
         s = NormalImageSaver(str(tmp_path), launch_tag="L", save_subdir="MyDir",
@@ -325,6 +365,60 @@ class TestSave:
         st = s.get_status()
         assert st["stats"]["save_failed"] == 1
         assert st["per_camera"].get("camera1", 0) == 0   # 配额已退回
+
+    def test_final_path_only_appears_via_rename(self, tmp_path, monkeypatch):
+        """成品名只可能由改名产生 —— cv2.imwrite 永远不该拿到成品路径。
+
+        这条锁住"先写临时名再原子改名"。踩到的真实竞态：直接写目标名时
+        cv2.imwrite 一创建文件 os.path.exists() 就为真，但字节还没写完，
+        读者（现场翻文件夹的人、或本测试自己）会拿到半个 PNG。
+        本用例曾经写成"检查有没有残留 .part.png"，那是无效的 ——
+        直接写目标名根本不会产生 .part.png，注入后照样通过。
+        """
+        import cv2
+        real = cv2.imwrite
+        written = []
+
+        def spy(path, img, params=None):
+            written.append(path)
+            return real(path, img, params)
+
+        monkeypatch.setattr(cv2, "imwrite", spy)
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: 1_700_000_000.0)
+        s.start_window(start=1_700_000_000.0, duration_sec=100.0)
+        s.should_save("camera1")
+        final = s.save("camera1", self._img())
+        for _ in range(100):
+            if s.get_status()["stats"]["saved"] == 1:
+                break
+            time.sleep(0.02)
+        assert written, "cv2.imwrite 一次都没被调到"
+        assert all(not w.endswith("_01.png") for w in written), (
+            f"直接写了成品名，读者会看到半个文件: {written}")
+        assert any(w.endswith(".part.png") for w in written), (
+            f"没走临时名: {written}")
+        assert os.path.exists(final)      # 改名后成品确实在
+        d = os.path.dirname(final)
+        assert [f for f in os.listdir(d) if f.endswith(".part.png")] == [], \
+            "改完名还留着半成品"
+
+    def test_temp_file_removed_when_write_fails(self, tmp_path, monkeypatch):
+        """写盘失败也不能把半成品留在盘上。"""
+        import cv2
+        monkeypatch.setattr(cv2, "imwrite", lambda *a, **k: False)
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: 1_700_000_000.0)
+        s.start_window(start=1_700_000_000.0, duration_sec=100.0)
+        s.should_save("camera1")
+        s.save("camera1", self._img())
+        for _ in range(100):
+            if s.get_status()["stats"]["save_failed"]:
+                break
+            time.sleep(0.02)
+        d = os.path.join(str(tmp_path), "L", "camera1", "NormalSave")
+        assert os.path.isdir(d)
+        assert os.listdir(d) == [], f"失败后目录里还有东西: {os.listdir(d)}"
 
     def test_bad_base_path_does_not_raise(self, tmp_path):
         """目录建不出来也不能把检测线程掀了。"""
@@ -359,7 +453,8 @@ class TestConfig:
         b = cfg["normal_image_save"]
         assert isinstance(b["enabled"], bool)
         assert isinstance(b["interval_sec"], (int, float)) and b["interval_sec"] > 0
-        assert isinstance(b["jpeg_quality"], int)
+        assert isinstance(b["png_compression"], int)
+        assert 0 <= b["png_compression"] <= 9
         assert isinstance(b["save_subdir"], str) and b["save_subdir"]
 
     def test_settings_exports_the_live_dict(self):
