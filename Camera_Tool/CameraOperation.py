@@ -316,6 +316,9 @@ class CameraOperation:
         self.trigger_stagger_us = max(0, int(trigger_stagger_us or 0))
         self._stagger_index = _camera_index_from_name(self.camera_name)
         self.trigger_delay_us = self._stagger_index * self.trigger_stagger_us
+        # 是否**真的写进相机了**。和 trigger_delay_us 是两回事：
+        # 后者是"我们想设多少"，前者是"相机收下了没有"。
+        self.trigger_delay_applied = False
         # 硬上限：TriggerDelay 算错（名字解析异常、配置写了离谱的值）的后果是
         # 相机在触发后一直等、永远不出图 —— 这个故障现场极难查。
         # 20 ms 已经远超任何合理的错峰需求，超过就截断并告警。
@@ -415,6 +418,32 @@ class CameraOperation:
         except Exception as e:
             warning(f"设备 {self.st_serial_number} 设置 {name}={value} 失败: {e}")
             return -1
+
+    def _apply_trigger_delay(self) -> bool:
+        """下发本机算好的 TriggerDelay。**绝不抛异常、绝不挡住启动/切流。**
+
+        为什么要在 Open_device **和** Set_trigger_source 两处都调：
+          TriggerDelay 按 GenICam 是挂在 TriggerSelector=FrameStart 上的持久
+          设置，切 TriggerSource 理论上不该丢。但"理论上不该丢"这件事在真机上
+          验不了 —— 部分机型在 StopGrabbing/StartGrabbing 或改触发源时会把
+          触发相关参数复位。而这里重下发一次的成本是零。
+
+          更关键的是**失效方向**：软触发是织机**停机预览**时才切过去的。如果
+          切过去时 TriggerDelay 丢了，8 台又变回同时推流，而这恰好是最不容易
+          被注意到的一条路径（停机时没人盯着检测节拍）。
+
+        trigger_delay_us == 0 时直接返回 False（不错峰是默认行为，不该去碰相机）。
+
+        :return: True = 确实写进相机了；False = 没写（不错峰，或相机不支持）。
+                 ⚠️ 调用方**必须**用这个返回值决定日志怎么写。之前不看返回值，
+                 结果相机不支持该特征、下发被跳过，启动日志却照样打
+                 "TriggerDelay=3500us" —— 现场会以为错峰生效了，其实没有。
+        """
+        if self.trigger_delay_us <= 0:
+            return False
+        ok = self._set_float("TriggerDelay", float(self.trigger_delay_us)) == 0
+        self.trigger_delay_applied = ok
+        return ok
 
     def _apply_packet_size(self) -> None:
         """设置 GigE 包长。**契约：绝不抛异常、绝不挡住相机启动。**
@@ -594,12 +623,11 @@ class CameraOperation:
             self._set_enum("TriggerSource", self.trigger_source)
 
             # ---- 触发错峰：TriggerDelay 按相机序号递增 ----
-            # 必须在 TriggerSelector=FrameStart 之后设，否则会写到别的触发通道上
-            # （和上面 TriggerMode/TriggerSource 是同一个坑）。
+            # 必须在 TriggerSelector=FrameStart 之后、stream_on 之前设，否则会
+            # 写到别的触发通道上（和上面 TriggerMode/TriggerSource 是同一个坑）。
             # 失败只告警不影响启动 —— 错峰的失败模式是"回到不错峰"，
-            # 也就是现在的行为，不是"相机起不来"。
-            if self.trigger_delay_us > 0:
-                self._set_float("TriggerDelay", float(self.trigger_delay_us))
+            # 也就是原来的行为，不是"相机起不来"。
+            self._apply_trigger_delay()
 
             # ---- 采集缓冲节点数：必须在 stream_on 之前设置 ----
             try:
@@ -609,10 +637,21 @@ class CameraOperation:
 
             self.b_open_device = True
 
+            # ⚠️ 日志必须反映**实际下发结果**，不能反映"我们打算设多少"。
+            #    相机不支持 TriggerDelay 时下发会被跳过，此时若照打
+            #    "TriggerDelay=3500us"，现场会以为错峰生效了 —— 而实际 8 台
+            #    仍在同时推流。这个谎报比不打印危险得多。
+            if self.trigger_delay_us <= 0:
+                _delay_tag = ""
+            elif self.trigger_delay_applied:
+                _delay_tag = f", TriggerDelay={self.trigger_delay_us}us"
+            else:
+                _delay_tag = (f", TriggerDelay={self.trigger_delay_us}us "
+                              f"[未生效·相机不支持或下发失败，错峰未启用]")
             info(f"设备 [{self.st_serial_number}] ({self.st_mode_name} @ {self.st_ip_address}) "
                  f"启动成功！(TriggerSelector=FrameStart, TriggerMode=On, "
                  f"TriggerSource={self.trigger_source}, BufferCount={self.buffer_count}"
-                 f"{f', TriggerDelay={self.trigger_delay_us}us' if self.trigger_delay_us > 0 else ''})")
+                 f"{_delay_tag}")
 
             CameraRegistry.register_camera(self.camera_name, self)
             return 0
@@ -962,6 +1001,11 @@ class CameraOperation:
             self._set_enum("TriggerSelector", "FrameStart", warn_only=True)
 
             ret = self._set_enum("TriggerSource", source, warn_only=True)
+
+            # ⚠️ 切完触发源**必须重下发 TriggerDelay**。见 _apply_trigger_delay
+            #    的说明：丢了的后果是软触发（停机预览）路径悄悄退回同时推流。
+            if ret == 0:
+                self._apply_trigger_delay()
             if ret == 0:
                 self.trigger_source = source
                 info(f"设备 {self.st_serial_number} 触发源已切换为 {source}")

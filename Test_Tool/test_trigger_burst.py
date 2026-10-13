@@ -177,3 +177,111 @@ class TestHotPath:
         assert tbp.get_probe() is None
         tbp.record_arrival("camera1")          # 不该抛
         assert tbp.get_probe() is None
+
+
+# ------------------------------------------------- §5 两条触发路径都要下发错峰
+class TestTriggerDelayWiring:
+    """用假 SDK + 桩 _set_float 验证**接线**：Open_device 和 Set_trigger_source
+    两处都必须下发 TriggerDelay。
+
+    ⚠️ 假 SDK 的 C 层没有浮点特征（没有 gx_get_float_feature），所以这里把
+    _set_float 打桩来记录调用。**相机真的收下了多少**这件事在本沙箱里验不了，
+    只能靠现场日志确认。"""
+
+    @staticmethod
+    def _make(monkeypatch, camera_name="camera8", step=500):
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool.CameraOperation import CameraOperation
+        B.reset()
+        B.add_camera("SNTEST", "MER2-500-14GM", "192.168.1.10", 32, 24,
+                     fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        cam = CameraOperation(
+            gx.DeviceManager(),
+            {"index": 1, "sn": "SNTEST", "model_name": "MER2",
+             "ip": "192.168.1.10"},
+            camera_name=camera_name, trigger_stagger_us=step)
+        calls = []
+        monkeypatch.setattr(cam, "_set_float",
+                            lambda n, v, readback=True: (calls.append((n, v)), 0)[1])
+        return cam, calls
+
+    def test_open_device_applies_the_delay(self, monkeypatch):
+        cam, calls = self._make(monkeypatch)
+        assert cam.Open_device() == 0
+        assert ("TriggerDelay", 3500.0) in calls, calls      # camera8 → 7×500
+        assert cam.trigger_delay_applied is True
+
+    def test_set_trigger_source_reapplies_the_delay(self, monkeypatch):
+        """⚠️ 关键：软触发是织机**停机预览**时才切过去的。如果切触发源时
+        TriggerDelay 丢了，8 台会悄悄退回同时推流，而这恰好是最不容易被
+        注意到的一条路径（停机时没人盯检测节拍）。"""
+        cam, calls = self._make(monkeypatch)
+        assert cam.Open_device() == 0
+        n0 = len([c for c in calls if c[0] == "TriggerDelay"])
+        assert n0 == 1, calls
+
+        cam.Start_grabbing()
+        assert cam.Set_trigger_source("Software") == 0
+        n1 = len([c for c in calls if c[0] == "TriggerDelay"])
+        assert n1 == 2, f"切到软触发后没有重下发 TriggerDelay: {calls}"
+
+        assert cam.Set_trigger_source("Line0") == 0
+        n2 = len([c for c in calls if c[0] == "TriggerDelay"])
+        assert n2 == 3, f"切回硬触发后没有重下发 TriggerDelay: {calls}"
+
+    def test_zero_stagger_never_touches_the_camera(self, monkeypatch):
+        """默认 trigger_stagger_us=0 → 一次都不该碰相机（不改变现有行为）。"""
+        cam, calls = self._make(monkeypatch, step=0)
+        assert cam.Open_device() == 0
+        assert [c for c in calls if c[0] == "TriggerDelay"] == []
+        assert cam.trigger_delay_applied is False
+
+    def test_camera1_gets_zero_delay(self, monkeypatch):
+        """camera1 是基准，delay 必须为 0 —— 否则整组会被无谓地推迟。"""
+        cam, calls = self._make(monkeypatch, camera_name="camera1", step=500)
+        assert cam.trigger_delay_us == 0
+        assert cam.Open_device() == 0
+        assert [c for c in calls if c[0] == "TriggerDelay"] == []
+
+    def test_unsupported_feature_does_not_block_startup(self, monkeypatch):
+        """相机不支持该特征时：只告警，**绝不挡住启动**。
+        不打桩 _set_float，直接用假 SDK（它没有浮点特征，等价于真机上
+        遇到不支持的机型）。"""
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool.CameraOperation import CameraOperation
+        B.reset()
+        B.add_camera("SNSUP", "MER2", "192.168.1.20", 32, 24,
+                     fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        cam = CameraOperation(
+            gx.DeviceManager(),
+            {"index": 1, "sn": "SNSUP", "model_name": "MER2", "ip": "192.168.1.20"},
+            camera_name="camera8", trigger_stagger_us=500)
+        assert cam.Open_device() == 0, "不支持 TriggerDelay 就不该挡住启动"
+        assert cam.trigger_delay_applied is False
+
+    def test_log_does_not_claim_success_when_not_applied(self, monkeypatch):
+        """回归：之前不看 _set_float 的返回值，下发被跳过却照样打
+        "TriggerDelay=3500us" —— 现场会以为错峰生效了，其实 8 台仍同时推流。"""
+        import fake_galaxy_sdk
+        B = fake_galaxy_sdk.install()
+        import gxipy as gx
+        from Camera_Tool.CameraOperation import CameraOperation
+        B.reset()
+        B.add_camera("SNLOG", "MER2", "192.168.1.21", 32, 24,
+                     fake_galaxy_sdk.PIXEL.BAYER_GB8)
+        cam = CameraOperation(
+            gx.DeviceManager(),
+            {"index": 1, "sn": "SNLOG", "model_name": "MER2", "ip": "192.168.1.21"},
+            camera_name="camera8", trigger_stagger_us=500)
+        logs = []
+        import Camera_Tool.CameraOperation as co
+        monkeypatch.setattr(co, "info", lambda m: logs.append(m))
+        assert cam.Open_device() == 0
+        txt = "\n".join(logs)
+        assert "未生效" in txt, txt
+        # 不能出现"干净的成功串"（没有未生效标记的那种）
+        assert "BufferCount=10, TriggerDelay=3500us)" not in txt, txt
