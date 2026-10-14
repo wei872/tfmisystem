@@ -769,7 +769,9 @@ class CameraOperation:
         """注册用户图像回调。
 
         :param callback: ``handler(image: np.ndarray, frame_info: dict) -> None``
-                         image 为 BGR、HxWx3、uint8、**已脱离 SDK 缓冲区的独立副本**；
+                         image 为 BGR、HxWx3、uint8、**只读**；生命周期不依赖
+                         SDK 环形缓冲（gxipy 构造时已 string_at 拷成 Python
+                         bytes），但要在上面原地画框/改像素必须先 copy；
                          frame_info 含 nWidth/nHeight/nFrameNum/timestamp/
                          camera_sn/camera_name/pixel_format。
         :return: 0 成功，-1 失败
@@ -861,10 +863,27 @@ class CameraOperation:
     # 像素格式转换
     # ==================================================================
     def _to_bgr(self, raw_image):
-        """把 SDK 原始帧转成 OpenCV 的 BGR uint8 数组（**独立副本**）。
+        """把 SDK 原始帧转成 OpenCV 的 BGR uint8 数组。
 
-        返回的数组必须在回调返回后依然有效 —— SDK 的环形缓冲在回调返回后
-        就会被复用，所以这里一定要 copy 出来。
+        关于"要不要再 copy 一次"（这里原来写错了，实测后更正）：
+
+        * **不需要为了生命周期而 copy。** gxipy 的 ``RawImage``/``RGBImage``
+          构造时执行 ``string_at(image_buf, image_size)``
+          （lib/gxipy/ImageProc.py:28 与 :172），那**已经是一次 Python bytes
+          拷贝**，内存归 Python 所有；``get_numpy_array()`` 只是
+          ``numpy.frombuffer`` 出的视图，会持有那个 bytes 的引用。
+          所以 SDK 环形缓冲被复用也不会让这块内存失效。
+
+        * **``np.ascontiguousarray`` 在这里不产生拷贝。** 输入本来就是
+          C 连续的，``ascontiguousarray`` 原样返回同一个对象（实测
+          ``out is arr`` 为真）。这里的注释原先声称做了真正的拷贝、
+          并让下游拿到可写数组 —— 两句都不成立，已更正。
+
+        * 因此返回的数组是**只读的**（``frombuffer`` over ``bytes``）。
+          下游全部是只读用法（YOLO / cvtColor / imencode / 经纬线分析），
+          标注绘制都先 ``image.copy()``，所以现状是安全的。
+          **若将来要在帧上原地画框或改像素，必须先显式 copy**，
+          否则会抛 "assignment destination is read-only"。
         """
         pixel_format = raw_image.get_pixel_format()
 
@@ -884,7 +903,8 @@ class CameraOperation:
             arr = rgb_image.get_numpy_array()
             if arr is None:
                 return self._bayer_fallback(raw_image, pixel_format)
-            # copy：既脱离 SDK 缓冲区，也让下游可写（frombuffer 出来的是只读的）
+            # 只保证连续，不保证拷贝（对已连续输入它是 no-op）——
+            # 见 _to_bgr 的文档字符串。生命周期由 gxipy 那次 string_at 兜住。
             return np.ascontiguousarray(arr)
 
         except Exception as e:
