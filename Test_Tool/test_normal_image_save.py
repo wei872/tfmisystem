@@ -517,7 +517,7 @@ class TestHook:
         dm._lock = threading.Lock()
         dm._stats = {"total_images": 0, "total_detections": 0,
                      "total_boxes": 0}
-        dm._speed_detail = lambda: ""
+        dm._speed_detail = lambda *a, **k: ""   # 现在会收到 worker_id
         return dm
 
     def _img(self):

@@ -240,22 +240,40 @@ class YOLODetectionManager:
         if hasattr(torch.backends.cudnn, 'allow_tf32'):
             torch.backends.cudnn.allow_tf32 = True
 
-    def _speed_detail(self) -> str:
-        """
-        取当前 worker 的推理分段耗时，附加到计时日志后面。
+    def _speed_detail(self, worker_id=None) -> str:
+        """取**该帧实际所在 worker** 的推理分段耗时，附加到计时日志后面。
 
         "推理" 这个数字包含了 CPU 预处理 + GPU 推理 + NMS 三段，
         只看总数无法判断变慢发生在哪一侧，所以这里把明细带出来。
+
+        必须按 worker_id 取。原实现是"遍历所有 pipeline，返回第一个有值的"，
+        于是不管在记哪台相机，附带的都是同一个 worker 的数字 ——
+        现场日志里 camera2/3/4/6 四行 `预处理=74.0 GPU推理=18.9 NMS=13.2`
+        一字不差，就是这么来的。那种日志会把人往错误方向带
+        （以为是某台相机预处理慢，其实是拿错了 worker 的数据），
+        所以现在把 worker 编号一并打出来，取不到就明确说取不到。
+
+        :param worker_id: 该帧的 worker 编号（DetectionResult.worker_id）。
+                          None 时退回旧行为，但会标注 `W?` 表示来源不明。
         """
         try:
             pool = self.worker_pool
             pipelines = pool.iter_pipelines() if pool else (
                 [self.pipeline] if self.pipeline else [])
+            if worker_id is not None:
+                for p in pipelines:
+                    if getattr(p, "worker_id", None) != worker_id:
+                        continue
+                    det = getattr(p, "detector", None)
+                    s = det.speed_str() if det is not None else ""
+                    return f" [W{worker_id} {s}]" if s else ""
+                return ""      # 该 worker 没上报过，宁可不显示也不拿别人的
             for p in pipelines:
                 det = getattr(p, "detector", None)
                 s = det.speed_str() if det is not None else ""
                 if s:
-                    return f" [{s}]"
+                    wid = getattr(p, "worker_id", "?")
+                    return f" [W{wid} {s}]"
         except Exception:
             pass
         return ""
@@ -491,7 +509,7 @@ class YOLODetectionManager:
             # ========== 无检测完成 ==========
             info(f'无检测处理完成 | {camera_name} | {filename} | '
                  f'端到端={e2e_ms:.1f}ms 推理={infer_ms:.1f}ms'
-                 f'{self._speed_detail()}')
+                 f'{self._speed_detail(getattr(result, "worker_id", None))}')
             # ========================================
 
             # ====== 无缺陷：推送原图 ======
@@ -628,7 +646,7 @@ class YOLODetectionManager:
              f'端到端={e2e_ms:.1f}ms '
              f'(排队={queue_ms:.1f} 推理={infer_ms:.1f} 后处理={analysis_ms:.1f}) | '
              f'boxes={result.total_boxes} stop={frame_stopped}'
-             f'{self._speed_detail()}')
+             f'{self._speed_detail(getattr(result, "worker_id", None))}')
         # ========================================
 
         self._perf_tracker.record(
