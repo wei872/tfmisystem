@@ -134,6 +134,28 @@ class TestSourceDoesNotLie:
         assert "只读" in body
         assert "ascontiguousarray" in body      # 解释清楚为什么不拷贝
 
+    def test_no_independent_copy_claim_anywhere_in_repo(self):
+        """全仓扫描。这句假话原先在三处各抄了一遍
+        （_to_bgr 文档字符串、Registration_callback、main_yolo 的
+        on_camera_frame / image_control），只扫单个文件会漏。
+        """
+        bad = []
+        for root, dirs, files in os.walk(ROOT):
+            dirs[:] = [d for d in dirs
+                       if d not in (".git", "docs", "__pycache__",
+                                    ".venv", "Test_Tool")]
+            for f in files:
+                if not f.endswith(".py"):
+                    continue
+                fp = os.path.join(root, f)
+                try:
+                    with open(fp, encoding="utf-8") as fh:
+                        if "独立副本" in fh.read():
+                            bad.append(os.path.relpath(fp, ROOT))
+                except (OSError, UnicodeDecodeError):
+                    continue
+        assert bad == [], f"这些地方还在声称返回独立副本: {bad}"
+
     def test_callers_copy_before_drawing(self):
         """现状安全的真正前提：所有原地绘制都先 copy。"""
         checks = [

@@ -204,7 +204,8 @@ def image_control(image, frame_info, camera_sn=""):
     因此这里只做分发：布幅检测、调试落盘、Java 推帧全部投递到线程池，
     YOLO 检测本身由 DetectionWorkerPool 内部排队消化。
 
-    :param image:      BGR / uint8 / HxWx3 的独立副本（可以安全跨线程传递）
+    :param image:      BGR / uint8 / HxWx3，只读（可以安全跨线程传递，
+                       但要原地修改必须先 copy）
     :param frame_info: CameraOperation 给出的帧信息 dict
     :param camera_sn:  相机序列号
     """
@@ -292,7 +293,9 @@ def on_camera_frame(image, frame_info):
     相机帧回调（运行在大恒 SDK 的采集线程上）。
 
     image / frame_info 由 CameraOperation 准备好：
-      - image 已经是 BGR / uint8 / HxWx3 的**独立副本**，可安全跨线程传递；
+      - image 已经是 BGR / uint8 / HxWx3，生命周期不依赖 SDK 环形缓冲
+        （gxipy 构造时已 string_at 拷成 Python bytes），可安全跨线程传递；
+        但它是**只读**的，要在上面画框/改像素必须先 copy；
       - frame_info 含 nWidth / nHeight / nFrameNum / timestamp / camera_sn 等。
 
     与旧的海康实现相比，这里不再手工做
