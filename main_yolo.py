@@ -59,7 +59,7 @@ from AnomalyDetection_Tool.output.fabric_width_service import (
     get_fabric_stats,
 )
 from AnomalyDetection_Tool.services.normal_image_saver import init_normal_saver
-from General_Tool.SpeedGuard import init_speed_guard
+from General_Tool.SpeedGuard import init_speed_guard, get_speed_guard
 from AnomalyDetection_Tool.services.WebSocketImageServer import (
     init_websocket_server,
     get_websocket_server,
@@ -699,6 +699,12 @@ def _camera_diag_provider() -> dict:
             continue
         out[f"{name}.frames"] = d.get("frame_count", 0)
         out[f"{name}.bad"] = d.get("bad_frame_count", 0)
+        # 超速守卫钳掉的帧数。**非零就意味着这台相机已经确定性漏检了**，
+        # 现场必须能一眼看到 —— 现场定的是"宁可漏检也要保护机器"，
+        # 但"漏了多少"不能是笔糊涂账。
+        spd = d.get("speed_dropped", 0)
+        if spd:
+            out[f"{name}.speed_capped"] = spd
         stream = d.get("stream") or {}
         lost = stream.get("lost")
         if lost is not None:
@@ -716,6 +722,37 @@ def _camera_diag_provider() -> dict:
         if note:
             out[f"{name}.pkt_note"] = note
     return out
+
+
+def _speed_guard_diag_provider() -> dict:
+    """把超速守卫的状态并进健康快照。
+
+    钳帧是**确定性漏检**，而现场选择的是"宁可漏检也要保护机器"。
+    选择可以做，但必须看得见：这里报出当前是否钳帧、判定用的车速、
+    钳到多少帧率、以及钳帧后布面有没有盲区、盲区多宽。
+    """
+    try:
+        sg = get_speed_guard()
+        if sg is None:
+            return {}
+        st = sg.snapshot()
+        out = {
+            "speed_guard.capping": int(bool(st["capping"])),
+            "speed_guard.speed_mpm": st["filtered_mpm"],
+            "speed_guard.cap_fps": st["cap_fps"],
+            "speed_guard.capped_frames": st["stats"]["frames_capped"],
+        }
+        if st["capping"]:
+            # 只在钳帧时报覆盖情况，正常时这些数没有意义
+            covered = st["accept_gap_mm"] <= st["frame_height_mm"]
+            out["speed_guard.coverage_ok"] = int(covered)
+            out["speed_guard.accept_gap_mm"] = st["accept_gap_mm"]
+            if not covered:
+                out["speed_guard.blind_strip_mm"] = round(
+                    st["accept_gap_mm"] - st["frame_height_mm"], 1)
+        return out
+    except Exception:
+        return {}
 
 
 def _detection_diag_provider() -> dict:
@@ -762,7 +799,8 @@ def _init_health_monitor() -> None:
         thread_warn=int(LOGGING_CONFIG.get("health_thread_warn", 0) or 0),
         pool_growth_warn_mb=float(
             LOGGING_CONFIG.get("health_pool_growth_warn_mb", 512) or 0),
-        providers=[_camera_diag_provider, _detection_diag_provider],
+        providers=[_camera_diag_provider, _detection_diag_provider,
+                   _speed_guard_diag_provider],
     )
 
 

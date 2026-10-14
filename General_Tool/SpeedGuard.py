@@ -62,6 +62,20 @@ k=2、间距 160.4 mm、完整；20.0 起变成 k=3、间距 240.7 mm、出现�
 20.0 是刀刃值 —— 理论上 k = ceil(481.3/240.67) = 2，但浮点累积会让第二帧
 落在 481.34 ms 刚好超阈值被拒。**稳妥按 ≤19 m/min 视为安全。**
 
+策略取舍（现场已确认）
+----------------------
+**宁可漏检也要保护机器。**
+
+超过临界车速后钳帧必然产生盲区，这个代价现场明确接受了，因此：
+
+  * 盲区只**告警**，不触发任何额外动作（不停机、不改变钳帧力度）；
+  * 但"漏了多少"必须看得见 —— ``speed_dropped`` 计数并进健康快照
+    （``cameraN.speed_capped``），守卫状态报成 ``speed_guard.*``。
+    接受漏检不等于可以是一笔糊涂账。
+
+钳到 ``cap_speed_mpm`` 的触发率，等于把负载精确拉回 10 m/min 的设计点
+（2.0775 帧/秒/台 × 8 台），这是已验证能长期跑的工况，所以不需要钳得更狠。
+
 三个实现前提
 ------------
 1. **判定用滑动中值，不用 Modbus 的 ``current_speed`` 原始值。**
@@ -206,11 +220,13 @@ class SpeedGuard:
                 self._blind_warned = True
                 self._stats["blind_warned"] += 1
                 warning(
-                    f"[超速守卫] 车速 {med:.2f} m/min 已超过临界值 "
+                    f"[超速守卫] 车速 {med:.2f} m/min 超过临界值 "
                     f"{self.blind_spot_mpm:.1f} m/min：钳帧后接受帧间距 "
                     f"{gap:.1f} mm > 帧高 {self.frame_height_mm:.1f} mm，"
-                    f"布面出现 {gap - self.frame_height_mm:.1f} mm 盲区"
-                    f"（漏检）。要消除盲区必须降车速或缩短触发距离。")
+                    f"布面出现 {gap - self.frame_height_mm:.1f} mm 盲区。"
+                    f"这是现场已确认的取舍（宁可漏检也要保护机器），"
+                    f"不是故障，机器保护优先。要消除盲区只有降车速或"
+                    f"缩短触发距离两条路。")
             elif gap <= self.frame_height_mm:
                 self._blind_warned = False
 

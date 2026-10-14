@@ -421,6 +421,90 @@ class TestFailOpen:
 
 
 # ======================================================================
+# §6b  策略：宁可漏检也要保护机器 —— 漏了多少必须看得见
+# ======================================================================
+class TestMissedDetectionVisibility:
+    """钳帧是确定性漏检。现场接受了这个代价，但不接受它是一笔糊涂账。"""
+
+    def test_blind_spot_does_not_stop_anything(self):
+        """盲区只告警，不改变钳帧行为、不停机。"""
+        c = _Clock()
+        g = _g(c, warn_mpm=15.0, cap_speed_mpm=10.0,
+               trigger_distance_mm=80.224, frame_height_mm=193.05)
+        g.update(42.0)
+        g._measured_gap_sec = 0.573             # 实测 k=5，有盲区
+        g.update(42.0)
+        assert g.snapshot()["stats"]["blind_warned"] == 1
+        # 钳帧力度不变：仍然是 481.3 ms 一个间隔
+        assert g.cap_interval_sec * 1000 == pytest.approx(481.3, abs=0.5)
+        # 且仍然在收图，没有一丢了之
+        c.adv(1.0)
+        assert g.should_drop("camera1") is False
+
+    def test_guard_never_gives_up_at_extreme_speed(self):
+        """再快的车速也照钳不误，不存在"太快就放弃"的分支。"""
+        c = _Clock()
+        g = _g(c, warn_mpm=15.0, cap_speed_mpm=10.0,
+               trigger_distance_mm=80.224)
+        for v in (100.0, 500.0, 2000.0):
+            g.update(v)
+            assert g.snapshot()["capping"] is True
+            # 进入/继续钳帧后的第一帧要收（配额窗口刚重置），紧接着的必须被钳
+            assert g.should_drop("camera1") is False
+            c.adv(0.1)                          # 100 ms << 481 ms
+            assert g.should_drop("camera1") is True
+            c.adv(0.5)
+
+    @pytest.fixture()
+    def wired(self):
+        import fake_galaxy_sdk
+        fake_galaxy_sdk.install()
+        import main_yolo
+        return main_yolo
+
+    def test_provider_reports_capping_and_blind_strip(self, wired):
+        g = init_speed_guard(warn_mpm=15.0, cap_speed_mpm=10.0,
+                             trigger_distance_mm=80.224,
+                             frame_height_mm=193.05, window=1)
+        g.update(42.0)
+        g._measured_gap_sec = 0.573
+        g.update(42.0)
+        out = wired._speed_guard_diag_provider()
+        assert out["speed_guard.capping"] == 1
+        assert out["speed_guard.speed_mpm"] == 42.0
+        assert out["speed_guard.coverage_ok"] == 0
+        assert out["speed_guard.blind_strip_mm"] > 0
+
+    def test_provider_hides_coverage_when_not_capping(self, wired):
+        g = init_speed_guard(warn_mpm=15.0, window=1)
+        g.update(10.0)
+        out = wired._speed_guard_diag_provider()
+        assert out["speed_guard.capping"] == 0
+        assert "speed_guard.coverage_ok" not in out
+        assert "speed_guard.blind_strip_mm" not in out
+
+    def test_provider_is_empty_before_init(self, wired):
+        import General_Tool.SpeedGuard as SG
+        SG._guard = None
+        assert wired._speed_guard_diag_provider() == {}
+
+    def test_provider_is_registered_in_the_health_monitor(self):
+        with open(os.path.join(ROOT, "main_yolo.py"), encoding="utf-8") as f:
+            src = f.read()
+        assert "_speed_guard_diag_provider" in src
+        seg = src[src.index("providers=["):]
+        assert "_speed_guard_diag_provider" in seg[:200], "没注册进健康快照"
+
+    def test_per_camera_capped_count_reaches_the_snapshot(self):
+        with open(os.path.join(ROOT, "main_yolo.py"), encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("def _camera_diag_provider"):
+                   src.index("def _speed_guard_diag_provider")]
+        assert 'd.get("speed_dropped"' in body
+        assert "speed_capped" in body
+
+
+# ======================================================================
 # §7  配置与接线
 # ======================================================================
 class TestConfigAndWiring:
