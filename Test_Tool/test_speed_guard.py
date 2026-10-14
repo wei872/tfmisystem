@@ -522,6 +522,31 @@ class TestConfigAndWiring:
         assert float(sg["cap_speed_mpm"]) == 10.0
         assert int(sg["window"]) >= 3
 
+    def test_warn_threshold_is_a_tolerance_band_above_design_speed(self, cfg):
+        """机器实际运行速度就是 10 m/min，15 是它的 1.5 倍容差带。
+
+        钉住这层关系：有人提过把 warn_mpm 降到 10，那等于把**正常运行**
+        也钳了 —— 是错的。cap_speed_mpm 必须等于机器设计运行速度，
+        warn_mpm 必须严格高于它。
+        """
+        sg = cfg["speed_guard"]
+        cap = float(sg["cap_speed_mpm"])
+        warn = float(sg["warn_mpm"])
+        assert cap == 10.0, "cap_speed_mpm 就是机器的实际运行速度"
+        assert warn > cap, "阈值必须高于设计速度，否则正常运行也会被钳"
+        assert warn == pytest.approx(cap * 1.5), \
+            "warn_mpm 是设计速度的 1.5 倍容差带，不是任意阈值"
+
+    def test_blind_spot_needs_double_the_design_speed(self, cfg):
+        """盲区临界 = 2 x 设计速度。正常运行不该到，到了说明速度异常。"""
+        sg = cfg["speed_guard"]
+        g = SpeedGuard(cap_speed_mpm=float(sg["cap_speed_mpm"]),
+                       trigger_distance_mm=float(sg["trigger_distance_mm"]),
+                       frame_height_mm=float(sg["frame_height_mm"]),
+                       window=1, min_samples=1)
+        assert g.blind_spot_mpm == pytest.approx(
+            2 * float(sg["cap_speed_mpm"]), abs=1e-6)
+
     def test_config_trigger_distance_matches_plc(self, cfg):
         """两处触发距离必须一致，否则钳出来的帧率是错的。"""
         sg = cfg["speed_guard"]

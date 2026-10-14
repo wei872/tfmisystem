@@ -1264,8 +1264,15 @@ normal_image_save:
 #
 speed_guard:
   enabled: true
-  warn_mpm: 15.0             # 超过即进入钳帧模式
-  cap_speed_mpm: 10.0        # 钳到该车速对应的触发率
+  # 机器实际运行速度就是 10 m/min。所以下面两个数的含义是：
+  #   cap_speed_mpm = 10.0 就是"按正常运行速度收图"，钳帧 = 回到正常工况；
+  #   warn_mpm = 15.0 是**设计速度的 1.5 倍**，一个刻意放宽的容差带 ——
+  #     留出余量是为了不被测速抖动和加减速瞬态误触发。不是可以随手往下压
+  #     的任意阈值（有人提过降到 10，是错的：那等于把正常运行也钳了）。
+  # 超过 15 已属异常；超过 20 出现盲区，而 20 是设计速度的 2 倍，
+  # 正常运行根本不该到 —— 所以盲区告警同时也是"机器跑飞了"的信号。
+  warn_mpm: 15.0             # = 设计速度 10 的 1.5 倍，容差上限
+  cap_speed_mpm: 10.0        # = 机器实际运行速度，钳帧即回到正常工况
   trigger_distance_mm: 80.224  # = plc.trigger_distance_mm x scaling_factor
   frame_height_mm: 193.05    # = 2048 px x (real_width_cm 23 / 2440 px) x 10
   window: 5                  # 中值窗口样本数
