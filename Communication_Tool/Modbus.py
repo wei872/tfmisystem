@@ -31,6 +31,7 @@ S7-200 SMART 编码器触发控制系统
 """
 import threading
 from General_Tool.RunningSystemRegistry import set_running_system
+from General_Tool.SpeedGuard import get_speed_guard as _get_speed_guard
 from Camera_Tool import CameraRegistry  #  新增：相机触发源统一调度
 import asyncio
 from pymodbus.client import ModbusTcpClient
@@ -424,6 +425,18 @@ class MotionController:
 
         #  m/min                        mm        ms
         self.current_speed = abs(distance_delta / dt * 60)
+
+        # —— 超速守卫：把速度喂给守卫（它内部做中值滤波，不用这个原始值判定）——
+        # 放在这里而不是让守卫自己读 current_speed，是为了让守卫只依赖"有一个
+        # 新样本"这件事，不关心测速是怎么算出来的。整体兜死：守卫出问题
+        # 绝不能影响测速主流程。
+        try:
+            _sg = _get_speed_guard()
+            if _sg is not None:
+                _sg.update(self.current_speed)
+        except Exception:
+            pass
+
         # 更新速度历史
         if self.current_speed != 0:
             self.speed_history.append(self.current_speed)

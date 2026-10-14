@@ -51,6 +51,7 @@ import cv2
 
 import gxipy as gx
 
+from General_Tool.SpeedGuard import get_speed_guard as _get_speed_guard
 from General_Tool.EnhancedLogger import info, error, warning
 from Camera_Tool import CameraRegistry
 
@@ -391,6 +392,8 @@ class CameraOperation:
         self._diag_bad_frame_count = 0
         self._diag_convert_error_count = 0
         self._diag_callback_error_count = 0
+        # 【五】超速守卫钳掉的帧数（未超速时恒为 0）
+        self._diag_speed_dropped = 0
         self._diag_last_frame_time = 0.0
         # ---- GigE 包长实测结果（get_diag_info() 可查）----
         self._diag_link_mtu = 0            # 探测到的本机网卡 MTU，0=未知
@@ -845,6 +848,21 @@ class CameraOperation:
             except Exception:
                 pass
 
+            # —— 【五】超速守卫：闸门必须在 _to_bgr **之前** ——
+            # 现有唯一的丢帧保护在 worker_pool.submit() 里，那时 15 MB 已经
+            # 分配、Bayer 已经转完（约 2.6 ms），最贵的部分已经付过钱了。
+            # 只有在这里丢才真的省下开销。
+            # 未超速时 should_drop 只是一次 bool 判断，零成本；超速时按
+            # **本相机**限流到 cap_speed 对应的触发率。整体兜死，
+            # 绝不让它影响取流。
+            try:
+                _sg = _get_speed_guard()
+                if _sg is not None and _sg.should_drop(self.camera_name):
+                    self._diag_speed_dropped += 1
+                    return
+            except Exception:
+                pass
+
             image = self._to_bgr(raw_image)
             if image is None:
                 return
@@ -1119,6 +1137,7 @@ class CameraOperation:
             "frame_count": self._diag_frame_count,
             "bad_frame_count": self._diag_bad_frame_count,
             "convert_error_count": self._diag_convert_error_count,
+            "speed_dropped": self._diag_speed_dropped,
             "callback_error_count": self._diag_callback_error_count,
             "last_frame_time": self._diag_last_frame_time,
             # GigE 包长实测结果：packet_size_applied 与 link_mtu 不匹配、

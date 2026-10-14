@@ -47,6 +47,7 @@ from AnomalyDetection_Tool.config.settings import (
     FABRIC_WIDTH_CONFIG, CAMERA_SN_MAP, CAMERA_ACQ_CONFIG,
     SAVE_PATH, SEAVEIMAGE, PUSH,
     NORMAL_IMAGE_SAVE,
+    SPEED_GUARD,
     PLC_CONFIG, WEBSOCKET_CONFIG, LOGGING_CONFIG, CONCURRENCY_CONFIG,
     DEBUG_CONFIG,
 )
@@ -58,6 +59,7 @@ from AnomalyDetection_Tool.output.fabric_width_service import (
     get_fabric_stats,
 )
 from AnomalyDetection_Tool.services.normal_image_saver import init_normal_saver
+from General_Tool.SpeedGuard import init_speed_guard
 from AnomalyDetection_Tool.services.WebSocketImageServer import (
     init_websocket_server,
     get_websocket_server,
@@ -1219,6 +1221,33 @@ def main() -> int:
         preview_max_width=int(WEBSOCKET_CONFIG.get("preview_max_width", 960)),
         jpeg_quality=int(WEBSOCKET_CONFIG.get("jpeg_quality", 70)),
     )
+
+    # —— 【五】超速守卫 ——
+    try:
+        _sg_cfg = SPEED_GUARD
+        if bool(_sg_cfg.get("enabled", False)):
+            _sg = init_speed_guard(
+                warn_mpm=float(_sg_cfg.get("warn_mpm", 15.0)),
+                cap_speed_mpm=float(_sg_cfg.get("cap_speed_mpm", 10.0)),
+                trigger_distance_mm=float(
+                    _sg_cfg.get("trigger_distance_mm", 80.224)),
+                frame_height_mm=float(_sg_cfg.get("frame_height_mm", 193.05)),
+                window=int(_sg_cfg.get("window", 5)),
+                hysteresis=float(_sg_cfg.get("hysteresis", 0.9)),
+            )
+            # 触发距离必须和 plc 段一致，否则钳出来的帧率是错的。
+            # 这里只做校验和告警，不自动改 —— 两个数分属不同模块，
+            # 静默覆盖会让现场排查时看到的配置和实际生效的不一致。
+            _plc_td = float(PLC_CONFIG.get("trigger_distance_mm", 102)) * \
+                float(PLC_CONFIG.get("scaling_factor", 0.78651))
+            if abs(_plc_td - _sg.trigger_distance_mm) > 0.5:
+                warning(f"[超速守卫] trigger_distance_mm="
+                        f"{_sg.trigger_distance_mm:.3f} 与 plc 段算出的 "
+                        f"{_plc_td:.3f} 不一致，钳帧间隔会偏。请对齐 config.yaml。")
+        else:
+            info("[超速守卫] 已在 config.yaml 关闭（speed_guard.enabled=false）")
+    except Exception as e:
+        error(f"[超速守卫] 初始化失败，功能不可用（不影响检测）: {e}")
 
     # —— 【四】正常图片定时保存：只待命，等前端下发窗口 ——
     try:
