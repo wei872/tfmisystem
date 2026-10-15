@@ -46,6 +46,8 @@ from AnomalyDetection_Tool.analysis.warp_density_detector import (
 )
 from AnomalyDetection_Tool.analysis.weft_skew_analyzer import WeftDetector
 from AnomalyDetection_Tool.utils.time_utils import now_str
+from AnomalyDetection_Tool.filter.multiline_edge_learner import (
+    get_multiline_learner)
 
 from AnomalyDetection_Tool.core.warp_weft_analysis_cache import WarpCache, WeftCache
 from AnomalyDetection_Tool.core.warp_weft_analysis_tasks import AnalysisTasks
@@ -640,7 +642,24 @@ class DetectionPipeline:
             # 置信度过滤（按相机取生效阈值，未配覆盖的相机走全局值）
             thr = self.threshold_config.get_threshold(
                 box.class_name, box.class_id, camera_name)
-            if float(box.confidence) < float(thr):
+
+            # 【六】多股线边缘区自学习：学习期对目标相机**临时**降阈值，
+            # 把"够不到正常阈值"的布边检出也捞进来，交给学习器判定。
+            # threshold_used 仍记**正常**阈值 —— 下游靠它区分"真检出"和
+            # "只因临时降阈值才存在的框"，后者不能保存/上传。
+            # 整体兜死：学习器出任何问题都退回正常阈值。
+            gate = thr
+            try:
+                _ml = get_multiline_learner()
+                if _ml is not None:
+                    _lt = _ml.learning_threshold_for(camera_name,
+                                                     box.class_name)
+                    if _lt is not None:
+                        gate = min(float(thr), float(_lt))
+            except Exception:
+                pass
+
+            if float(box.confidence) < float(gate):
                 f_thr += 1
                 continue
 

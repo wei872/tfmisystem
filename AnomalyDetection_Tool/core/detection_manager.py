@@ -56,6 +56,8 @@ from AnomalyDetection_Tool.services.comm_service import comm_service
 from AnomalyDetection_Tool.stats.performance_tracker import (
     PerformanceTracker,
 )
+from AnomalyDetection_Tool.filter.multiline_edge_learner import (
+    get_multiline_learner)
 from AnomalyDetection_Tool.filter.vertical_line_filter import (
     VerticalLineFilter,
 )
@@ -551,6 +553,41 @@ class YOLODetectionManager:
                         capture_delay, queue_wait, yolo_time,
                         0.0, time.time() - t_post_start)
                     return
+
+        # ---- 【六】多股线边缘区自学习 ----
+        # 两件事，都只针对目标相机的目标类：
+        #   1) 学习期：边带内的框只记录不报出；边带外的低置信度框直接丢弃
+        #      （它们只是因为临时降阈值才存在的噪声）。
+        #   2) 本卷已学成过滤区：落在区里的多股线一律滤掉。
+        # 放在面积分析**之前**：被滤掉的框不该进停机判定、不该存图、
+        # 不该上传。整体兜死：这条路径出问题绝不能影响检测主流程。
+        try:
+            _ml = get_multiline_learner()
+            if _ml is not None and result.boxes:
+                _ml.check_distance()          # 米长够了就地结算窗口
+                keep = []
+                for b in result.boxes:
+                    if _ml.should_filter(camera_name, b.class_name,
+                                         b.x1, b.x2):
+                        continue
+                    if _ml.observe(camera_name, b.class_name, b.x1, b.x2,
+                                   b.confidence,
+                                   getattr(b, "threshold_used", 0.0) or 0.0):
+                        continue
+                    keep.append(b)
+                if len(keep) != len(result.boxes):
+                    result.boxes = keep
+                    result.total_boxes = len(keep)
+                    result.has_detection = result.total_boxes > 0
+                    result.max_confidence = max(
+                        (b.confidence for b in keep), default=0)
+                    if not result.has_detection:
+                        self._perf_tracker.record(
+                            capture_delay, queue_wait, yolo_time,
+                            0.0, time.time() - t_post_start)
+                        return
+        except Exception as e:
+            error(f"[多股线学习] {camera_name} | {filename} | 异常，已跳过: {e}")
 
         # 面积分析
         t_analysis_start = time.time()

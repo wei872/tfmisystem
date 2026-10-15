@@ -1080,12 +1080,17 @@ class TestPerCameraRepeatOverride:
         import yaml
         with open(os.path.join(_ROOT, "config.yaml"), encoding="utf-8") as f:
             text = f.read()
+        # 只扫【三】这一段本身。原来写的是到 "heatmap:" 为止，
+        # 但【四】正常图保存 /【五】超速守卫 /【六】多股线学习 都插在
+        # 这中间，它们各自会提到自己的相机（比如【六】的 camera2/camera7），
+        # 与重复停机白名单无关，扫进来就是误报。
         seg = text[text.index("# 【三】停机 · 重复触发"):
-                   text.index("heatmap:")]
+                   text.index("# 【四】正常图片定时保存")]
         allowed = set(yaml.safe_load(text)["repeat_stop_rules"]
                       ["stop_allowed_cameras"])
         mentioned = set(re.findall(r"camera\d", seg))
         bad = mentioned - allowed
+        assert "# 【四】" in text, "锚点段标题变了，扫描边界要跟着改"
         assert not bad, (
             f"注释里举了白名单外的相机 {sorted(bad)} 作为覆盖示例，"
             f"照着配是死配置。白名单={sorted(allowed)}")

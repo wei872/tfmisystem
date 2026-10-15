@@ -718,6 +718,9 @@ NORMAL_IMAGE_SAVE = _LiveDict("normal_image_save", {})
 # 判定用滑动中值，不用 Modbus 的 current_speed 原始值（那个会尖峰）。
 SPEED_GUARD = _LiveDict("speed_guard", {})
 
+# 【六】多股线边缘区自学习（见 config.yaml 同名段的注释）
+MULTILINE_EDGE_LEARNING = _LiveDict("multiline_edge_learning", {})
+
 # 标量无法就地更新（Python 的数字是不可变对象，import 拿到的是值的副本），
 # 因此对外提供访问器；模块级常量保留为启动时快照，仅供兼容旧调用点。
 DEFAULT_CLASS_CONFIDENCE = _get("default_class_confidence", 0.1)

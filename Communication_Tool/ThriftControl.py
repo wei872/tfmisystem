@@ -51,6 +51,30 @@ def _fire_start_callbacks() -> None:
         except Exception as e:
             error(f"[Thrift] \"开始\"事件回调异常: {e}")
 
+
+# ==================== "停止"事件回调 ====================
+# 与"开始"对称。【六】多股线边缘区自学习靠它结算本卷的学习窗口：
+# 前端点「停止」意味着这块布走完了，窗口必须就地关闭并生成过滤区，
+# 否则要一直等到下一卷「开始」才结算，中间那段会用着半截数据。
+_on_stop_callbacks: list = []
+_on_stop_lock = threading.Lock()
+
+
+def register_on_stop(cb) -> None:
+    """注册一个在收到前端"停止"指令时执行的回调（无参，可阻塞）。"""
+    with _on_stop_lock:
+        _on_stop_callbacks.append(cb)
+
+
+def _fire_stop_callbacks() -> None:
+    with _on_stop_lock:
+        callbacks = list(_on_stop_callbacks)
+    for cb in callbacks:
+        try:
+            cb()
+        except Exception as e:
+            error(f"[Thrift] \"停止\"事件回调异常: {e}")
+
 # 兼容旧代码的直接访问变量
 is_stop = False
 # local_IP_ADDRESS = '192.168.123.69'
@@ -147,6 +171,11 @@ def setIsStop(value: bool, status: str, user: str = "Python") -> bool:
         PCL_reset()  # 完全重置(距离+触发次数归零)
         if status == "开始":
             _fire_start_callbacks()   # 通知外部开启新批次（例如刷新 launch_tag 重建批次目录）
+        elif status == "停止":
+            # 必须在 PCL_reset() 之后触发：reset 会把累计距离归零，
+            # 而回调里的结算逻辑读的是归零前的米长。这里只关窗口、
+            # 结算已经收集到的样本，不再读距离，所以顺序是安全的。
+            _fire_stop_callbacks()
     elif status == "Auto恢复":
         PCL_reset(reset_distance=False)  # 仅复位PLC触发状态，保留距离
         info(f"[系统] ▶ 速度恢复，自动继续检测")
