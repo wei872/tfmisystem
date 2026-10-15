@@ -61,8 +61,8 @@ from AnomalyDetection_Tool.output.fabric_width_service import (
 )
 from AnomalyDetection_Tool.services.normal_image_saver import init_normal_saver
 from General_Tool.SpeedGuard import init_speed_guard, get_speed_guard
-from AnomalyDetection_Tool.filter.multiline_edge_learner import (
-    init_multiline_learner)
+from AnomalyDetection_Tool.filter.edge_region_learner import (
+    init_edge_learner)
 from AnomalyDetection_Tool.output.encoder_state_service import (
     get_encoder_state)
 from AnomalyDetection_Tool.services.WebSocketImageServer import (
@@ -1292,57 +1292,66 @@ def main() -> int:
     except Exception as e:
         error(f"[超速守卫] 初始化失败，功能不可用（不影响检测）: {e}")
 
-    # —— 【六】多股线边缘区自学习 ——
+    # —— 【六】边缘区自学习 ——
     # 窗口起点有两个：前端「开始」和程序启动。这里先把程序启动这一次
     # 开出来 —— 现场可能不点「开始」就直接开机跑，那种情况下第一卷
-    # 也得能学。之后每次「开始」会重新开窗并清掉上一卷的区域。
+    # 也得能学。之后每次「开始」会重新开窗并清掉上一卷的生效区。
     try:
-        _ml_cfg = MULTILINE_EDGE_LEARNING
-        if bool(_ml_cfg.get("enabled", False)):
+        _er_cfg = MULTILINE_EDGE_LEARNING
+        if bool(_er_cfg.get("enabled", False)):
             # 三态：键不存在=用默认 camera2/camera7；配成空的 {}=显式禁用。
-            # 不能写 `_ml_cfg.get("targets") or None` —— 那会把"显式禁用"
+            # 不能写 `_er_cfg.get("targets") or None` —— 那会把"显式禁用"
             # 变成"回落到默认"，现场想关掉这个功能反而关不掉。
-            _targets = _ml_cfg.get("targets", None)
+            _targets = _er_cfg.get("targets", None)
             if _targets is not None and not isinstance(_targets, dict):
-                warning(f"[多股线学习] targets={_targets!r} 不是字典，"
+                warning(f"[边缘区学习] targets={_targets!r} 不是字典，"
                         f"已按未配置处理（用默认）")
                 _targets = None
-            _ml = init_multiline_learner(
+            # 类别也走三态；配置里是列表，以后加类别只改配置不改代码。
+            _classes = _er_cfg.get("target_classes", None)
+            if _classes is not None and not isinstance(_classes, (list, tuple)):
+                warning(f"[边缘区学习] target_classes={_classes!r} 不是列表，"
+                        f"已按未配置处理（用默认）")
+                _classes = None
+            _el = init_edge_learner(
                 targets=_targets,
-                target_class=str(_ml_cfg.get("target_class", "多股线")),
+                target_classes=_classes,
                 learning_threshold=float(
-                    _ml_cfg.get("learning_threshold", 0.1)),
+                    _er_cfg.get("learning_threshold", 0.1)),
                 window_length_mm=float(
-                    _ml_cfg.get("window_length_mm", 10000)),
-                count_threshold=int(_ml_cfg.get("count_threshold", 5)),
+                    _er_cfg.get("window_length_mm", 10000)),
+                count_threshold=int(_er_cfg.get("count_threshold", 5)),
                 region_padding_px=int(
-                    _ml_cfg.get("region_padding_px", 50)),
-                image_width_px=int(_ml_cfg.get("image_width_px", 2440)),
+                    _er_cfg.get("region_padding_px", 50)),
+                image_width_px=int(_er_cfg.get("image_width_px", 2440)),
                 distance_provider=lambda: get_encoder_state().cumulative_distance,
             )
-            if not _ml.targets:
-                warning("[多股线学习] targets 配置无效，功能不生效")
+            if not _el.targets or not _el.target_classes:
+                warning("[边缘区学习] targets / target_classes 配置无效，"
+                        "功能不生效")
             else:
-                # 「开始」开新窗、「停止」结算本卷
                 # 用限定名：main_yolo 只 from ThriftControl 导入了
                 # PythonJavaClient / start_python_server，其余一律走
                 # Communication_Tool.ThriftControl.xxx（与 :613 一致）。
+                #
+                # 「开始」= 新一卷，开窗重学；
+                # 「停止」= 这批布结束，**只清场不结算** —— 学习期是否结束
+                # 只由 10 m 米长判断，不能拿半截数据凑生效区。
                 Communication_Tool.ThriftControl.register_on_start(
-                    lambda: _ml.begin_window("前端开始"))
+                    lambda: _el.begin_window("前端开始"))
                 Communication_Tool.ThriftControl.register_on_stop(
-                    lambda: _ml.end_window("前端停止"))
-                _ml.begin_window("程序启动")
-                info(f"[多股线学习] 已就绪：{_ml.target_class} "
-                     f"学习阈值 {_ml.learning_threshold}，窗口 "
-                     f"{_ml.window_length_mm / 1000:.1f} m，"
-                     f"记录数 > {_ml.count_threshold} 生成区域，"
-                     f"目标 {_ml.targets}")
+                    lambda: _el.end_roll("前端停止"))
+                _el.begin_window("程序启动")
+                info(f"[边缘区学习] 已就绪：类别 {list(_el.target_classes)}，"
+                     f"学习阈值 {_el.learning_threshold}，学习长度 "
+                     f"{_el.window_length_mm / 1000:.1f} m，"
+                     f"采样数 > {_el.count_threshold} 生成生效区，"
+                     f"学习区 {_el.targets}")
         else:
-            info("[多股线学习] 已在 config.yaml 关闭"
+            info("[边缘区学习] 已在 config.yaml 关闭"
                  "（multiline_edge_learning.enabled=false）")
     except Exception as e:
-        error(f"[多股线学习] 初始化失败，功能不可用（不影响检测）: {e}")
-
+        error(f"[边缘区学习] 初始化失败，功能不可用（不影响检测）: {e}")
     # —— 【四】正常图片定时保存：只待命，等前端下发窗口 ——
     try:
         _nis = NORMAL_IMAGE_SAVE

@@ -56,8 +56,8 @@ from AnomalyDetection_Tool.services.comm_service import comm_service
 from AnomalyDetection_Tool.stats.performance_tracker import (
     PerformanceTracker,
 )
-from AnomalyDetection_Tool.filter.multiline_edge_learner import (
-    get_multiline_learner)
+from AnomalyDetection_Tool.filter.edge_region_learner import (
+    get_edge_learner)
 from AnomalyDetection_Tool.filter.vertical_line_filter import (
     VerticalLineFilter,
 )
@@ -554,25 +554,24 @@ class YOLODetectionManager:
                         0.0, time.time() - t_post_start)
                     return
 
-        # ---- 【六】多股线边缘区自学习 ----
-        # 两件事，都只针对目标相机的目标类：
-        #   1) 学习期：边带内的框只记录不报出；边带外的低置信度框直接丢弃
-        #      （它们只是因为临时降阈值才存在的噪声）。
-        #   2) 本卷已学成过滤区：落在区里的多股线一律滤掉。
+        # ---- 【六】边缘区自学习 ----
+        # 两件事，都**按 (相机, 类别)** 分别处理：
+        #   1) 学习期：落在学习区内的目标类框只记录、不保存、不上传。
+        #      区外的框用的是正常阈值，是真检出，照常放行。
+        #   2) 本卷已算出生效区：落在生效区内的**该类**框一律滤掉。
+        #      生效区按类存，绝不会拿多股线的布边去屏蔽别的疵点。
         # 放在面积分析**之前**：被滤掉的框不该进停机判定、不该存图、
         # 不该上传。整体兜死：这条路径出问题绝不能影响检测主流程。
         try:
-            _ml = get_multiline_learner()
-            if _ml is not None and result.boxes:
-                _ml.check_distance()          # 米长够了就地结算窗口
+            _el = get_edge_learner()
+            if _el is not None and result.boxes:
+                _el.check_distance()          # 米长到点就地结算学习期
                 keep = []
                 for b in result.boxes:
-                    if _ml.should_filter(camera_name, b.class_name,
+                    if _el.should_filter(camera_name, b.class_name,
                                          b.x1, b.x2):
                         continue
-                    if _ml.observe(camera_name, b.class_name, b.x1, b.x2,
-                                   b.confidence,
-                                   getattr(b, "threshold_used", 0.0) or 0.0):
+                    if _el.observe(camera_name, b.class_name, b.x1, b.x2):
                         continue
                     keep.append(b)
                 if len(keep) != len(result.boxes):
@@ -587,7 +586,7 @@ class YOLODetectionManager:
                             0.0, time.time() - t_post_start)
                         return
         except Exception as e:
-            error(f"[多股线学习] {camera_name} | {filename} | 异常，已跳过: {e}")
+            error(f"[边缘区学习] {camera_name} | {filename} | 异常，已跳过: {e}")
 
         # 面积分析
         t_analysis_start = time.time()

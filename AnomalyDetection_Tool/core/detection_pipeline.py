@@ -46,8 +46,8 @@ from AnomalyDetection_Tool.analysis.warp_density_detector import (
 )
 from AnomalyDetection_Tool.analysis.weft_skew_analyzer import WeftDetector
 from AnomalyDetection_Tool.utils.time_utils import now_str
-from AnomalyDetection_Tool.filter.multiline_edge_learner import (
-    get_multiline_learner)
+from AnomalyDetection_Tool.filter.edge_region_learner import (
+    get_edge_learner)
 
 from AnomalyDetection_Tool.core.warp_weft_analysis_cache import WarpCache, WeftCache
 from AnomalyDetection_Tool.core.warp_weft_analysis_tasks import AnalysisTasks
@@ -643,17 +643,23 @@ class DetectionPipeline:
             thr = self.threshold_config.get_threshold(
                 box.class_name, box.class_id, camera_name)
 
-            # 【六】多股线边缘区自学习：学习期对目标相机**临时**降阈值，
-            # 把"够不到正常阈值"的布边检出也捞进来，交给学习器判定。
-            # threshold_used 仍记**正常**阈值 —— 下游靠它区分"真检出"和
-            # "只因临时降阈值才存在的框"，后者不能保存/上传。
+            # 【六】边缘区自学习：学习期**只在学习区内**临时降阈值，
+            # 把"够不到正常阈值"的布边检出也捞进来采样。
+            #
+            # 降阈值必须限定在学习区（camera2 右 350 px / camera7 左 350 px）
+            # 内：区外照旧用正常阈值。第一版把整台相机都降了，结果区外冒出
+            # 一堆 0.1~0.65 的噪声框，只能再加一条"区外低置信度也丢掉"的
+            # 补救规则 —— 那是把两个问题搅在一起。区外不降阈值，就根本不会
+            # 产生那种框，也就不需要任何补救规则。
+            #
+            # threshold_used 仍记**正常**阈值，语义是"这个类本该用的阈值"。
             # 整体兜死：学习器出任何问题都退回正常阈值。
             gate = thr
             try:
-                _ml = get_multiline_learner()
-                if _ml is not None:
-                    _lt = _ml.learning_threshold_for(camera_name,
-                                                     box.class_name)
+                _el = get_edge_learner()
+                if _el is not None:
+                    _lt = _el.learning_threshold_for(
+                        camera_name, box.class_name, box.x1, box.x2)
                     if _lt is not None:
                         gate = min(float(thr), float(_lt))
             except Exception:
