@@ -704,6 +704,21 @@ def _camera_diag_provider() -> dict:
             continue
         out[f"{name}.frames"] = d.get("frame_count", 0)
         out[f"{name}.bad"] = d.get("bad_frame_count", 0)
+        # 距上一次出图多少秒（-1 = 这台相机从未出过图）。
+        # **这是判断"相机还在不在出图"最直接的指标**：frames 是累计值，
+        # 要跨两条心跳相减才知道涨没涨；frame_age_s 是瞬时值，一条心跳
+        # 就能看出这台相机是不是已经断了。
+        #
+        # 为什么必须加：现场排查过一次"突然没有图片进来"，Modbus 侧
+        # [触发] 日志一路正常、速度正常、触发源仍是 Line0，但 8 台相机的
+        # frames 同时冻结在 712。断点在 PLC→Line0→相机 这一段，Python 侧
+        # 完全健康（submitted/processed 同步增长、零丢帧）。
+        # 而 [触发] 第 N 次 那条日志**只代表 send_trigger() 这个 Modbus 写
+        # 成功了**（写 VW4=1），不代表 PLC 真的脉冲了 Line0、更不代表相机
+        # 真的曝光出图 —— 只看它会误判成"相机在出图"。
+        _lft = d.get("last_frame_time", 0.0) or 0.0
+        out[f"{name}.frame_age_s"] = (round(time.time() - _lft, 1)
+                                      if _lft > 0 else -1.0)
         # 超速守卫钳掉的帧数。**非零就意味着这台相机已经确定性漏检了**，
         # 现场必须能一眼看到 —— 现场定的是"宁可漏检也要保护机器"，
         # 但"漏了多少"不能是笔糊涂账。
