@@ -41,9 +41,17 @@ import aiohttp
 from Communication_Tool.http_client import get_base_url
 from General_Tool.EnhancedLogger import info, warning, error
 
-# 接口路径。注意是 /api/v1/... —— 拼在 api_base_url（已含 /api）之后
-# 会得到 /api/api/v1/...，这与后端实际暴露的地址一致。
-API_PATH = "/api/v1/defect/material/current-config"
+# 接口路径。**不要再把 /api 写进来。**
+#
+# get_api_base_url() 返回的基址已经含 api_base_path（现场是 "/api"），
+# 所以这里写 "/v1/..." 拼出来才是 .../api/v1/...。
+#
+# 第一版这里写的是 "/api/v1/..."，拼出 .../api/api/v1/...，现场直接 404：
+#   {"status":404,"path":"/api/api/v1/defect/material/current-config"}
+# 当时的理由是"接口文档给的地址带 /api/v1"——文档给的是**完整 URL**，
+# 而这里要的是**基址之后的那一段**，两者不能混。
+# 仓库里其他调用点也是这个惯例："/image/upload"、"/v1/defect/log/size"。
+API_PATH = "/v1/defect/material/current-config"
 
 # 视为成功的 code。后端各接口的约定不完全一致，这里从宽。
 _OK_CODES = {0, 200, "0", "200", "SUCCESS", "success", "OK", "ok"}

@@ -405,10 +405,27 @@ class TestWiring:
         from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
         assert MATERIAL_CONFIG.get("enabled") is True
 
-    def test_api_path_matches_the_spec(self):
-        """拼在 api_base_url（已含 /api）之后 => /api/api/v1/...，
-        与现场实际暴露的地址一致。"""
-        assert API_PATH == "/api/v1/defect/material/current-config"
+    def test_api_path_does_not_repeat_the_base_prefix(self):
+        """API_PATH 是**基址之后**的那一段，不能再带 /api。
+
+        第一版写成 "/api/v1/..."，与已含 /api 的基址拼出 /api/api/v1/...，
+        现场直接 404。接口文档给的是完整 URL，这里要的是相对段，两者不能混。
+        """
+        assert API_PATH == "/v1/defect/material/current-config"
+        assert not API_PATH.startswith("/api/"), \
+            "基址已含 api_base_path(/api)，这里再写 /api 会拼成 /api/api/..."
+
+    def test_full_url_has_exactly_one_api_prefix(self):
+        """端到端拼出来的 URL 里 /api 只能出现一次。"""
+        import Communication_Tool.http_client as HC
+        from AnomalyDetection_Tool.config.settings import get_api_base_url
+        base = get_api_base_url()
+        url = base + API_PATH
+        assert url.count("/api/") == 1, url
+        # 现场基址就是 http://host:port/api 这个形状
+        assert base.endswith("/api"), base
+        assert url.endswith("/api/v1/defect/material/current-config"), url
+        assert HC.get_base_url() == base
 
     def test_threshold_hook_is_first_step(self):
         with open(os.path.join(ROOT, "AnomalyDetection_Tool", "models",
@@ -450,8 +467,9 @@ class TestEndToEnd:
     """真实 HTTP 往返：客户端走 aiohttp，服务端用 stdlib http.server。
 
     前面所有用例都只喂 dict，绕过了"请求真的发出去了吗"这一环。
-    这一组把完整路径跑通，顺带验证 URL 拼接（/api 前缀会重复一次，
-    那是接口文档里给的路径就带 /api/v1）。
+    这一组把完整路径跑通，顺带验证 URL 拼接：基址含 /api，API_PATH 只写
+    /v1/...，拼出来 /api 只出现一次。（第一版这里拼成了 /api/api/...，
+    现场 404 —— 服务端收到的路径才是唯一可信的判据。）
     """
 
     def _serve(self, payload, status=200):
@@ -490,7 +508,8 @@ class TestEndToEnd:
 
             assert M.refresh_once(timeout=5) is True
             # 请求真的打到了服务端，且路径符合接口文档
-            assert hits and hits[0] == "/api" + M.API_PATH
+            # 服务端**实际收到**的路径才算数，不能只看本地拼的字符串
+            assert hits == ["/api/v1/defect/material/current-config"]
             # 注意：snapshot() 的 key 是拍平后的「相机/类别」字符串（诊断
             # 视图，方便打日志），不是内部的元组 key。取值要走
             # get_threshold / get_stop_rule 这两个真正的访问器。
