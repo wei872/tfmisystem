@@ -34,7 +34,7 @@ config.yaml。
 
 import asyncio
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -213,17 +213,32 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
     return thresholds, stop_rules, meta
 
 
+# 已经告警过的 (相机, 类, label)。同一个不一致每次刷新都会命中，
+# refresh_interval_sec 调小后会刷屏（8 台相机 × 每 2s 一次），所以只报第一次。
+_LABEL_WARNED: set = set()
+
+
 def _check_label(cam_id: str, name: str, label: Any) -> None:
-    """用 DEFECT_LABEL_MAP 交叉校验 defectLabel，抓后端名称对不上的情况。"""
+    """用 DEFECT_LABEL_MAP 交叉校验 defectLabel，抓后端名称对不上的情况。
+
+    同一个 (相机, 类, label) 只告警一次 —— 这是配置层面的固定不一致，
+    重复刷屏只会把真正有用的变更日志淹掉。label 变了会重新告警。
+    """
     if not label:
         return
     try:
         from AnomalyDetection_Tool.output.detection_info_formatter import (
             DEFECT_LABEL_MAP)
         expect = DEFECT_LABEL_MAP.get(name)
-        if expect is not None and str(label) != expect:
-            warning(f"[材质配置] {cam_id}/{name} 的 defectLabel={label!r} "
-                    f"与本地映射 {expect!r} 不一致，已按 defectName 应用")
+        if expect is None or str(label) == expect:
+            return
+        key = (cam_id, name, str(label))
+        if key in _LABEL_WARNED:
+            return
+        _LABEL_WARNED.add(key)
+        warning(f"[材质配置] {cam_id}/{name} 的 defectLabel={label!r} "
+                f"与本地映射 {expect!r} 不一致，已按 defectName 应用"
+                f"（同一项不再重复告警）")
     except Exception:
         pass
 
@@ -293,28 +308,132 @@ async def fetch_current_config(timeout: float = 5.0) -> Optional[dict]:
         return None
 
 
-def apply_config(data: dict) -> bool:
-    """解析并写入覆盖层。成功返回 True。
+_DIFF_MAX_LINES = 15      # 单次最多打印多少条变更明细，避免刷屏
 
-    解析失败时**不动**已有配置。
+
+def _f(v) -> str:
+    """把值格式化成短字符串，None 显示为「无」。"""
+    if v is None:
+        return "无"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def _stop_rule_diff(old: Optional[dict], new: dict) -> List[str]:
+    """比较两份停机规则，返回 ['字段 旧 -> 新', ...]。"""
+    out: List[str] = []
+    old = old or {}
+    for k in ("enabled", "min_confidence", "min_area_mm2", "trigger_mode",
+              "min_width_mm", "min_height_mm"):
+        ov, nv = old.get(k), new.get(k)
+        if k not in new:
+            continue
+        if ov != nv:
+            out.append(f"{k} {_f(ov)}->{_f(nv)}")
+    return out
+
+
+def _collect_previous(thresholds, stop_rules):
+    """取每个 (相机, 类) 在**本次应用之前**实际生效的值和它的来源。
+
+    来源判定：覆盖层里有 → 上一次后端下发的；覆盖层里没有 → 当前生效的是
+    config.yaml（全局 / 按相机覆盖）里的值。
     """
     from AnomalyDetection_Tool.config.remote_config_store import (
         get_remote_config_store)
+    store = get_remote_config_store()
+    was_empty = store.is_empty()
+    prev_thr, prev_stop, src = {}, {}, {}
+    for (cam, cls) in thresholds:
+        v = store.get_threshold(cam, cls)
+        if v is None:
+            try:
+                from AnomalyDetection_Tool.config.settings import (
+                    _camera_det_threshold)
+                v = _camera_det_threshold(cam, cls)
+                src[(cam, cls, "thr")] = "config.yaml"
+            except Exception:
+                v = None
+        else:
+            src[(cam, cls, "thr")] = "后端"
+        prev_thr[(cam, cls)] = v
+    for (cam, cls), rule in stop_rules.items():
+        r = store.get_stop_rule(cam, cls)
+        if r is None:
+            try:
+                from AnomalyDetection_Tool.config.settings import (
+                    effective_stop_rule)
+                r = effective_stop_rule(cls, cam)
+                src[(cam, cls, "stop")] = "config.yaml"
+            except Exception:
+                r = None
+        else:
+            src[(cam, cls, "stop")] = "后端"
+        prev_stop[(cam, cls)] = r
+    return prev_thr, prev_stop, src, was_empty
+
+
+def apply_config(data: dict) -> bool:
+    """解析并写入覆盖层。成功返回 True。
+
+    解析失败时**不动**已有配置，并明确打出"变更失败"以及当前仍在生效的
+    来源，避免出现"日志说拉到了、实际没生效"的黑箱。
+    """
+    from AnomalyDetection_Tool.config.remote_config_store import (
+        get_remote_config_store)
+    store = get_remote_config_store()
+
+    # 当前生效来源，用于失败时说明"仍在用什么"
+    cur_src = "config.yaml（后端从未成功下发）" if store.is_empty() else "后端数据库（上次成功的下发）"
+
     try:
         thresholds, stop_rules, meta = parse_config(data)
     except Exception as e:
-        error(f"[材质配置] 解析失败，保留上一份配置: {e}")
+        error(f"[材质配置] 变更失败：解析异常 {e}；当前仍沿用 {cur_src}")
         return False
+
     if not thresholds and not stop_rules:
-        warning("[材质配置] 解析后没有任何可用配置，保留上一份"
-                "（不会用空配置覆盖）")
+        warning(f"[材质配置] 变更失败：后端返回为空/无法解析，"
+                f"**不会**用空配置覆盖；当前仍沿用 {cur_src}")
         return False
-    get_remote_config_store().apply(thresholds, stop_rules, meta)
-    info(f"[材质配置] 已应用：白布={meta.get('clothNumber')} "
-         f"卷号={meta.get('roller')} 材质={meta.get('material')} "
-         f"规格={meta.get('specification')} "
-         f"相机={meta.get('camera_count')} 台，"
-         f"阈值 {len(thresholds)} 条 / 停机规则 {len(stop_rules)} 条")
+
+    prev_thr, prev_stop, src, was_empty = _collect_previous(
+        thresholds, stop_rules)
+
+    store.apply(thresholds, stop_rules, meta)
+
+    # ---- 算变更明细 ----
+    changes: List[str] = []
+    for (cam, cls), nv in sorted(thresholds.items()):
+        ov = prev_thr.get((cam, cls))
+        if ov is None or abs(float(ov) - float(nv)) > 1e-9:
+            changes.append(f"{cam}/{cls} 阈值 {_f(ov)}->{_f(nv)} "
+                           f"[原:{src.get((cam, cls, 'thr'), '?')}]")
+    for (cam, cls), rule in sorted(stop_rules.items()):
+        d = _stop_rule_diff(prev_stop.get((cam, cls)), rule)
+        if d:
+            changes.append(f"{cam}/{cls} 停机 " + ", ".join(d)
+                           + f" [原:{src.get((cam, cls, 'stop'), '?')}]")
+
+    head = (f"[材质配置] 变更成功（来源：后端数据库）"
+            f"白布={meta.get('clothNumber')} 卷号={meta.get('roller')} "
+            f"材质={meta.get('material')} 规格={meta.get('specification')} "
+            f"相机={meta.get('camera_count')} 台 | "
+            f"阈值 {len(thresholds)} 条 / 停机规则 {len(stop_rules)} 条 | "
+            f"生效 {len(thresholds) + len(stop_rules)} 项，"
+            f"变化 {len(changes)} 项")
+    if was_empty:
+        head += "（首次下发，此前生效的是 config.yaml）"
+
+    if not changes:
+        info(head + " —— 与当前生效值一致，无需改动")
+    else:
+        shown = changes[:_DIFF_MAX_LINES]
+        tail = (f"\n  ... 另有 {len(changes) - len(shown)} 项变化未列出"
+                if len(changes) > len(shown) else "")
+        info(head + "\n  变更明细：\n  - " + "\n  - ".join(shown) + tail)
+
     _warn_model_mismatch(meta)
     return True
 
@@ -334,6 +453,30 @@ def _warn_model_mismatch(meta: dict) -> None:
                 f"yolo.model_path={local!r} 不一致。"
                 f"**不会在运行中热切模型**（需重建各 worker 的 TensorRT "
                 f"engine），请人工确认后改配置重启。")
+
+
+def _log_source(reason: str) -> None:
+    """拉取失败时，明确打出"当前生效的是哪一份配置"。
+
+    优先级本来就是「后端数据库 > config.yaml」，但日志里如果只写"拉取失败"，
+    现场看不出此刻检测到底按哪套阈值在跑。这里把来源说清楚。
+    """
+    from AnomalyDetection_Tool.config.remote_config_store import (
+        get_remote_config_store)
+    try:
+        st = get_remote_config_store()
+        if st.is_empty():
+            info(f"[材质配置] 变更未生效（{reason}）——后端数据库为空，"
+                 f"**当前使用 config.yaml 本地配置**")
+        else:
+            snap = st.snapshot()
+            info(f"[材质配置] 变更未生效（{reason}）——继续使用"
+                 f"**后端数据库上一次成功下发的配置**"
+                 f"（阈值 {snap['threshold_count']} 条 / "
+                 f"停机规则 {snap['stop_rule_count']} 条，"
+                 f"{snap['age_sec']}s 前应用）")
+    except Exception:
+        info(f"[材质配置] 变更未生效（{reason}）")
 
 
 def refresh_once(timeout: float = 5.0) -> bool:
@@ -359,12 +502,13 @@ def refresh_once(timeout: float = 5.0) -> bool:
     t.start()
     t.join(timeout + 3)
     if t.is_alive():
-        info(f"[材质配置] 拉取超过 {timeout + 3:.0f}s 未返回，放弃本次")
+        _log_source(f"拉取超过 {timeout + 3:.0f}s 未返回")
         return False
     if box.get("e") is not None:
-        info(f"[材质配置] 拉取异常: {box['e']}")
+        _log_source(f"拉取异常 {box['e']}")
         return False
     data = box.get("d")
     if data is None:
+        _log_source("后端未返回可用配置")
         return False
     return apply_config(data)

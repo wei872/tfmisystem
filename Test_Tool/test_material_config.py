@@ -627,3 +627,139 @@ class TestRefreshOnceRobustness:
         t0 = _t.time()
         assert M.refresh_once(timeout=1) is False
         assert _t.time() - t0 < 8      # 硬超时是 timeout+3
+
+
+class TestChangeReporting:
+    """变更必须可见：由什么变更成什么、是否成功、当前生效的是哪一份。
+
+    这些日志是 EnhancedLogger 直接打的，caplog/capsys 抓不到，
+    所以统一 monkeypatch 模块级的 info/warning 来收集。
+    """
+
+    @staticmethod
+    def _collect(monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = {"info": [], "warning": [], "error": []}
+        for lvl in logs:
+            monkeypatch.setattr(M, lvl,
+                                (lambda L: lambda m: L.append(m))(logs[lvl]))
+        return logs
+
+    def _cams(self, thr=0.10, conf=0.5):
+        return {"clothNumber": "C1", "roller": "R1", "material": "1500D/2",
+                "specification": "100145",
+                "cameras": [{"cameraId": "camera2",
+                             "thresholds": [{"defectName": "多股线",
+                                             "defectLabel": "multi_line",
+                                             "thresholdValue": thr,
+                                             "status": 1}],
+                             "stopSetting": [{"name": "单根包不进",
+                                              "enabled": True,
+                                              "minConfidence": conf,
+                                              "triggerMode": "dimension",
+                                              "minWidthMm": 50,
+                                              "minHeightMm": 47}]}]}
+
+    def test_first_apply_reports_source_and_diff(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(self._cams(0.10)) is True
+        out = "\n".join(logs["info"])
+        assert "变更成功" in out
+        assert "来源：后端数据库" in out
+        assert "首次下发" in out
+        assert "此前生效的是 config.yaml" in out
+        # 明细里必须能看到"由什么变成什么"
+        assert "多股线 阈值" in out and "->0.1" in out
+        assert "[原:config.yaml]" in out
+
+    def test_no_change_does_not_repeat_details(self, monkeypatch):
+        """同样的配置再拉一次，不能再打一遍明细（否则 2s 一轮会刷屏）。"""
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self._cams(0.10))
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(self._cams(0.10)) is True
+        out = "\n".join(logs["info"])
+        assert "变化 0 项" in out
+        assert "无需改动" in out
+        assert "变更明细" not in out
+
+    def test_changed_value_shows_old_and_new(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self._cams(0.10))
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(self._cams(0.42)) is True
+        out = "\n".join(logs["info"])
+        assert "变化 1 项" in out
+        assert "多股线 阈值 0.1->0.42" in out
+        assert "[原:后端]" in out          # 上一次的值来自后端
+
+    def test_stop_rule_change_is_listed_field_by_field(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self._cams(0.10, conf=0.5))
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(self._cams(0.10, conf=0.87)) is True
+        out = "\n".join(logs["info"])
+        assert "单根包不进 停机" in out
+        assert "min_confidence 0.5->0.87" in out
+
+    def test_detail_lines_are_capped(self, monkeypatch):
+        """144 条阈值不能全打出来。"""
+        import Communication_Tool.material_config_client as M
+        many = {"clothNumber": "C1", "cameras": [
+            {"cameraId": f"camera{i}",
+             "thresholds": [{"defectName": "多股线", "defectLabel": "multi_line",
+                             "thresholdValue": 0.10, "status": 1}],
+             "stopSetting": []} for i in range(1, 41)]}
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(many) is True
+        out = "\n".join(logs["info"])
+        assert "另有" in out and "项变化未列出" in out
+
+    def test_parse_failure_reports_failure_and_source(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        assert M.apply_config({"clothNumber": "C1", "cameras": []}) is False
+        assert any("变更失败" in m for m in logs["warning"])
+        assert any("config.yaml" in m for m in logs["warning"])
+
+    def test_source_says_backend_when_store_populated(self, monkeypatch):
+        """已经成功下发过一次后拉取失败，要说清仍在用后端那份。"""
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self._cams(0.10))
+        logs = self._collect(monkeypatch)
+        M._log_source("后端未返回可用配置")
+        out = "\n".join(logs["info"])
+        assert "上一次成功下发的配置" in out
+        assert "阈值 1 条" in out
+
+
+class TestLabelWarningDedup:
+    """defectLabel 不一致是配置层面的固定问题，同一项只该告警一次。"""
+
+    def test_same_mismatch_warns_once(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        seen = []
+        monkeypatch.setattr(M, "warning", lambda m: seen.append(m))
+        M._LABEL_WARNED.clear()
+        for _ in range(5):
+            M._check_label("camera1", "缺纬", "missing_latitude")
+        assert len(seen) == 1, seen
+
+    def test_new_mismatch_still_warns(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        seen = []
+        monkeypatch.setattr(M, "warning", lambda m: seen.append(m))
+        M._LABEL_WARNED.clear()
+        M._check_label("camera1", "缺纬", "missing_latitude")
+        M._check_label("camera2", "缺纬", "missing_latitude")
+        assert len(seen) == 2, seen
+
+    def test_changed_label_warns_again(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        seen = []
+        monkeypatch.setattr(M, "warning", lambda m: seen.append(m))
+        M._LABEL_WARNED.clear()
+        M._check_label("camera1", "缺纬", "missing_latitude")
+        M._check_label("camera1", "缺纬", "yet_another_label")
+        assert len(seen) == 2, seen
