@@ -405,52 +405,54 @@ class TestWiring:
         from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
         assert MATERIAL_CONFIG.get("enabled") is True
 
-    def test_api_path_has_two_api_segments(self):
-        """这个接口的完整地址确实是**两层 /api**，别"顺手修正"成一层。
+    def test_api_path_is_relative_to_the_base(self):
+        """API_PATH 是**基址之后**的那一段，不能再写 /api。
 
-        该服务自身 context-path 就带一层 /api，基址又含 api_base_path=/api，
-        所以 API_PATH 必须再写一层，拼出来才是
-        http://<host>:8001/api/api/v1/defect/material/current-config
+        基址 get_api_base_url() 已含 api_base_path("/api")，这里再写一层
+        就会拼成 /api/api/v1/...，现场 404。
+        仓库里其他调用点同一惯例："/image/upload"、"/v1/defect/log/size"。
         """
-        assert API_PATH == "/api/v1/defect/material/current-config"
+        assert API_PATH == "/v1/defect/material/current-config"
+        assert not API_PATH.startswith("/api/"), \
+            "基址已含 /api，这里再写会拼成 /api/api/..."
 
-    def test_full_url_shape(self):
-        """端到端拼出来的地址形状。"""
+    def test_full_url_matches_the_confirmed_address(self):
+        """拼出来必须与现场确认的地址逐字符相同。"""
         import Communication_Tool.material_config_client as M
         url = M._get_base_url() + API_PATH
-        assert url.endswith(
-            "/api/api/v1/defect/material/current-config"), url
+        assert url == (
+            "http://localhost:8890/api/v1/defect/material/"
+            "current-config"), url
+        assert url.count("/api/") == 1, url
 
-    def test_uses_its_own_port_not_the_global_one(self):
-        """本功能走 material_config.api_port，**不能**用全局 api_port。
-
-        全局那三项（api_host/api_port/api_base_path）被检测信息上报、
-        布料尺寸上报、周期上报共用，改不得。
-        """
+    def test_base_url_defaults_to_the_global_one(self):
+        """默认没有覆盖项时，基址就等于全局基址（同一个后端）。"""
         import Communication_Tool.material_config_client as M
         from AnomalyDetection_Tool.config.settings import (
             MATERIAL_CONFIG, get_api_base_url)
-        assert int(MATERIAL_CONFIG.get("api_port")) == M.DEFAULT_API_PORT == 8001
-        assert ":8001/" in M._get_base_url()
-        # 全局仍然是 8890，一点没动
-        assert get_api_base_url().endswith(":8890/api"), get_api_base_url()
-        from Communication_Tool.http_client import get_base_url
-        assert get_base_url().endswith(":8890/api")
+        assert MATERIAL_CONFIG.get("api_port") is None
+        assert M._get_base_url() == get_api_base_url()
+        assert M._get_base_url().endswith(":8890/api")
 
-    def test_missing_override_falls_back_to_global(self):
-        """material_config 里没配端口时，回落到全局，不能凭空造一个。"""
+    def test_port_override_does_not_touch_the_global(self):
+        """万一后端挪端口，改 material_config 就行，全局不能被带跑。
+
+        全局那三项被检测信息上报、布料尺寸上报、周期上报共用。
+        """
         import Communication_Tool.material_config_client as M
         from AnomalyDetection_Tool.config import settings as S
         saved = dict(S.MATERIAL_CONFIG)
         try:
-            S.MATERIAL_CONFIG.clear()
-            S.MATERIAL_CONFIG.update(
-                {"enabled": True})          # 没有 api_port
-            assert S.MATERIAL_CONFIG.get("api_port") is None
-            assert ":8890/" in M._get_base_url(), M._get_base_url()
+            S.MATERIAL_CONFIG["api_port"] = 8001
+            assert ":8001/" in M._get_base_url(), M._get_base_url()
+            # 全局一点没动
+            assert S.get_api_base_url().endswith(":8890/api")
+            from Communication_Tool.http_client import get_base_url
+            assert get_base_url().endswith(":8890/api")
         finally:
             S.MATERIAL_CONFIG.clear()
             S.MATERIAL_CONFIG.update(saved)
+
 
     def test_threshold_hook_is_first_step(self):
         with open(os.path.join(ROOT, "AnomalyDetection_Tool", "models",
@@ -532,7 +534,7 @@ class TestEndToEnd:
             assert M.refresh_once(timeout=5) is True
             # 请求真的打到了服务端，且路径符合接口文档
             # 服务端**实际收到**的路径才算数，不能只看本地拼的字符串
-            assert hits == ["/api/api/v1/defect/material/current-config"]
+            assert hits == ["/api/v1/defect/material/current-config"]
             # 注意：snapshot() 的 key 是拍平后的「相机/类别」字符串（诊断
             # 视图，方便打日志），不是内部的元组 key。取值要走
             # get_threshold / get_stop_rule 这两个真正的访问器。

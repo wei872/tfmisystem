@@ -1371,7 +1371,7 @@ material_config:
   #  不要去改上面 upload.api_port（8890）—— 检测信息上报、布料尺寸上报、
   #  周期上报全都靠那三项，改了会一起跑偏。
   #  下面三项留空则回落到全局同名项，只换端口时不必把 host/前缀抄一遍。
-  api_port: 8001               # 本接口所在服务的端口
+  # api_port: 8001            # 本接口若挪到别的服务/端口，取消注释即可
   # api_host: ""               # 留空 = 沿用全局 upload.api_host
   # api_base_path: ""          # 留空 = 沿用全局 upload.api_base_path(/api)
   #  最终地址 = http://<host>:8001/api  +  /api/v1/defect/material/current-config
