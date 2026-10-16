@@ -346,6 +346,15 @@ class MotionController:
         self._idle_since: Optional[float] = None
         self.is_idle = False
 
+        #  距离账目计数器。这两条路径都会让「总行进距离」比真实值小，
+        #  以前只在日志里留一行，上层拿不到，对不上账时无从下手。
+        #    reverse_clamp_*   反向增量超过一个触发距离后被截断的部分
+        #    glitch_discard_*  被突变防护整拍丢弃的部分
+        self.reverse_clamp_count = 0
+        self.reverse_clamp_loss_mm = 0.0
+        self.glitch_discard_count = 0
+        self.glitch_discard_mm = 0.0
+
     def update(self, hc0: int, is_stopped: bool = False) -> Tuple[bool, dict]:
         """
         更新运动状态并判断是否触发
@@ -386,6 +395,10 @@ class MotionController:
                 f"{self.config.max_plausible_speed_mpm:.0f} m/min)。"
                 f"通常是 PLC 计数器被复位或 32 位回绕。"
                 f"累计 {self._glitch_count} 次。")
+            #  这一拍被整拍丢弃 = 这段时间的布料行进距离没有被计入总距离。
+            #  它比反向钳位丢得多得多（单拍上限就有 500 mm），必须单独记账。
+            self.glitch_discard_count += 1
+            self.glitch_discard_mm += abs(pulse_delta) * self.config.pulse_equivalent
             self.last_hc0 = hc0
             self.last_time = current_time
             # 保持突变前的状态值，只把本拍的增量置零，
@@ -403,6 +416,11 @@ class MotionController:
                 'trigger_count': self.trigger_count,
                 'is_idle': self.is_idle,
                 'is_defect_stopped': is_stopped,
+                'reverse_deficit_mm': min(0.0, self.accumulated_distance),
+                'reverse_clamp_count': self.reverse_clamp_count,
+                'reverse_clamp_loss_mm': round(self.reverse_clamp_loss_mm, 3),
+                'glitch_discard_count': self.glitch_discard_count,
+                'glitch_discard_mm': round(self.glitch_discard_mm, 3),
             }
 
         # 判断方向
@@ -418,8 +436,36 @@ class MotionController:
         if self.is_forward:
             self.accumulated_distance += distance_delta
         else:
-            # 反转时减去距离，但不允许为负
-            self.accumulated_distance = max(0, self.accumulated_distance + distance_delta)
+            #  反转时的距离处理。
+            #
+            #  原实现是 max(0, accumulated + delta) —— 一旦反向增量超过当前
+            #  累加值，超出的部分就被**永久丢掉**了。而 accumulated_distance
+            #  同时是「距上次触发走了多远」的账本，cumulative_distance 又完全
+            #  由它推导（base + trigger_count*trigger_distance + accumulated），
+            #  所以丢掉多少，总行进距离和触发节拍就一起错多少。
+            #
+            #  物理上正确的做法是把这笔亏空**记下来**：布料确实往后走了，
+            #  那么下一次触发就该相应地往后推。所以这里让累加值可以为负。
+            #
+            #  但不设下界也不安全：编码器持续往下漂会让累加值越来越负，
+            #  触发被无限期压住 —— 那是一段**静默的漏检**，比距离算错更难查。
+            #  所以下界取一个触发距离：最多"欠"一帧的量。再往后的那段布料
+            #  本来就已经拍过了，多等换不来覆盖率，只会白等。
+            #  超过下界的部分计数 + 累计 + 打日志，不做成黑箱。
+            _new_acc = self.accumulated_distance + distance_delta
+            _floor = -self.config.trigger_distance
+            if _new_acc < _floor:
+                _lost = _floor - _new_acc
+                self.reverse_clamp_count += 1
+                self.reverse_clamp_loss_mm += _lost
+                if self.reverse_clamp_count <= 10 or self.reverse_clamp_count % 50 == 0:
+                    warning(
+                        f"[编码器] 反向增量超出一个触发距离，已截断："
+                        f"本次丢弃 {_lost:.3f} mm，累计 {self.reverse_clamp_count} 次 / "
+                        f"{self.reverse_clamp_loss_mm:.1f} mm。"
+                        f"通常是织机真实倒转或编码器长时间下漂，请核对现场。")
+                _new_acc = _floor
+            self.accumulated_distance = _new_acc
 
         #
 
@@ -503,6 +549,13 @@ class MotionController:
             'trigger_count': self.trigger_count,
             'is_idle': self.is_idle,  #  物理停机状态（决定触发/预览切换）
             'is_defect_stopped': is_stopped,  #  【新增】原样透出缺陷停机逻辑标志，仅供展示/上层参考，不参与触发判定
+            #  距离账目：钳位丢掉的量 + 突变丢弃的量，都必须能被上层看到。
+            #  「漏了多少」不能是黑箱 —— 否则总行进距离对不上时没人查得出来。
+            'reverse_deficit_mm': min(0.0, self.accumulated_distance),
+            'reverse_clamp_count': self.reverse_clamp_count,
+            'reverse_clamp_loss_mm': round(self.reverse_clamp_loss_mm, 3),
+            'glitch_discard_count': self.glitch_discard_count,
+            'glitch_discard_mm': round(self.glitch_discard_mm, 3),
         }
 
         return should_trigger, status
@@ -518,6 +571,11 @@ class MotionController:
         self.accumulated_distance = 0.0
         self.cumulative_distance = 0.0
         self.base_cumulative_distance = 0.0
+        # 距离账目计数器随会话一起归零，否则上一卷布的丢弃量会算到这一卷头上
+        self.reverse_clamp_count = 0
+        self.reverse_clamp_loss_mm = 0.0
+        self.glitch_discard_count = 0
+        self.glitch_discard_mm = 0.0
         info("[MotionController] 完整状态已重置（距离、触发次数、累计基准）")
 
     def restore_base(self, value_mm: float) -> None:
@@ -592,6 +650,22 @@ class DisplayManager:
         idle_flag = " [织机停机-预览模式]" if status.get('is_idle') else ""
         defect_flag = " [缺陷逻辑停机]" if status.get('is_defect_stopped') else ""
 
+        #  距离账目：这两项都会让「总行进距离」比真实值小，以前只在
+        #  触发的那一刻打一行 warning，得翻日志才知道，面板上看不见。
+        #  现在直接挂在状态行末尾 —— 但**只在真的有丢弃/亏空时才显示**，
+        #  正常工况一个字符都不加，不制造噪音。
+        _loss = []
+        _rcl = status.get("reverse_clamp_loss_mm")
+        if _rcl:
+            _loss.append(f"反向截断:{_rcl:.1f}mm/{status['reverse_clamp_count']}次")
+        _gdm = status.get("glitch_discard_mm")
+        if _gdm:
+            _loss.append(f"突变丢弃:{_gdm:.1f}mm/{status['glitch_discard_count']}次")
+        _rdf = status.get("reverse_deficit_mm")
+        if _rdf:
+            _loss.append(f"当前亏空:{_rdf:.1f}mm")
+        loss_flag = ("  [距离账目 " + " ".join(_loss) + "]") if _loss else ""
+
         # 构建显示字符串
         display_str = (
             f"HC0:{status['hc0']:8f} | "
@@ -602,7 +676,8 @@ class DisplayManager:
             f"距离:{status['accumulated_distance']:6.2f}mm | "
             f"触发:{status['trigger_count']:4f}次 | "
             f"总行进距离：{status['cumulative_distance']:6.2f}mm | "
-            f"{running_status} | 触发源:{trigger_mode}{idle_flag}{defect_flag}"
+            f"{running_status} | 触发源:{trigger_mode}"
+            f"{idle_flag}{defect_flag}{loss_flag}"
         )
         info(display_str)
 
