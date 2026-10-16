@@ -721,6 +721,9 @@ SPEED_GUARD = _LiveDict("speed_guard", {})
 # 【六】多股线边缘区自学习（见 config.yaml 同名段的注释）
 MULTILINE_EDGE_LEARNING = _LiveDict("multiline_edge_learning", {})
 
+# 【七】后端下发的材质检测配置（见 config.yaml 同名段的注释）
+MATERIAL_CONFIG = _LiveDict("material_config", {})
+
 # 标量无法就地更新（Python 的数字是不可变对象，import 拿到的是值的副本），
 # 因此对外提供访问器；模块级常量保留为启动时快照，仅供兼容旧调用点。
 DEFAULT_CLASS_CONFIDENCE = _get("default_class_confidence", 0.1)
@@ -903,6 +906,20 @@ def effective_stop_rule(class_name, camera_name=None, stop_rules=None) -> Option
     except Exception:
         warning(f"[停机规则] 读取 {class_name} 的全局规则失败，按不停机处理")
         return None
+
+    # ---- 后端按材质下发的停机规则（优先级高于本地全局/按相机覆盖）----
+    # 放在总开关**之后**：machine_stop_rules.enabled 是现场的急停手段，
+    # 后端不该能绕过它。放在全局规则**之前**：后端是业务权威来源。
+    # 返回 None 表示后端没给这个 (相机, 类) 下发，继续走本地合并。
+    # 整体兜死：这一层出任何问题都退回本地规则。
+    try:
+        from AnomalyDetection_Tool.config.remote_config_store import (
+            get_remote_config_store)
+        _rr = get_remote_config_store().get_stop_rule(camera_name, class_name)
+    except Exception:
+        _rr = None
+    if _rr is not None:
+        return _rr
 
     if isinstance(base_rule, dict):
         base = dict(base_rule)

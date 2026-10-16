@@ -49,6 +49,7 @@ from AnomalyDetection_Tool.config.settings import (
     NORMAL_IMAGE_SAVE,
     SPEED_GUARD,
     MULTILINE_EDGE_LEARNING,
+    MATERIAL_CONFIG,
     PLC_CONFIG, WEBSOCKET_CONFIG, LOGGING_CONFIG, CONCURRENCY_CONFIG,
     DEBUG_CONFIG,
 )
@@ -63,6 +64,8 @@ from AnomalyDetection_Tool.services.normal_image_saver import init_normal_saver
 from General_Tool.SpeedGuard import init_speed_guard, get_speed_guard
 from AnomalyDetection_Tool.filter.edge_region_learner import (
     init_edge_learner)
+from Communication_Tool.material_config_client import (
+    refresh_once as refresh_material_config)
 from AnomalyDetection_Tool.output.encoder_state_service import (
     get_encoder_state)
 from AnomalyDetection_Tool.services.WebSocketImageServer import (
@@ -1367,6 +1370,59 @@ def main() -> int:
                  "（multiline_edge_learning.enabled=false）")
     except Exception as e:
         error(f"[边缘区学习] 初始化失败，功能不可用（不影响检测）: {e}")
+    # —— 【七】后端下发的材质检测配置 ——
+    # 拉取一律放在**后台线程**：启动流程绝不能被网络卡住，
+    # 后端没起来也要能正常开机跑（那时覆盖层是空的，自动用本地 yaml）。
+    try:
+        _mc_cfg = MATERIAL_CONFIG
+        if bool(_mc_cfg.get("enabled", False)):
+            _mc_timeout = float(_mc_cfg.get("timeout_sec", 5) or 5)
+            _mc_interval = float(_mc_cfg.get("refresh_interval_sec", 60) or 0)
+            _mc_on_start = bool(_mc_cfg.get("fetch_on_start", True))
+
+            def _mc_fetch(tag: str) -> None:
+                try:
+                    ok = refresh_material_config(timeout=_mc_timeout)
+                    if not ok:
+                        info(f"[材质配置] {tag} 拉取未生效，"
+                             f"沿用当前配置（首次失败则用本地 config.yaml）")
+                except Exception as e:
+                    error(f"[材质配置] {tag} 异常: {e}")
+
+            threading.Thread(target=_mc_fetch, args=("启动",),
+                             name="material-config-init",
+                             daemon=True).start()
+
+            if _mc_on_start:
+                # 新布卷可能换了材质/规格，必须重新拉
+                Communication_Tool.ThriftControl.register_on_start(
+                    lambda: threading.Thread(
+                        target=_mc_fetch, args=("前端开始",),
+                        name="material-config-start",
+                        daemon=True).start())
+
+            if _mc_interval > 0:
+                # Event 必须在 _mc_loop 之前建好：闭包捕获的是变量名，
+                # 线程真跑起来时才去查，晚一步定义虽然也能工作，
+                # 但读代码的人会以为这是个 NameError。
+                _mc_stop = threading.Event()
+
+                def _mc_loop():
+                    while not _mc_stop.wait(_mc_interval):
+                        _mc_fetch("定时刷新")
+
+                threading.Thread(target=_mc_loop, name="material-config-loop",
+                                 daemon=True).start()
+                info(f"[材质配置] 已启用：每 {_mc_interval:.0f}s 刷新一次，"
+                     f"「开始」时重新拉，超时 {_mc_timeout:.0f}s")
+            else:
+                info("[材质配置] 已启用：仅启动和「开始」时拉取"
+                     "（refresh_interval_sec<=0）")
+        else:
+            info("[材质配置] 已在 config.yaml 关闭"
+                 "（material_config.enabled=false），使用本地阈值/停机规则")
+    except Exception as e:
+        error(f"[材质配置] 初始化失败，使用本地配置（不影响检测）: {e}")
     # —— 【四】正常图片定时保存：只待命，等前端下发窗口 ——
     try:
         _nis = NORMAL_IMAGE_SAVE

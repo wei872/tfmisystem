@@ -221,6 +221,20 @@ class ClassThresholdConfig:
 
     def get_threshold(self, class_name: str, class_id: int,
                       camera_name: Optional[str] = None) -> float:
+        # ---- 0：后端按材质下发的配置（最高优先）----
+        # 存储为空（从未成功拉取过）时返回 None，下面 1~7 步原样执行，
+        # 行为与接入前完全一致。整体兜死：这一层出任何问题都不能
+        # 让阈值解析失败 —— 检测链路上不能有单点。
+        try:
+            from AnomalyDetection_Tool.config.remote_config_store import (
+                get_remote_config_store)
+            _rt = get_remote_config_store().get_threshold(camera_name,
+                                                          class_name)
+            if _rt is not None:
+                return float(_rt)
+        except Exception:
+            pass
+
         # ---- 1~3：该相机的覆盖 ----
         block = self._camera_block(camera_name)
         if block:
