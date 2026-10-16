@@ -405,27 +405,52 @@ class TestWiring:
         from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
         assert MATERIAL_CONFIG.get("enabled") is True
 
-    def test_api_path_does_not_repeat_the_base_prefix(self):
-        """API_PATH 是**基址之后**的那一段，不能再带 /api。
+    def test_api_path_has_two_api_segments(self):
+        """这个接口的完整地址确实是**两层 /api**，别"顺手修正"成一层。
 
-        第一版写成 "/api/v1/..."，与已含 /api 的基址拼出 /api/api/v1/...，
-        现场直接 404。接口文档给的是完整 URL，这里要的是相对段，两者不能混。
+        该服务自身 context-path 就带一层 /api，基址又含 api_base_path=/api，
+        所以 API_PATH 必须再写一层，拼出来才是
+        http://<host>:8001/api/api/v1/defect/material/current-config
         """
-        assert API_PATH == "/v1/defect/material/current-config"
-        assert not API_PATH.startswith("/api/"), \
-            "基址已含 api_base_path(/api)，这里再写 /api 会拼成 /api/api/..."
+        assert API_PATH == "/api/v1/defect/material/current-config"
 
-    def test_full_url_has_exactly_one_api_prefix(self):
-        """端到端拼出来的 URL 里 /api 只能出现一次。"""
-        import Communication_Tool.http_client as HC
-        from AnomalyDetection_Tool.config.settings import get_api_base_url
-        base = get_api_base_url()
-        url = base + API_PATH
-        assert url.count("/api/") == 1, url
-        # 现场基址就是 http://host:port/api 这个形状
-        assert base.endswith("/api"), base
-        assert url.endswith("/api/v1/defect/material/current-config"), url
-        assert HC.get_base_url() == base
+    def test_full_url_shape(self):
+        """端到端拼出来的地址形状。"""
+        import Communication_Tool.material_config_client as M
+        url = M._get_base_url() + API_PATH
+        assert url.endswith(
+            "/api/api/v1/defect/material/current-config"), url
+
+    def test_uses_its_own_port_not_the_global_one(self):
+        """本功能走 material_config.api_port，**不能**用全局 api_port。
+
+        全局那三项（api_host/api_port/api_base_path）被检测信息上报、
+        布料尺寸上报、周期上报共用，改不得。
+        """
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import (
+            MATERIAL_CONFIG, get_api_base_url)
+        assert int(MATERIAL_CONFIG.get("api_port")) == M.DEFAULT_API_PORT == 8001
+        assert ":8001/" in M._get_base_url()
+        # 全局仍然是 8890，一点没动
+        assert get_api_base_url().endswith(":8890/api"), get_api_base_url()
+        from Communication_Tool.http_client import get_base_url
+        assert get_base_url().endswith(":8890/api")
+
+    def test_missing_override_falls_back_to_global(self):
+        """material_config 里没配端口时，回落到全局，不能凭空造一个。"""
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config import settings as S
+        saved = dict(S.MATERIAL_CONFIG)
+        try:
+            S.MATERIAL_CONFIG.clear()
+            S.MATERIAL_CONFIG.update(
+                {"enabled": True})          # 没有 api_port
+            assert S.MATERIAL_CONFIG.get("api_port") is None
+            assert ":8890/" in M._get_base_url(), M._get_base_url()
+        finally:
+            S.MATERIAL_CONFIG.clear()
+            S.MATERIAL_CONFIG.update(saved)
 
     def test_threshold_hook_is_first_step(self):
         with open(os.path.join(ROOT, "AnomalyDetection_Tool", "models",
@@ -467,9 +492,9 @@ class TestEndToEnd:
     """真实 HTTP 往返：客户端走 aiohttp，服务端用 stdlib http.server。
 
     前面所有用例都只喂 dict，绕过了"请求真的发出去了吗"这一环。
-    这一组把完整路径跑通，顺带验证 URL 拼接：基址含 /api，API_PATH 只写
-    /v1/...，拼出来 /api 只出现一次。（第一版这里拼成了 /api/api/...，
-    现场 404 —— 服务端收到的路径才是唯一可信的判据。）
+    这一组把完整路径跑通，并断言**服务端实际收到**的路径——本地拼的字符串
+    对上不代表请求真的打对了地方。曾经因为只看本地字符串，把一个端口错误
+    误判成了路径错误。
     """
 
     def _serve(self, payload, status=200):
@@ -500,16 +525,14 @@ class TestEndToEnd:
                                        "cameras": _cams()}}
         srv, port, hits = self._serve(payload)
         try:
-            import Communication_Tool.http_client as HC
-            monkeypatch.setattr(HC, "get_base_url",
-                                lambda: f"http://127.0.0.1:{port}/api")
             import Communication_Tool.material_config_client as M
-            monkeypatch.setattr(M, "get_base_url", HC.get_base_url)
+            monkeypatch.setattr(
+                M, "_get_base_url", lambda: f"http://127.0.0.1:{port}/api")
 
             assert M.refresh_once(timeout=5) is True
             # 请求真的打到了服务端，且路径符合接口文档
             # 服务端**实际收到**的路径才算数，不能只看本地拼的字符串
-            assert hits == ["/api/v1/defect/material/current-config"]
+            assert hits == ["/api/api/v1/defect/material/current-config"]
             # 注意：snapshot() 的 key 是拍平后的「相机/类别」字符串（诊断
             # 视图，方便打日志），不是内部的元组 key。取值要走
             # get_threshold / get_stop_rule 这两个真正的访问器。
@@ -526,11 +549,9 @@ class TestEndToEnd:
         try:
             _store().apply(thresholds={(("camera9", "多股线"), 0.9)},
                            meta={"material": "旧料"})
-            import Communication_Tool.http_client as HC
-            monkeypatch.setattr(HC, "get_base_url",
-                                lambda: f"http://127.0.0.1:{port}/api")
             import Communication_Tool.material_config_client as M
-            monkeypatch.setattr(M, "get_base_url", HC.get_base_url)
+            monkeypatch.setattr(
+                M, "_get_base_url", lambda: f"http://127.0.0.1:{port}/api")
             assert M.refresh_once(timeout=5) is False
             assert _store().get_threshold("camera9", "多股线") == 0.9
         finally:
@@ -538,11 +559,9 @@ class TestEndToEnd:
 
     def test_dead_port_does_not_raise(self, monkeypatch):
         """端口没人听 —— 现场后端没起时就是这个状态，不能抛。"""
-        import Communication_Tool.http_client as HC
-        monkeypatch.setattr(HC, "get_base_url",
-                            lambda: "http://127.0.0.1:1/api")
         import Communication_Tool.material_config_client as M
-        monkeypatch.setattr(M, "get_base_url", HC.get_base_url)
+        monkeypatch.setattr(M, "_get_base_url",
+                            lambda: "http://127.0.0.1:1/api")
         assert M.refresh_once(timeout=1) is False
         assert _store().is_empty()
 
@@ -578,10 +597,8 @@ class TestRefreshOnceRobustness:
         port = srv.server_address[1]
         _th.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            import Communication_Tool.http_client as HC
             import Communication_Tool.material_config_client as M
-            HC.get_base_url = lambda: f"http://127.0.0.1:{port}/api"
-            M.get_base_url = HC.get_base_url
+            M._get_base_url = lambda: f"http://127.0.0.1:{port}/api"
 
             async def caller():
                 # 关键：refresh_once 是在一个正在运行的事件循环里被调的
@@ -595,15 +612,14 @@ class TestRefreshOnceRobustness:
     def test_hard_timeout_does_not_hang_caller(self, monkeypatch):
         """请求挂死时，refresh_once 必须在有限时间内返回 False。"""
         import time as _t
-        import Communication_Tool.http_client as HC
         import Communication_Tool.material_config_client as M
 
         async def hang(**kw):
             await asyncio.sleep(60)
             return None
 
-        monkeypatch.setattr(HC, "get_base_url", lambda: "http://127.0.0.1:1/api")
-        monkeypatch.setattr(M, "get_base_url", HC.get_base_url)
+        monkeypatch.setattr(M, "_get_base_url",
+                            lambda: "http://127.0.0.1:1/api")
         monkeypatch.setattr(M, "fetch_current_config", hang)
 
         t0 = _t.time()

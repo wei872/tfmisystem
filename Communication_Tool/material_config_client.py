@@ -38,20 +38,25 @@ from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 
-from Communication_Tool.http_client import get_base_url
 from General_Tool.EnhancedLogger import info, warning, error
 
-# 接口路径。**不要再把 /api 写进来。**
+# 接口路径。**这里确实是两层 /api，不要"顺手修正"成一层。**
 #
-# get_api_base_url() 返回的基址已经含 api_base_path（现场是 "/api"），
-# 所以这里写 "/v1/..." 拼出来才是 .../api/v1/...。
+# 这个接口由另一个服务提供，它的 context-path 本身就带 /api，对外暴露的
+# 完整地址是 http://<host>:8001/api/api/v1/defect/material/current-config。
+# 基址（见下面 _get_base_url）已含 api_base_path="/api"，所以这里再写一层
+# "/api/v1/..."，拼出来正好是两层。
 #
-# 第一版这里写的是 "/api/v1/..."，拼出 .../api/api/v1/...，现场直接 404：
+# 曾经出现过一次现场 404：
 #   {"status":404,"path":"/api/api/v1/defect/material/current-config"}
-# 当时的理由是"接口文档给的地址带 /api/v1"——文档给的是**完整 URL**，
-# 而这里要的是**基址之后的那一段**，两者不能混。
-# 仓库里其他调用点也是这个惯例："/image/upload"、"/v1/defect/log/size"。
-API_PATH = "/v1/defect/material/current-config"
+# 当时误判成"路径多写了一层 /api"，把它改成 "/v1/..." —— 那是错的。
+# 真正的原因是**端口**：请求打到了全局的 api_port(8890)，而这个接口在 8001。
+# 路径从头到尾都是对的，404 的 path 字段回显的就是正确的两层 /api。
+API_PATH = "/api/v1/defect/material/current-config"
+
+# 这个接口所在服务的默认端口。与全局 api_port（8890，主后端）**不是同一个
+# 服务**，所以单独配，绝不能去改全局那三项——其他所有上报都靠它们。
+DEFAULT_API_PORT = 8001
 
 # 视为成功的 code。后端各接口的约定不完全一致，这里从宽。
 _OK_CODES = {0, 200, "0", "200", "SUCCESS", "success", "OK", "ok"}
@@ -227,9 +232,32 @@ def _check_label(cam_id: str, name: str, label: Any) -> None:
 # ======================================================================
 #  拉取 + 应用
 # ======================================================================
+def _get_base_url() -> str:
+    """本功能专用的基址。
+
+    **不复用** Communication_Tool.http_client.get_base_url()：那个读的是
+    全局 api_host/api_port/api_base_path（现场 8890，主后端），而这个接口
+    在另一个服务的 8001 上。改全局会把所有上报一起带跑，所以这里单独取。
+
+    material_config 段里没写的项，回落到全局同名项——这样只换端口时
+    不必把 host / base_path 也抄一遍。
+    """
+    from AnomalyDetection_Tool.config.settings import (
+        MATERIAL_CONFIG, get_upload_config)
+    g = get_upload_config()
+    host = MATERIAL_CONFIG.get("api_host") or g.get("api_host") or "localhost"
+    port = MATERIAL_CONFIG.get("api_port") or g.get("api_port") or DEFAULT_API_PORT
+    base = MATERIAL_CONFIG.get("api_base_path")
+    if base is None:
+        base = g.get("api_base_path") or ""
+    if base and not base.startswith("/"):
+        base = "/" + base
+    return f"http://{host}:{int(port)}{base.rstrip('/')}"
+
+
 async def fetch_current_config(timeout: float = 5.0) -> Optional[dict]:
     """拉一次。返回 Result 的 data；失败/业务错误返回 None。"""
-    url = get_base_url() + API_PATH
+    url = _get_base_url() + API_PATH
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
