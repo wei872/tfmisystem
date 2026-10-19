@@ -48,6 +48,18 @@ from AnomalyDetection_Tool.output.encoder_state_service import get_encoder_state
 # ========================================
 # 配置类
 # ========================================
+# 当前织机速度的模块级快照（m/min），由 MotionController 每次算完速度刷新。
+# 存在的理由：image_control() 跑在相机回调线程，拿不到 main() 里创建的
+# TriggerControlSystem/MotionController 局部实例，但它需要把速度写进
+# "缺陷停机丢帧"的日志里，否则现场看不出织机到底在不在跑。
+_LAST_SPEED = 0.0
+
+
+def get_current_speed() -> float:
+    """当前织机速度（m/min）。纯读快照，永不抛异常。"""
+    return _LAST_SPEED
+
+
 @dataclass
 class SystemConfig:
     """系统配置参数"""
@@ -471,6 +483,8 @@ class MotionController:
 
         #  m/min                        mm        ms
         self.current_speed = abs(distance_delta / dt * 60)
+        global _LAST_SPEED
+        _LAST_SPEED = self.current_speed
 
         # —— 超速守卫：把速度喂给守卫（它内部做中值滤波，不用这个原始值判定）——
         # 放在这里而不是让守卫自己读 current_speed，是为了让守卫只依赖"有一个
@@ -704,6 +718,9 @@ class TriggerControlSystem:
         self.running = False
         # 自动恢复状态机标记
         self._has_stopped_after_defect = False
+        # 连续高速的起点（用于"没观测到停稳"时的兜底恢复），None=未在高速
+        self._resume_speed_since = None
+        self._resume_log_at = 0.0   # 兜底进度日志的节流时间戳
 
         #  新增：相机触发模式状态机
         self._current_trigger_mode = "Line0"   # "Line0"(硬触发) / "Software"(软触发预览)
@@ -779,12 +796,13 @@ class TriggerControlSystem:
     def is_preview_mode(self) -> bool:
         return self._current_trigger_mode == "Software"
 
-    def _check_auto_resume(self, status: dict):
+    def _check_auto_resume(self, status: dict, now: float = None):
         """
         停机自动恢复状态机：
-        阶段1（冷却期）: 停机后至少等待 MIN_COOL_DOWN 秒，忽略一切速度
-        阶段2（确认停稳）: 观察到速度低于 STOP_SPEED 才认为"已停稳"
-        阶段3（确认恢复）: 停稳后速度重新超过 RESUME_SPEED 才触发恢复
+        阶段1（冷却期）: 停机后至少等待 MIN_COOL_DOWN 秒，期间**只观测不恢复**
+        阶段2（确认恢复）: 观测到停稳后，速度重新超过 RESUME_SPEED 才恢复
+        阶段3（兜底恢复）: 始终没观测到停稳时，速度连续保持 RESUME_SPEED
+                          以上达 SUSTAINED_RESUME 秒也恢复（否则永久卡死）
 
         说明：本状态机只负责"缺陷停机"逻辑标志(TC.isDefectStopped())的自动复位，
         与是否继续硬触发拍照检测(should_trigger/is_idle)完全独立，互不影响。
@@ -798,35 +816,76 @@ class TriggerControlSystem:
         MIN_COOL_DOWN = 2.0  # 停机后强制冷却时间(秒)，此期间无论速度多快都不恢复
         STOP_SPEED = 1.0  # 低于此速度视为"已停稳"(m/min)
         RESUME_SPEED = 5.0  # 停稳后高于此速度视为"速度恢复"(m/min)
+        # 兜底：一直没观测到停稳时，连续高速持续这么久就认定织机已重启。
+        # 惯性速度撑不了这么久 —— 冷却期的意义（挡掉惯性速度）不会被破坏。
+        SUSTAINED_RESUME = 10.0
 
+        # now 可注入，纯粹为了测试：兜底判定要"连续高速 N 秒"，
+        # 用真实时钟的话单测得真的睡 10 秒，等于没法测。默认走真实时钟。
+        if now is None:
+            now = time.time()
         current_speed = status.get('current_speed', 0.0)
         stop_time = TC.getDefectStopTime()
-        elapsed = time.time() - stop_time
+        elapsed = now - stop_time
+
+        # 观测"停稳"这件事在**冷却期也要做**。
+        #
+        # 旧实现把 self._has_stopped_after_defect 在冷却期强制清零并直接
+        # return，等于这 2 秒里发生的一切都不看。现场织机常在 1 秒内就
+        # 停完又重启，等冷却结束再去等停稳，那个"停"早就过去了 ——
+        # 于是永远卡在"等待停稳"，缺陷停机标志再也不复位，
+        # image_control() 把所有硬触发帧全丢掉：速度正常、触发正常、
+        # 总米长在涨，却一张图都不检。
+        #
+        # 冷却期挡的应该是"恢复动作"，不是"观测"。
+        if current_speed <= STOP_SPEED:
+            if not self._has_stopped_after_defect:
+                self._has_stopped_after_defect = True
+                info(f"[自动恢复] 已确认停稳，速度 {current_speed:.2f} m/min，"
+                     f"等待速度恢复到 {RESUME_SPEED} m/min 以上...")
+        elif current_speed < RESUME_SPEED:
+            # 中间速度既不算停稳也不算恢复，重置兜底计时
+            self._resume_speed_since = None
 
         # 阶段1：冷却期，强制等待，防止读到停机前的惯性速度
         if elapsed < MIN_COOL_DOWN:
             info(f"[自动恢复] 冷却期 {elapsed:.1f}/{MIN_COOL_DOWN}s，"
                  f"当前速度 {current_speed:.2f} m/min，等待中...")
-            # 重置"已停稳"标记，确保冷却期结束后重新从零判断
-            self._has_stopped_after_defect = False
             return
 
-        # 阶段2：等停稳
-        if not self._has_stopped_after_defect:
-            if current_speed <= STOP_SPEED:
-                self._has_stopped_after_defect = True
-                info(f"[自动恢复] 已确认停稳，速度 {current_speed:.2f} m/min，"
-                     f"等待速度恢复到 {RESUME_SPEED} m/min 以上...")
-            else:
-                info(f"[自动恢复] 等待停稳，当前速度 {current_speed:.2f} m/min > {STOP_SPEED}...")
+        # 阶段2：已观测到停稳 -> 等速度回升
+        if self._has_stopped_after_defect:
+            if current_speed >= RESUME_SPEED:
+                info(f"[自动恢复] 速度 {current_speed:.2f} m/min >= {RESUME_SPEED}，"
+                     f"缺陷停机自动恢复运行")
+                self._has_stopped_after_defect = False  # 为下次停机做准备
+                self._resume_speed_since = None
+                TC.setIsStop(False, "Auto恢复", "Auto")
             return
 
-        # 阶段3：已停稳，判断速度是否重新恢复
+        # 阶段3：兜底 —— 一直没观测到停稳（停机比轮询周期还短，或整个停机
+        # 过程都落在冷却期内）。这种情况旧实现会永久卡死，只能靠前端手动
+        # 点"开始/停止"。这里用"连续高速持续 SUSTAINED_RESUME 秒"兜底。
         if current_speed >= RESUME_SPEED:
-            info(f"[自动恢复] 速度 {current_speed:.2f} m/min >= {RESUME_SPEED}，"
-                 f"缺陷停机自动恢复运行")
-            self._has_stopped_after_defect = False  # 重置状态，为下次停机做准备
-            TC.setIsStop(False, "Auto恢复", "Auto")
+            if self._resume_speed_since is None:
+                self._resume_speed_since = now
+            held = now - self._resume_speed_since
+            if held >= SUSTAINED_RESUME:
+                info(f"[自动恢复] 未观测到停稳，但速度已连续 {held:.1f}s "
+                     f"保持 {current_speed:.2f} m/min（>= {RESUME_SPEED}），"
+                     f"判定织机已重启，缺陷停机自动恢复运行")
+                self._has_stopped_after_defect = False
+                self._resume_speed_since = None
+                TC.setIsStop(False, "Auto恢复", "Auto")
+            else:
+                if now - self._resume_log_at >= 1.0:
+                    self._resume_log_at = now
+                    info(f"[自动恢复] 未观测到停稳，已连续高速 {held:.1f}/"
+                         f"{SUSTAINED_RESUME:.0f}s（{current_speed:.2f} m/min）...")
+        else:
+            self._resume_speed_since = None
+            info(f"[自动恢复] 等待停稳，当前速度 {current_speed:.2f} m/min "
+                 f"> {STOP_SPEED}...")
 
     # ==================================================================
     #  新增：停机预览状态机

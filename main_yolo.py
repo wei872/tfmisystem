@@ -175,6 +175,16 @@ def _submit_aux(fn, *args) -> bool:
 
 _manual_stop_log_ts: dict = {}
 _MANUAL_STOP_LOG_INTERVAL = 10.0   # 秒
+_defect_stop_log_ts = {}           # 缺陷停机丢帧日志的按相机节流时间戳
+
+
+def _current_loom_speed() -> float:
+    """取当前织机速度，取不到就返回 -1（只用于日志，绝不能抛异常）"""
+    try:
+        from Communication_Tool.Modbus import get_current_speed
+        return float(get_current_speed())
+    except Exception:
+        return -1.0
 
 
 def _log_manual_stop_skip(camera_name: str) -> None:
@@ -185,6 +195,22 @@ def _log_manual_stop_skip(camera_name: str) -> None:
         _manual_stop_log_ts[camera_name] = now
         info(f"[停止] {camera_name} 前端已下发停止，跳过检测中"
              f"（等待前端重新点『开始』，织机速度回升也不会自动恢复）")
+
+
+def _log_defect_stop_skip(camera_name: str, speed: float) -> None:
+    """缺陷停机期间丢帧要出声，否则现场无法区分"相机没出图"和"图被丢了"。
+
+    现场实际踩过：Modbus 那边速度正常、[触发] 正常、总米长一直涨，前端却
+    一张图都收不到。原因是缺陷停机标志没复位，帧全部在 image_control() 的
+    getIsStop() 分支里被 return 掉，而那条分支当时一条日志都不打。
+    """
+    now = time.time()
+    last = _defect_stop_log_ts.get(camera_name, 0.0)
+    if now - last >= _MANUAL_STOP_LOG_INTERVAL:
+        _defect_stop_log_ts[camera_name] = now
+        info(f"[缺陷停机] {camera_name} 硬触发帧已到达但被丢弃（缺陷停机标志未复位，"
+             f"当前织机速度 {speed:.2f} m/min）。织机在跑、图在出，只是不进检测链路 —— "
+             f"若在等自动恢复，请检查 [自动恢复] 日志是否卡在『等待停稳』")
 
 
 def _save_debug_image(image, camera_sn: str, sub_dir: str) -> None:
@@ -256,6 +282,8 @@ def image_control(image, frame_info, camera_sn=""):
     if Communication_Tool.ThriftControl.getIsStop():
         if Communication_Tool.ThriftControl.isManualPaused():
             _log_manual_stop_skip(camera_name)
+        else:
+            _log_defect_stop_skip(camera_name, _current_loom_speed())
         return
 
     frame_number = frame_info["nFrameNum"]
