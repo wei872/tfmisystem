@@ -703,8 +703,8 @@ class TestChangeReporting:
         assert "单根包不进 停机" in out
         assert "min_confidence 0.5->0.87" in out
 
-    def test_detail_lines_are_capped(self, monkeypatch):
-        """144 条阈值不能全打出来。"""
+    def test_detail_defaults_to_complete(self, monkeypatch):
+        """默认全部打印 —— 截断会让后面的相机看起来像没变。"""
         import Communication_Tool.material_config_client as M
         many = {"clothNumber": "C1", "cameras": [
             {"cameraId": f"camera{i}",
@@ -714,7 +714,9 @@ class TestChangeReporting:
         logs = self._collect(monkeypatch)
         assert M.apply_config(many) is True
         out = "\n".join(logs["info"])
-        assert "另有" in out and "项变化未列出" in out
+        for i in range(1, 41):
+            assert f"【camera{i}】" in out, f"camera{i} 明细被截断了"
+        assert "另有" not in out
 
     def test_parse_failure_reports_failure_and_source(self, monkeypatch):
         import Communication_Tool.material_config_client as M
@@ -763,3 +765,165 @@ class TestLabelWarningDedup:
         M._check_label("camera1", "缺纬", "missing_latitude")
         M._check_label("camera1", "缺纬", "yet_another_label")
         assert len(seen) == 2, seen
+
+
+class TestAllCamerasChange:
+    """前端「全部相机」改一次就是 8 台一起动。
+
+    明细必须能看出**哪台**变了，且不能被截断——截断会让 camera2 之后的
+    相机看起来像没变。同时要能看到「特殊值」那台没跟着变。
+    """
+
+    CLASSES = ["多股线", "缺纬", "单根包不进", "包边不良"]
+
+    @staticmethod
+    def _collect(monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = []
+        monkeypatch.setattr(M, "info", lambda m: logs.append(m))
+        monkeypatch.setattr(M, "warning", lambda m: None)
+        monkeypatch.setattr(M, "_warn_model_mismatch", lambda meta: None)
+        return logs
+
+    def payload(self, v, special=None):
+        """全部相机统一设 v；special = {相机: (类别, 值)} 保留特殊值。"""
+        special = special or {}
+        cams = []
+        for i in range(1, 9):
+            cid = f"camera{i}"
+            ths = []
+            for c in self.CLASSES:
+                val = special.get((cid, c), v)
+                ths.append({"defectName": c, "defectLabel": c, "status": 1,
+                            "thresholdValue": val})
+            cams.append({"cameraId": cid, "thresholds": ths,
+                         "stopSetting": [{"name": "单根包不进", "enabled": True,
+                                          "minConfidence": v,
+                                          "triggerMode": "dimension",
+                                          "minWidthMm": 50,
+                                          "minHeightMm": 47}]})
+        return {"clothNumber": "C1", "roller": "R1", "material": "1500D/2",
+                "specification": "100145", "cameras": cams}
+
+    def test_every_changed_camera_is_named(self, monkeypatch):
+        """8 台全变，8 台都得在"变化相机"那一行里，一个不能少。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.30))
+        out = "\n".join(logs)
+        line = [x for x in out.split("\n") if "变化相机" in x][0]
+        assert "8 台" in line
+        for i in range(1, 9):
+            assert f"camera{i}(" in line, f"camera{i} 没出现在变化相机里：{line}"
+
+    def test_detail_is_complete_by_default(self, monkeypatch):
+        """默认不截断：每台的明细块都要在。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.30))
+        out = "\n".join(logs)
+        for i in range(1, 9):
+            assert f"【camera{i}】" in out, f"camera{i} 的明细块缺失"
+        assert "另有" not in out and "未列出" not in out
+
+    def test_per_camera_block_shows_class_and_values(self, monkeypatch):
+        """明细里每台相机下要能看到类别名和前后值。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.30))
+        out = "\n".join(logs)
+        blk = out.split("【camera3】")[1].split("【camera4】")[0]
+        for c in self.CLASSES:
+            assert c in blk, f"camera3 的明细里缺类别 {c}"
+        assert "->0.3" in blk
+
+    def test_special_value_camera_is_called_out(self, monkeypatch):
+        """camera8 的 多股线 是特殊值 0.55，改「全部相机」时始终不动它。
+
+        特殊值特意取 0.55（不是 config.yaml 里的 0.65），免得断言碰巧因为
+        本地默认值相同而变绿。
+        """
+        import Communication_Tool.material_config_client as M
+        sp = {("camera8", "多股线"): 0.55}
+        M.apply_config(self.payload(0.30, sp))       # 建立基线
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.12, sp))       # 全部相机 0.30 -> 0.12
+        out = "\n".join(logs)
+        assert "同类别未跟随变更" in out
+        hold = [x for x in out.split("\n") if "多股线" in x and "保持原值" in x]
+        assert hold, out
+        assert "7 台已更新" in hold[0] and "camera8=0.55" in hold[0]
+        # camera8 的明细里不该有 多股线 那一行（它没变）
+        blk = out.split("【camera8】")[1]
+        assert "多股线 阈值" not in blk
+        # 但它仍然出现在"变化相机"里（另外 3 个类变了）
+        line = [x for x in out.split("\n") if "变化相机" in x][0]
+        assert "camera8(4项)" in line
+
+    def test_two_special_cameras_are_both_listed(self, monkeypatch):
+        """特殊值可能是两台（比如 camera1 和 camera8）。"""
+        import Communication_Tool.material_config_client as M
+        sp = {("camera1", "多股线"): 0.55, ("camera8", "多股线"): 0.55}
+        M.apply_config(self.payload(0.30, sp))
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.12, sp))
+        out = "\n".join(logs)
+        hold = [x for x in out.split("\n") if "多股线" in x and "保持原值" in x][0]
+        assert "6 台已更新" in hold and "2 台保持原值" in hold
+        assert "camera1=0.55" in hold and "camera8=0.55" in hold
+
+    def test_stop_rule_holdout_is_called_out(self, monkeypatch):
+        """停机阈值也有特殊值，同样要点出来。"""
+        import Communication_Tool.material_config_client as M
+        def _sp(v, cam8_stop):
+            p = self.payload(v)
+            p["cameras"][7]["stopSetting"][0]["minConfidence"] = cam8_stop
+            return p
+        M.apply_config(_sp(0.30, 0.9))           # 建立基线，camera8 停机=0.9
+        logs = self._collect(monkeypatch)
+        M.apply_config(_sp(0.12, 0.9))           # 全部相机改 0.12，camera8 仍 0.9
+        out = "\n".join(logs)
+        hold = [x for x in out.split("\n")
+                if "停机规则" in x and "保持原值" in x]
+        assert hold, out
+        assert "camera8" in hold[0] and "conf>=0.9" in hold[0]
+
+    def test_camera_with_no_change_is_listed_separately(self, monkeypatch):
+        """整台相机都没变的，要单独列出来，别让人以为漏了它。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        p = self.payload(0.30)
+        p["cameras"][4]["thresholds"] = []            # camera5 整台没配
+        p["cameras"][4]["stopSetting"] = []
+        M.apply_config(p)
+        out = "\n".join(logs)
+        assert "未变化相机（1 台）：camera5" in out
+
+    def test_all_cameras_unchanged_stays_one_line(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self.payload(0.30))
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.30))
+        assert len(logs) == 1, logs
+        assert "变化 0 项" in logs[0] and "涉及 0 台相机" in logs[0]
+
+    def test_max_diff_lines_can_still_cap(self, monkeypatch):
+        """真要限制行数：material_config.max_diff_lines > 0 时生效。"""
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        monkeypatch.setitem(MATERIAL_CONFIG, "max_diff_lines", 6)
+        assert M._diff_max_lines() == 6
+        logs = self._collect(monkeypatch)
+        M.apply_config(self.payload(0.30))
+        out = "\n".join(logs)
+        assert "未列出" in out
+        # 即使明细被截断，"变化相机"那一行仍然完整
+        line = [x for x in out.split("\n") if "变化相机" in x][0]
+        for i in range(1, 9):
+            assert f"camera{i}(" in line
+
+    def test_max_diff_lines_default_is_unlimited(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        monkeypatch.delitem(MATERIAL_CONFIG, "max_diff_lines", raising=False)
+        assert M._diff_max_lines() == 0

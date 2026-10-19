@@ -98,6 +98,7 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
     if not isinstance(data, dict):
         raise ValueError(f"data 不是对象: {type(data).__name__}")
 
+    cam_ids: List[str] = []
     cameras = data.get("cameras")
     if cameras is None:
         cameras = []
@@ -112,6 +113,7 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
             skipped_stop.append(f"<无 cameraId 的条目 {cam!r}>")
             continue
         cam_id = cam_id.strip()
+        cam_ids.append(cam_id)
 
         # ---- 检测阈值 ----
         ths = cam.get("thresholds") or []
@@ -194,6 +196,8 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
         "specificationId": data.get("specificationId"),
         "specification": data.get("specification"),
         "camera_count": len(cameras),
+        # 相机名单（含配了但一条有效项都没有的），用于"未变化相机"统计
+        "camera_ids": list(cam_ids),
     }
     model = data.get("model")
     if isinstance(model, dict):
@@ -308,7 +312,73 @@ async def fetch_current_config(timeout: float = 5.0) -> Optional[dict]:
         return None
 
 
-_DIFF_MAX_LINES = 15      # 单次最多打印多少条变更明细，避免刷屏
+def _diff_max_lines() -> int:
+    """单次变更明细最多打多少行；0 = 全部打印（默认）。
+
+    现场一次「全部相机」改值最多 144 条阈值 + 120 条停机规则，默认全打 ——
+    截断会让 camera2 之后的相机看起来「没变」。真要限制，在 config.yaml 里
+    设 material_config.max_diff_lines，改完热更新即生效。
+    """
+    try:
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        v = MATERIAL_CONFIG.get("max_diff_lines", 0)
+        return int(v) if v is not None else 0
+    except Exception:
+        return 0
+
+
+def _stop_rule_brief(rule: Optional[dict]) -> str:
+    """停机规则的紧凑表示，用于「保持原值」那一行。"""
+    r = rule or {}
+    parts = ["enabled=" + ("yes" if r.get("enabled") else "no")]
+    if "min_confidence" in r:
+        parts.append("conf>=" + _f(r["min_confidence"]))
+    if "min_area_mm2" in r:
+        parts.append("area>=" + _f(r["min_area_mm2"]) + "mm2")
+    if r.get("trigger_mode"):
+        parts.append("mode=" + str(r["trigger_mode"]))
+    if "min_width_mm" in r:
+        parts.append("w>=" + _f(r["min_width_mm"]) + "mm")
+    if "min_height_mm" in r:
+        parts.append("h>=" + _f(r["min_height_mm"]) + "mm")
+    return ",".join(parts)
+
+
+def _holdout_lines(thresholds, thr_changed, stop_rules, stop_changed):
+    """同一类别里「部分相机变了、部分没变」时，把没变的连保留值一起列出来。
+
+    前端「全部相机」改阈值时，个别相机（特殊值）会被保留原值。只打「变了什么」
+    看不出这一点 —— 必须同时说明哪些相机没跟着变、保留的是什么值，否则现场
+    没法确认特殊值真的被保住了。
+    """
+    out: List[str] = []
+
+    by_cls: Dict[str, Dict[str, float]] = {}
+    for (cam, cls), nv in thresholds.items():
+        by_cls.setdefault(cls, {})[cam] = nv
+    for cls in sorted(by_cls):
+        cams = by_cls[cls]
+        ch = {c for (c, k) in thr_changed if k == cls}
+        if ch and len(ch) < len(cams):
+            hold = sorted(c for c in cams if c not in ch)
+            out.append("[检测阈值] %s: %d 台已更新, %d 台保持原值 -> %s" % (
+                cls, len(ch), len(hold),
+                ", ".join("%s=%s" % (c, _f(cams[c])) for c in hold)))
+
+    by_cls_s: Dict[str, Dict[str, dict]] = {}
+    for (cam, cls), r in stop_rules.items():
+        by_cls_s.setdefault(cls, {})[cam] = r
+    for cls in sorted(by_cls_s):
+        cams = by_cls_s[cls]
+        ch = {c for (c, k) in stop_changed if k == cls}
+        if ch and len(ch) < len(cams):
+            hold = sorted(c for c in cams if c not in ch)
+            out.append("[停机规则] %s: %d 台已更新, %d 台保持原值 -> %s" % (
+                cls, len(ch), len(hold),
+                ", ".join("%s[%s]" % (c, _stop_rule_brief(cams[c]))
+                          for c in hold)))
+    return out
+
 
 
 def _f(v) -> str:
@@ -403,18 +473,32 @@ def apply_config(data: dict) -> bool:
 
     store.apply(thresholds, stop_rules, meta)
 
-    # ---- 算变更明细 ----
-    changes: List[str] = []
+    # ---- 算变更明细：按相机分组，并单独标出"没跟着变"的相机 ----
+    by_cam: Dict[str, List[str]] = {}
+    thr_changed, stop_changed = set(), set()
     for (cam, cls), nv in sorted(thresholds.items()):
         ov = prev_thr.get((cam, cls))
         if ov is None or abs(float(ov) - float(nv)) > 1e-9:
-            changes.append(f"{cam}/{cls} 阈值 {_f(ov)}->{_f(nv)} "
-                           f"[原:{src.get((cam, cls, 'thr'), '?')}]")
+            by_cam.setdefault(cam, []).append(
+                f"{cls} 阈值 {_f(ov)}->{_f(nv)} "
+                f"[原:{src.get((cam, cls, 'thr'), '?')}]")
+            thr_changed.add((cam, cls))
     for (cam, cls), rule in sorted(stop_rules.items()):
         d = _stop_rule_diff(prev_stop.get((cam, cls)), rule)
         if d:
-            changes.append(f"{cam}/{cls} 停机 " + ", ".join(d)
-                           + f" [原:{src.get((cam, cls, 'stop'), '?')}]")
+            by_cam.setdefault(cam, []).append(
+                f"{cls} 停机 " + ", ".join(d)
+                + f" [原:{src.get((cam, cls, 'stop'), '?')}]")
+            stop_changed.add((cam, cls))
+
+    # 名单以 payload 为准：某台相机配了但一条有效项都没有时，它既不在
+    # thresholds 也不在 stop_rules 里，但现场需要知道"这台什么都没变"。
+    all_cams = sorted(set(meta.get("camera_ids") or [])
+                      | {c for c, _ in thresholds}
+                      | {c for c, _ in stop_rules})
+    changed_cams = sorted(by_cam)
+    unchanged_cams = [c for c in all_cams if c not in by_cam]
+    n_changes = len(thr_changed) + len(stop_changed)
 
     head = (f"[材质配置] 变更成功（来源：后端数据库）"
             f"白布={meta.get('clothNumber')} 卷号={meta.get('roller')} "
@@ -422,17 +506,42 @@ def apply_config(data: dict) -> bool:
             f"相机={meta.get('camera_count')} 台 | "
             f"阈值 {len(thresholds)} 条 / 停机规则 {len(stop_rules)} 条 | "
             f"生效 {len(thresholds) + len(stop_rules)} 项，"
-            f"变化 {len(changes)} 项")
+            f"变化 {n_changes} 项，涉及 {len(changed_cams)} 台相机")
     if was_empty:
         head += "（首次下发，此前生效的是 config.yaml）"
 
-    if not changes:
+    if not by_cam:
         info(head + " —— 与当前生效值一致，无需改动")
     else:
-        shown = changes[:_DIFF_MAX_LINES]
-        tail = (f"\n  ... 另有 {len(changes) - len(shown)} 项变化未列出"
-                if len(changes) > len(shown) else "")
-        info(head + "\n  变更明细：\n  - " + "\n  - ".join(shown) + tail)
+        out = [head]
+        # ① 哪台相机变了 —— 这一行永远打全，不受行数上限影响。
+        #    前端「全部相机」一改就是 8 台一起动，明细被截断时至少这里看得见。
+        out.append("  变化相机（%d 台）：%s" % (
+            len(changed_cams),
+            "  ".join("%s(%d项)" % (c, len(by_cam[c])) for c in changed_cams)))
+        if unchanged_cams:
+            out.append("  未变化相机（%d 台）：%s" % (
+                len(unchanged_cams), ", ".join(unchanged_cams)))
+        # ② 同类别里谁没跟着变 —— 用来确认「特殊值」真的被保住了
+        hold = _holdout_lines(thresholds, thr_changed,
+                              stop_rules, stop_changed)
+        if hold:
+            out.append("  同类别未跟随变更（保持原值的相机）：")
+            out.extend("    " + h for h in hold)
+        # ③ 完整明细，按相机分组
+        body: List[str] = []
+        for c in changed_cams:
+            body.append("【%s】%d 项变化" % (c, len(by_cam[c])))
+            body.extend("    - " + x for x in by_cam[c])
+        cap = _diff_max_lines()
+        if cap > 0 and len(body) > cap:
+            body = body[:cap] + [
+                "... 另有 %d 行未列出（config.yaml "
+                "material_config.max_diff_lines 可调，0=全部打印）"
+                % (len(body) - cap)]
+        out.append("  变更明细（按相机）：")
+        out.extend("    " + b for b in body)
+        info("\n".join(out))
 
     _warn_model_mismatch(meta)
     return True
