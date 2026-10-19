@@ -927,3 +927,119 @@ class TestAllCamerasChange:
         from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
         monkeypatch.delitem(MATERIAL_CONFIG, "max_diff_lines", raising=False)
         assert M._diff_max_lines() == 0
+
+
+class TestDetectionActuallyApplies:
+    """日志打完不算完 —— 读到的值必须真的进到检测判决里。
+
+    本端只读不改：前端页面改 -> 数据库改 -> 本端拉取 -> 检测用新值。
+    这一组从 HTTP 拉取一路查到 ClassThresholdConfig.get_threshold 和
+    effective_stop_rule，确认「全部相机改值」时 7 台跟着走、特殊值那台不动，
+    而且是**检测路径实际取到的值**，不是日志里写的值。
+    """
+
+    CLASSES = ["\u591a\u80a1\u7ebf", "\u7f3a\u7eac",
+               "\u5355\u6839\u5305\u4e0d\u8fdb", "\u5305\u8fb9\u4e0d\u826f"]
+
+    def _serve_mutable(self, db, monkeypatch):
+        import http.server, socketserver, threading as _th
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                cams = []
+                for i in range(1, 9):
+                    cid = "camera%d" % i
+                    ths = [{"defectName": c, "defectLabel": c, "status": 1,
+                            "thresholdValue": (db["cam8_thr"]
+                                               if (i == 8 and c == self.CLS0)
+                                               else db["v"])}
+                           for c in self.CLASSES]
+                    st = [{"name": "\u5355\u6839\u5305\u4e0d\u8fdb",
+                           "enabled": True,
+                           "minConfidence": (db["cam8_stop"] if i == 8
+                                             else db["v"]),
+                           "triggerMode": "dimension",
+                           "minWidthMm": 50, "minHeightMm": 47}]
+                    cams.append({"cameraId": cid, "thresholds": ths,
+                                 "stopSetting": st})
+                body = json.dumps({"code": 0, "data": {
+                    "clothNumber": "C1", "cameras": cams}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        H.CLS0 = self.CLASSES[0]
+        H.CLASSES = self.CLASSES
+        socketserver.TCPServer.allow_reuse_address = True
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+
+        import Communication_Tool.material_config_client as M
+        monkeypatch.setattr(
+            M, "_get_base_url",
+            lambda: "http://127.0.0.1:%d/api" % srv.server_address[1])
+        monkeypatch.setattr(M, "_warn_model_mismatch", lambda meta: None)
+        return srv
+
+    @staticmethod
+    def _detector():
+        """与 detection_pipeline.py:149 完全相同的接线。"""
+        from AnomalyDetection_Tool.config.settings import (
+            CLASS_CONFIDENCE_THRESHOLDS, get_camera_threshold_override,
+            get_default_class_confidence)
+        from AnomalyDetection_Tool.models.data_types import (
+            ClassThresholdConfig)
+        return ClassThresholdConfig(
+            thresholds_by_name=CLASS_CONFIDENCE_THRESHOLDS,
+            default_threshold_provider=get_default_class_confidence,
+            camera_override_provider=get_camera_threshold_override)
+
+    def test_values_reach_the_detection_path(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import effective_stop_rule
+        db = {"v": 0.12, "cam8_thr": 0.55, "cam8_stop": 0.9}
+        srv = self._serve_mutable(db, monkeypatch)
+        tc = self._detector()
+        multi, stop_cls = self.CLASSES[0], self.CLASSES[2]
+        try:
+            # ---- 前端第一次改库 ----
+            assert M.refresh_once(timeout=5) is True
+            assert abs(tc.get_threshold(multi, 0, "camera1") - 0.12) < 1e-9
+            assert abs(tc.get_threshold(multi, 0, "camera5") - 0.12) < 1e-9
+            # 特殊值那台不吃「全部相机」的值
+            assert abs(tc.get_threshold(multi, 0, "camera8") - 0.55) < 1e-9
+            r1 = effective_stop_rule(stop_cls, "camera1")
+            r8 = effective_stop_rule(stop_cls, "camera8")
+            assert abs(r1["min_confidence"] - 0.12) < 1e-9
+            assert abs(r8["min_confidence"] - 0.90) < 1e-9
+
+            # ---- 前端再改一次：全部 0.12 -> 0.20，特殊值仍不动 ----
+            db["v"] = 0.20
+            assert M.refresh_once(timeout=5) is True
+            for i in (1, 2, 3, 4, 5, 6, 7):
+                got = tc.get_threshold(multi, 0, "camera%d" % i)
+                assert abs(got - 0.20) < 1e-9, ("camera%d" % i, got)
+            assert abs(tc.get_threshold(multi, 0, "camera8") - 0.55) < 1e-9
+            assert abs(effective_stop_rule(stop_cls, "camera1")
+                       ["min_confidence"] - 0.20) < 1e-9
+            assert abs(effective_stop_rule(stop_cls, "camera8")
+                       ["min_confidence"] - 0.90) < 1e-9
+        finally:
+            srv.shutdown()
+
+    def test_no_backend_means_yaml_still_drives_detection(self, monkeypatch):
+        """后端从没下发过 -> 检测用的必须是 config.yaml 的值。"""
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import (
+            _camera_det_threshold)
+        RCS.reset_remote_config_store()
+        tc = self._detector()
+        multi = self.CLASSES[0]
+        got = tc.get_threshold(multi, 0, "camera1")
+        assert abs(got - 0.65) < 1e-9, got          # config.yaml 里的值
+        assert abs(_camera_det_threshold("camera1", multi) - got) < 1e-9
