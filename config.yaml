@@ -228,6 +228,17 @@ class_confidence_thresholds:
   纬线不直:   0.35
   短废纱线:   0.5
   经线毛球:   0.5
+  # ---- 以下 8 类为补全 19 项疵点清单新增 ----
+  # 值 = 补全前的实际生效值（回落到 default_class_confidence=0.1），
+  # 即**行为与补全前完全一致**；这些数偏低，请按现场实测逐个调。
+  断纬   : 0.1
+  捻接器接头: 0.1
+  小尾巴  : 0.1
+  手工接头 : 0.1
+  纬斜   : 0.1
+  棉团   : 0.1
+  小布头  : 0.1
+  稀缝   : 0.1
 
 default_class_confidence: 0.1
 
@@ -272,6 +283,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera2:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -285,6 +305,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera3:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -298,6 +327,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera4:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -311,6 +349,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera5:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -324,6 +371,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera6:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -337,6 +393,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera7:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -350,6 +415,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
   camera8:
     class_confidence_thresholds:
       多股线   : 0.65
@@ -363,6 +437,15 @@ camera_threshold_overrides:
       纬线不直  : 0.35
       短废纱线  : 0.5
       经线毛球  : 0.5
+      # ---- 补全 19 项疵点清单新增，值同上（= 全局值）----
+      断纬   : 0.1
+      捻接器接头: 0.1
+      小尾巴  : 0.1
+      手工接头 : 0.1
+      纬斜   : 0.1
+      棉团   : 0.1
+      小布头  : 0.1
+      稀缝   : 0.1
 
 # ------------------------------------------------------------------
 # 【二】停机阈值 · 全局  [热更新]
@@ -449,6 +532,23 @@ machine_stop_rules:
     稀缝:
       enabled: false
 
+    # ---- 以下 4 类为补全 19 项疵点清单新增 ----
+    断纬:
+      enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+      min_confidence: 0.7
+      min_area_mm2  : 60
+    手工接头:
+      enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+      min_confidence: 0.7
+      min_area_mm2  : 60
+    纬斜:
+      enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+      min_confidence: 0.7
+      min_area_mm2  : 60
+    小布头:
+      enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+      min_confidence: 0.7
+      min_area_mm2  : 60
 # ------------------------------------------------------------------
 # 【二】停机阈值 · 按相机覆盖  [热更新]
 # ------------------------------------------------------------------
@@ -552,6 +652,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera2:
     rules:
       飘絮:
@@ -627,6 +744,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera3:
     rules:
       飘絮:
@@ -702,6 +836,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera4:
     rules:
       飘絮:
@@ -777,6 +928,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera5:
     rules:
       飘絮:
@@ -852,6 +1020,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera6:
     rules:
       飘絮:
@@ -927,6 +1112,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera7:
     rules:
       飘絮:
@@ -1002,6 +1204,23 @@ camera_stop_rule_overrides:
         enabled: false
       稀缝:
         enabled: false
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
   camera8:
     rules:
       飘絮:
@@ -1079,6 +1298,23 @@ camera_stop_rule_overrides:
         enabled: false
 
 
+      # ---- 补全 19 项疵点清单新增 ----
+      断纬:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      手工接头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      纬斜:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
+      小布头:
+        enabled       : false   # 补全清单新增，默认**不停机**；要启用请先按现场实测配好下面两项再改 true
+        min_confidence: 0.7
+        min_area_mm2  : 60
 # ==================================================================
 # 【三】停机 · 重复触发（同一台相机上同类疵点在时间窗口内反复出现）  [热更新]
 # ==================================================================
