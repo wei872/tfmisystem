@@ -26,6 +26,14 @@ DEFECT_LABEL_MAP = {
     "棉团": "cotton_ball",
     "捻接器接头": "joint",
     "飘絮": "feather",
+    # 断纬 与 缺纬 是**两种不同的疵点**，不是改名：
+    #   缺纬 = 纬线间距过大（stop_type="weft"）        -> missing_latitude
+    #   断纬 = 纬线断裂成根（stop_type="broken_weft"） -> weft_broken
+    # 两者由 warp_weft_analysis_tasks.py 各自独立产生。断纬 取 weft_broken
+    # 是为了和 warp_weft_stop_handler.STOP_TYPE_TO_DEFECT 保持一致 ——
+    # 稀缝(thin_seam) 和 纬斜(lat_slope) 两对本来就对得上，同一个疵点
+    # 在两条路径上必须上报同一个 defectType。
+    "断纬": "weft_broken",
     "缺纬": "lack_lat",
     "纬线不直": "lat_not_straight",
     "纬线杂质": "lat_impurity",
