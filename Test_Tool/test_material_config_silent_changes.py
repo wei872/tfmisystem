@@ -72,26 +72,31 @@ def _apply_then(monkeypatch, mutate):
 
 class TestSilentChangesAreNowReported:
     def test_disabled_class_is_reported(self, monkeypatch):
-        """status=0：该类别退回本地阈值，这是真实的行为变化。"""
+        """status=0 = 前端明确停用，日志要说清"不再检测"。"""
         def m(p):
             for c in p["cameras"]:
                 for t in c["thresholds"]:
                     if t["defectName"] == "包边不良":
                         t["status"] = 0
         out = _apply_then(monkeypatch, m)
-        assert "本次未下发" in out, out
+        assert "已停用" in out and "不再检测" in out, out
         assert "包边不良" in out
         # 停用前是 0.5，不是"无" —— 旧值必须来自应用前的快照
-        assert "0.5->退回本地" in out, out
+        assert "0.5->已停用" in out, out
 
     def test_deleted_class_is_reported(self, monkeypatch):
-        """整条删掉，和停用同样要让现场看得见。"""
+        """整条缺失（不是 status=0）：语义不明，退回本地并说明原因。
+
+        不能当成"停用" —— 后端漏发一个类别就把该类检测关掉是静默漏检。
+        """
         def m(p):
             for c in p["cameras"]:
                 c["thresholds"] = [t for t in c["thresholds"]
                                    if t["defectName"] != "包边不良"]
         out = _apply_then(monkeypatch, m)
-        assert "本次未下发" in out and "包边不良" in out, out
+        assert "后端本次未包含该项" in out, out
+        assert "退回本地" in out and "包边不良" in out, out
+        assert "已停用" not in out, out
 
     def test_cleared_stop_field_is_reported(self, monkeypatch):
         """字段被清空 = 键从 payload 消失。按并集比才抓得到。"""
@@ -128,6 +133,84 @@ class TestSilentChangesAreNowReported:
         for _ in range(5):
             M.apply_config(_base())
         assert logs == [], logs
+
+
+class TestDisabledClassReallyStopsDetecting:
+    """status=0 的类别必须真的检不出来 —— 日志说"已停用"不算数。
+
+    阈值不能写成 1.0：check_confidence 用的是 confidence >= threshold，
+    置信度恰好 1.0 时仍会通过，关不干净。所以用严格大于 1 的哨兵值。
+    """
+
+    @staticmethod
+    def _detector():
+        from AnomalyDetection_Tool.config.settings import (
+            CLASS_CONFIDENCE_THRESHOLDS, get_camera_threshold_override,
+            get_default_class_confidence)
+        from AnomalyDetection_Tool.models.data_types import (
+            ClassThresholdConfig)
+        return ClassThresholdConfig(
+            thresholds_by_name=CLASS_CONFIDENCE_THRESHOLDS,
+            default_threshold_provider=get_default_class_confidence,
+            camera_override_provider=get_camera_threshold_override)
+
+    @staticmethod
+    def _disable(monkeypatch, off):
+        """off = 停用 包边不良 的相机集合。"""
+        M.apply_config(_base())
+        p = _base()
+        for c in p["cameras"]:
+            for t in c["thresholds"]:
+                if t["defectName"] == "包边不良" and c["cameraId"] in off:
+                    t["status"] = 0
+        assert M.apply_config(p) is True
+
+    def test_sentinel_is_strictly_above_one(self):
+        assert M.DISABLED_THRESHOLD > 1.0
+
+    def test_disabled_camera_never_detects(self, monkeypatch):
+        tc = self._detector()
+        self._disable(monkeypatch, {"camera1", "camera2"})
+        for cam in ("camera1", "camera2"):
+            assert tc.get_threshold("包边不良", 0, cam) == M.DISABLED_THRESHOLD
+            # 连置信度 1.0 都必须挡掉 —— 这正是不能用 1.0 当阈值的原因
+            for conf in (0.0, 0.5, 0.9, 0.99999, 1.0):
+                assert tc.check_confidence("包边不良", 0, conf, cam) is False, \
+                    (cam, conf)
+
+    def test_enabled_camera_still_detects(self, monkeypatch):
+        tc = self._detector()
+        self._disable(monkeypatch, {"camera1"})
+        assert abs(tc.get_threshold("包边不良", 0, "camera2") - 0.50) < 1e-9
+        assert tc.check_confidence("包边不良", 0, 0.9, "camera2") is True
+
+    def test_other_classes_unaffected(self, monkeypatch):
+        tc = self._detector()
+        self._disable(monkeypatch, {"camera1", "camera2"})
+        assert abs(tc.get_threshold("多股线", 0, "camera1") - 0.30) < 1e-9
+        assert tc.check_confidence("多股线", 0, 0.9, "camera1") is True
+
+    def test_re_enabling_restores_detection(self, monkeypatch):
+        """前端再把它打开，必须立刻恢复检测。"""
+        tc = self._detector()
+        self._disable(monkeypatch, {"camera1"})
+        assert tc.check_confidence("包边不良", 0, 1.0, "camera1") is False
+        M.apply_config(_base())                    # status 回到 1
+        assert abs(tc.get_threshold("包边不良", 0, "camera1") - 0.50) < 1e-9
+        assert tc.check_confidence("包边不良", 0, 0.9, "camera1") is True
+
+    def test_absent_class_falls_back_not_disabled(self, monkeypatch):
+        """整条缺失 != 停用：仍按本地阈值检测，不能被静默关掉。"""
+        tc = self._detector()
+        M.apply_config(_base())
+        p = _base()
+        for c in p["cameras"]:
+            c["thresholds"] = [t for t in c["thresholds"]
+                               if t["defectName"] != "包边不良"]
+        M.apply_config(p)
+        thr = tc.get_threshold("包边不良", 0, "camera1")
+        assert thr != M.DISABLED_THRESHOLD, thr
+        assert tc.check_confidence("包边不良", 0, 0.9, "camera1") is True
 
 
 class TestStopRuleDiffSemantics:

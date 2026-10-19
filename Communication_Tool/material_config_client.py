@@ -117,6 +117,7 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
         raise ValueError(f"data 不是对象: {type(data).__name__}")
 
     cam_ids: List[str] = []
+    disabled_thr: List[str] = []
     cameras = data.get("cameras")
     if cameras is None:
         cameras = []
@@ -154,9 +155,13 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
             except (TypeError, ValueError):
                 status = 1
             if status != 1:
+                # status=0 是前端**明确停用**这个类别，不是"没配"。
+                # 语义是"这一项不检测"，所以记进 disabled，稍后把阈值置成
+                # 哨兵值；**不能**退回本地阈值 —— 那等于前端关了、现场还在检。
+                disabled_thr.append(f"{cam_id}/{name}")
                 skipped_threshold.append(
                     f"{cam_id}/{name}: status={t.get('status')!r} 未启用，"
-                    f"退回本地阈值")
+                    f"该类别不再检测")
                 continue
             val = _to_float(t.get("thresholdValue"))
             if val is None:
@@ -216,6 +221,8 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
         "camera_count": len(cameras),
         # 相机名单（含配了但一条有效项都没有的），用于"未变化相机"统计
         "camera_ids": list(cam_ids),
+        # status!=1 的 (相机/类别) 名单 —— 明确停用，阈值置哨兵值
+        "disabled_thresholds": list(disabled_thr),
     }
     model = data.get("model")
     if isinstance(model, dict):
@@ -380,6 +387,16 @@ async def fetch_current_config(timeout: float = 5.0) -> Optional[dict]:
     except Exception as e:
         _log_stable("fail:exc", "info", f"[材质配置] 拉取异常: {e}")
         return None
+
+
+# 「该类别不检测」用的哨兵阈值。
+#
+# 必须**严格大于 1**：check_confidence 用的是 confidence >= threshold，
+# 写成 1.0 时置信度恰好等于 1.0 的检出仍然会通过，关不干净。
+# YOLO 置信度是 float32，1.0 之上的下一个可表示值约 1.0000001，
+# 取 1.000001 足以把任何 <=1.0 的置信度挡在外面，又不像 inf 那样会在
+# 别处的算术（有效停机门槛 max() 等）里炸掉。
+DISABLED_THRESHOLD = 1.000001
 
 
 def _diff_max_lines() -> int:
@@ -562,8 +579,17 @@ def apply_config(data: dict) -> bool:
                     f"（来源接口 {_endpoint()}）")
         return False
 
+    # status=0 的类别：阈值置哨兵值 = 该类别不再检测。
+    # 单独拎出来，因为它和"后端整条没给"是两回事（见下面注释）。
+    disabled = {tuple(str(k).split("/", 1))
+                for k in (meta.get("disabled_thresholds") or [])
+                if "/" in str(k)}
+    store_thr = dict(thresholds)
+    for k in disabled:
+        store_thr[k] = DISABLED_THRESHOLD
+
     prev_thr, prev_stop, src, was_empty = _collect_previous(
-        thresholds, stop_rules)
+        store_thr, stop_rules)
 
     # 应用**前**的完整快照。覆盖层是整份替换（remote_config_store.apply
     # 明确不做增量合并），所以后端这次没下发的条目会真的从生效值里消失、
@@ -583,7 +609,7 @@ def apply_config(data: dict) -> bool:
     # 被删掉的那条根本不在里面，直接取会得到 None 显示成"无"。
     prev_thr_flat = _before.get("thresholds") or {}
 
-    store.apply(thresholds, stop_rules, meta)
+    store.apply(store_thr, stop_rules, meta)
 
     # ---- 算变更明细：按相机分组，并单独标出"没跟着变"的相机 ----
     by_cam: Dict[str, List[str]] = {}
@@ -606,7 +632,16 @@ def apply_config(data: dict) -> bool:
     # ---- 后端这次**没下发**的条目：生效值已退回本地，必须打出来 ----
     # 前端把某个类停用（status=0）或整条删掉，都会走到这里。不打的话，
     # 现场会看到"我明明改了/停了，日志一点动静都没有"。
-    for (cam, cls) in sorted(prev_thr_keys - set(thresholds)):
+    # ① 前端明确停用（status=0）—— 该类别不再检测
+    for (cam, cls) in sorted(disabled):
+        ov = prev_thr_flat.get(f"{cam}/{cls}")
+        if ov is None or not _same(ov, DISABLED_THRESHOLD):
+            by_cam.setdefault(cam, []).append(
+                f"{cls} 阈值 {_f(ov)}->已停用（status=0，不再检测）")
+            thr_changed.add((cam, cls))
+    # ② 后端整条没给（不是 status=0）—— 语义不明，退回本地并告警。
+    #    不能当成"停用"：后端漏发一个类别就把该类检测关掉，是静默漏检。
+    for (cam, cls) in sorted(prev_thr_keys - set(store_thr)):
         local = None
         try:
             from AnomalyDetection_Tool.config.settings import (
@@ -615,7 +650,7 @@ def apply_config(data: dict) -> bool:
         except Exception:
             local = None
         by_cam.setdefault(cam, []).append(
-            f"{cls} 阈值 本次未下发（已停用/删除），"
+            f"{cls} 阈值 后端本次未包含该项（非 status=0），"
             f"{_f(prev_thr_flat.get(f'{cam}/{cls}'))}->退回本地 {_f(local)}")
         thr_changed.add((cam, cls))
     for (cam, cls) in sorted(prev_stop_keys - set(stop_rules)):
