@@ -460,16 +460,36 @@ def _f(v) -> str:
     return str(v)
 
 
+def _same(a, b) -> bool:
+    """值相等判断，浮点带容差。
+
+    后端回传的 JSON 浮点可能带尾巴（0.30000000000000004），直接 != 会
+    把"没变"判成"变了"，反过来也会把真变更淹在噪声里。
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    try:
+        return abs(float(a) - float(b)) <= 1e-9
+    except (TypeError, ValueError):
+        return a == b
+
+
 def _stop_rule_diff(old: Optional[dict], new: dict) -> List[str]:
-    """比较两份停机规则，返回 ['字段 旧 -> 新', ...]。"""
+    """比较两份停机规则，返回 ['字段 旧 -> 新', ...]。
+
+    按**并集**比，不是只看新规则里有的字段。覆盖层是整份替换：前端把某个
+    字段清空后，这个字段就从生效规则里消失了 —— 只比新规则里有的键，
+    这种"字段被删掉"的变更会被完全漏掉（实测过，确实漏）。
+    """
     out: List[str] = []
     old = old or {}
+    new = new or {}
     for k in ("enabled", "min_confidence", "min_area_mm2", "trigger_mode",
               "min_width_mm", "min_height_mm"):
         ov, nv = old.get(k), new.get(k)
-        if k not in new:
+        if ov is None and nv is None:
             continue
-        if ov != nv:
+        if not _same(ov, nv):
             out.append(f"{k} {_f(ov)}->{_f(nv)}")
     return out
 
@@ -545,6 +565,24 @@ def apply_config(data: dict) -> bool:
     prev_thr, prev_stop, src, was_empty = _collect_previous(
         thresholds, stop_rules)
 
+    # 应用**前**的完整快照。覆盖层是整份替换（remote_config_store.apply
+    # 明确不做增量合并），所以后端这次没下发的条目会真的从生效值里消失、
+    # 悄悄退回 config.yaml。只比对"新下发里有什么"，就会漏掉"原来有、
+    # 现在没了"的那一半 —— 而那正是生效值发生变化的时候。
+    try:
+        _before = store.snapshot()
+    except Exception:
+        _before = {}
+    prev_meta = _before.get("meta") or {}
+    prev_thr_keys = {tuple(str(k).split("/", 1))
+                     for k in (_before.get("thresholds") or {})}
+    prev_stop_keys = {tuple(str(k).split("/", 1))
+                      for k in (_before.get("stop_rules") or {})}
+    # 拍平键 "相机/类别" -> 值，用于报"这条被删掉前是多少"。
+    # 不能用 prev_thr：_collect_previous 只收集**本次新下发**的键，
+    # 被删掉的那条根本不在里面，直接取会得到 None 显示成"无"。
+    prev_thr_flat = _before.get("thresholds") or {}
+
     store.apply(thresholds, stop_rules, meta)
 
     # ---- 算变更明细：按相机分组，并单独标出"没跟着变"的相机 ----
@@ -564,6 +602,36 @@ def apply_config(data: dict) -> bool:
                 f"{cls} 停机 " + ", ".join(d)
                 + f" [原:{src.get((cam, cls, 'stop'), '?')}]")
             stop_changed.add((cam, cls))
+
+    # ---- 后端这次**没下发**的条目：生效值已退回本地，必须打出来 ----
+    # 前端把某个类停用（status=0）或整条删掉，都会走到这里。不打的话，
+    # 现场会看到"我明明改了/停了，日志一点动静都没有"。
+    for (cam, cls) in sorted(prev_thr_keys - set(thresholds)):
+        local = None
+        try:
+            from AnomalyDetection_Tool.config.settings import (
+                _camera_det_threshold)
+            local = _camera_det_threshold(cam, cls)
+        except Exception:
+            local = None
+        by_cam.setdefault(cam, []).append(
+            f"{cls} 阈值 本次未下发（已停用/删除），"
+            f"{_f(prev_thr_flat.get(f'{cam}/{cls}'))}->退回本地 {_f(local)}")
+        thr_changed.add((cam, cls))
+    for (cam, cls) in sorted(prev_stop_keys - set(stop_rules)):
+        by_cam.setdefault(cam, []).append(
+            f"{cls} 停机规则 本次未下发（已停用/删除），已退回本地规则")
+        stop_changed.add((cam, cls))
+
+    # ---- 元信息变化：换布卷/换材质本身就是要看得见的事 ----
+    meta_changes: List[str] = []
+    if not was_empty:
+        for key, label in (("clothNumber", "白布"), ("roller", "卷号"),
+                           ("material", "材质"), ("specification", "规格"),
+                           ("modelPath", "模型")):
+            ov, nv = prev_meta.get(key), meta.get(key)
+            if _f(ov) != _f(nv):
+                meta_changes.append(f"{label} {_f(ov)}->{_f(nv)}")
 
     # 名单以 payload 为准：某台相机配了但一条有效项都没有时，它既不在
     # thresholds 也不在 stop_rules 里，但现场需要知道"这台什么都没变"。
@@ -589,21 +657,29 @@ def apply_config(data: dict) -> bool:
     _log_reset("fail:")
     _log_reset("src:")
 
-    if not by_cam:
+    if not by_cam and not meta_changes:
         # 现场要求：只在**出错**或**发生变更**时打日志。2s 一轮的轮询下，
         # "无需改动"每分钟会重复 30 次，没有任何信息量。
+        # 注意这里必须连 meta_changes 一起判：只改卷号/材质而阈值没动，
+        # 也是一次真实的变更，不能静默。
         if not _quiet_when_unchanged():
             info(head + " —— 与当前生效值一致，无需改动")
     else:
         out = [head, "  来源接口：" + _endpoint()]
+        if meta_changes:
+            out.append("  布卷/材质变更：" + ", ".join(meta_changes))
         # ① 哪台相机变了 —— 这一行永远打全，不受行数上限影响。
         #    前端「全部相机」一改就是 8 台一起动，明细被截断时至少这里看得见。
-        out.append("  变化相机（%d 台）：%s" % (
-            len(changed_cams),
-            "  ".join("%s(%d项)" % (c, len(by_cam[c])) for c in changed_cams)))
-        if unchanged_cams:
-            out.append("  未变化相机（%d 台）：%s" % (
-                len(unchanged_cams), ", ".join(unchanged_cams)))
+        #    只改了布卷/材质时 changed_cams 是空的，这时整段都不打，
+        #    否则留下"变化相机（0 台）："这种空标题。
+        if changed_cams:
+            out.append("  变化相机（%d 台）：%s" % (
+                len(changed_cams),
+                "  ".join("%s(%d项)" % (c, len(by_cam[c]))
+                          for c in changed_cams)))
+            if unchanged_cams:
+                out.append("  未变化相机（%d 台）：%s" % (
+                    len(unchanged_cams), ", ".join(unchanged_cams)))
         # ② 同类别里谁没跟着变 —— 用来确认「特殊值」真的被保住了
         hold = _holdout_lines(thresholds, thr_changed,
                               stop_rules, stop_changed)
@@ -621,8 +697,9 @@ def apply_config(data: dict) -> bool:
                 "... 另有 %d 行未列出（config.yaml "
                 "material_config.max_diff_lines 可调，0=全部打印）"
                 % (len(body) - cap)]
-        out.append("  变更明细（按相机）：")
-        out.extend("    " + b for b in body)
+        if body:
+            out.append("  变更明细（按相机）：")
+            out.extend("    " + b for b in body)
         info("\n".join(out))
 
     _warn_model_mismatch(meta)
