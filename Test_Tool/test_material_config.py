@@ -1226,3 +1226,191 @@ class TestPollingQuietness:
         monkeypatch.delitem(MATERIAL_CONFIG, "quiet_when_unchanged",
                             raising=False)
         assert M._quiet_when_unchanged() is True
+
+
+class TestStartupSource:
+    """开局以数据库为准，数据库有问题才回落 config.yaml。
+
+    以前启动拉取一律丢后台线程，覆盖层还是空的检测就已经开跑了 ——
+    开头那几秒实际用的是本地 yaml，与"开局以数据库为准"相反。
+    现在开局是**有硬上限的阻塞等待**，等完才走到 run_production_mode()。
+    """
+
+    @staticmethod
+    def _collect(monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = []
+        for lvl in ("info", "warning", "error"):
+            monkeypatch.setattr(M, lvl,
+                                (lambda L: lambda m: L.append(m))(logs))
+        monkeypatch.setattr(M, "_warn_model_mismatch", lambda meta: None)
+        return logs
+
+    def test_source_says_yaml_when_store_empty(self):
+        import Communication_Tool.material_config_client as M
+        assert "config.yaml" in M.active_source()
+        assert "从未成功下发" in M.active_source()
+
+    def test_source_says_backend_after_apply(self):
+        import Communication_Tool.material_config_client as M
+        M.apply_config({"clothNumber": "C1", "cameras": [
+            {"cameraId": "camera1",
+             "thresholds": [{"defectName": "多股线", "defectLabel": "multi_line",
+                             "thresholdValue": 0.2, "status": 1}],
+             "stopSetting": []}]})
+        s = M.active_source()
+        assert "后端数据库" in s and "阈值 1 条" in s, s
+
+    def test_source_never_raises(self):
+        """来源查询是诊断用的，自己出异常也不能把启动带崩。"""
+        import Communication_Tool.material_config_client as M
+        import AnomalyDetection_Tool.config.remote_config_store as R
+        real = R.get_remote_config_store
+
+        def boom():
+            raise RuntimeError("store 炸了")
+        R.get_remote_config_store = boom
+        try:
+            assert "无法确定" in M.active_source()
+        finally:
+            R.get_remote_config_store = real
+
+    def test_dead_backend_returns_within_the_hard_bound(self, monkeypatch):
+        """后端连不上时，阻塞时长必须有硬上限，不能把开机流程挂死。
+
+        注入实验证明这条是真会咬人的：把 refresh_once 里的
+        join(timeout + 3) 改成 join() 之后，这条用例从 9s 变成 65s。
+        """
+        import socket
+        import time
+        import Communication_Tool.material_config_client as M
+        # 占一个端口再立刻放掉 —— 这个端口上一定没人监听
+        sk = socket.socket()
+        sk.bind(("127.0.0.1", 0))
+        dead_port = sk.getsockname()[1]
+        sk.close()
+        monkeypatch.setattr(
+            M, "_get_base_url",
+            lambda: "http://127.0.0.1:%d/api" % dead_port)
+        M._LOG_SEEN.clear()
+        try:
+            t0 = time.monotonic()
+            assert M.refresh_once(timeout=2.0) is False
+            dt = time.monotonic() - t0
+        finally:
+            M._LOG_SEEN.clear()
+        assert dt < 2.0 + 3.0 + 1.5, "阻塞 %.2fs 超过硬上限" % dt
+        assert "config.yaml" in M.active_source()
+
+    def test_slow_backend_is_waited_for(self, monkeypatch):
+        """后端慢但在超时内 -> 必须等它，开局就用数据库那份。"""
+        import http.server, socketserver, threading as _th
+        import time
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import effective_stop_rule
+        from AnomalyDetection_Tool.models.data_types import ClassThresholdConfig
+        from AnomalyDetection_Tool.config.settings import (
+            CLASS_CONFIDENCE_THRESHOLDS, get_camera_threshold_override,
+            get_default_class_confidence)
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(0.6)
+                cams = [{"cameraId": "camera%d" % i,
+                         "thresholds": [{"defectName": "多股线",
+                                         "defectLabel": "multi_line",
+                                         "thresholdValue": 0.20,
+                                         "status": 1}],
+                         "stopSetting": [{"name": "单根包不进", "enabled": True,
+                                          "minConfidence": 0.20,
+                                          "triggerMode": "dimension",
+                                          "minWidthMm": 50,
+                                          "minHeightMm": 47}]}
+                        for i in range(1, 9)]
+                body = json.dumps({"code": 0, "data": {"clothNumber": "C1",
+                                                       "cameras": cams}}
+                                  ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        socketserver.TCPServer.allow_reuse_address = True
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+        monkeypatch.setattr(
+            M, "_get_base_url",
+            lambda: "http://127.0.0.1:%d/api" % srv.server_address[1])
+        monkeypatch.setattr(M, "_warn_model_mismatch", lambda meta: None)
+        tc = ClassThresholdConfig(
+            thresholds_by_name=CLASS_CONFIDENCE_THRESHOLDS,
+            default_threshold_provider=get_default_class_confidence,
+            camera_override_provider=get_camera_threshold_override)
+        try:
+            t0 = time.monotonic()
+            assert M.refresh_once(timeout=5) is True
+            assert time.monotonic() - t0 >= 0.6      # 真的等了
+            # 开局这一刻，检测取到的就是数据库那份
+            assert abs(tc.get_threshold("多股线", 0, "camera1") - 0.20) < 1e-9
+            assert abs(effective_stop_rule("单根包不进", "camera1")
+                       ["min_confidence"] - 0.20) < 1e-9
+            assert "后端数据库" in M.active_source()
+        finally:
+            srv.shutdown()
+
+
+class TestStartupWiring:
+    """main_yolo 里的接线：开局拉取必须阻塞，且在启动检测之前。"""
+
+    @pytest.fixture()
+    def wired(self):
+        import fake_galaxy_sdk
+        fake_galaxy_sdk.install()
+        import main_yolo
+        return main_yolo
+
+    def _main_src(self, wired):
+        import inspect
+        return inspect.getsource(wired.main)
+
+    def test_startup_fetch_is_not_in_a_thread_by_default(self, wired):
+        """wait_on_start=true（默认）时，开局拉取是同步调用。"""
+        src = self._main_src(wired)
+        assert '_mc_wait = bool(_mc_cfg.get("wait_on_start", True))' in src
+        # 阻塞分支里直接调 _mc_fetch，而不是塞进 Thread
+        blk = src[src.index("if _mc_wait:"):src.index("else:", src.index("if _mc_wait:"))]
+        assert '_mc_fetch("启动")' in blk, blk
+        assert "threading.Thread" not in blk, "开局又变回后台线程了"
+
+    def test_nonblocking_path_is_kept_behind_the_switch(self, wired):
+        """wait_on_start=false 时保留旧的后台线程行为。"""
+        src = self._main_src(wired)
+        tail = src[src.index('name="material-config-init"') - 400:]
+        assert "threading.Thread" in tail
+        assert 'args=("启动",)' in tail
+
+    def test_fetch_happens_before_detection_starts(self, wired):
+        """顺序不能反：拉取在前，run_production_mode() 在后。"""
+        src = self._main_src(wired)
+        i_fetch = src.index("开局检测/停机配置来源")
+        # 必须匹配真正的**调用**（return run_xxx()）。裸写 run_production_mode()
+        # 会先命中我自己在注释里提的那一句 —— 锚点看着唯一其实不唯一。
+        i_prod = src.index("return run_production_mode()")
+        i_sim = src.index("return run_simulation_mode()")
+        assert i_fetch < i_prod, "开局拉取跑到了启动检测之后"
+        assert i_fetch < i_sim, "开局拉取跑到了启动模拟之后"
+
+    def test_active_source_is_imported(self, wired):
+        assert callable(wired.material_config_source)
+
+    def test_config_default_waits(self):
+        """config.yaml 里 wait_on_start 默认开着。"""
+        import io
+        import yaml
+        p = os.path.join(ROOT, "config.yaml")
+        c = yaml.safe_load(io.open(p, encoding="utf-8"))
+        assert c["material_config"]["wait_on_start"] is True

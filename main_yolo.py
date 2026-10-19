@@ -65,6 +65,7 @@ from General_Tool.SpeedGuard import init_speed_guard, get_speed_guard
 from AnomalyDetection_Tool.filter.edge_region_learner import (
     init_edge_learner)
 from Communication_Tool.material_config_client import (
+    active_source as material_config_source,
     refresh_once as refresh_material_config)
 from AnomalyDetection_Tool.output.encoder_state_service import (
     get_encoder_state)
@@ -1379,6 +1380,7 @@ def main() -> int:
             _mc_timeout = float(_mc_cfg.get("timeout_sec", 5) or 5)
             _mc_interval = float(_mc_cfg.get("refresh_interval_sec", 60) or 0)
             _mc_on_start = bool(_mc_cfg.get("fetch_on_start", True))
+            _mc_wait = bool(_mc_cfg.get("wait_on_start", True))
 
             def _mc_fetch(tag: str) -> None:
                 try:
@@ -1389,9 +1391,25 @@ def main() -> int:
                 except Exception as e:
                     error(f"[材质配置] {tag} 异常: {e}")
 
-            threading.Thread(target=_mc_fetch, args=("启动",),
-                             name="material-config-init",
-                             daemon=True).start()
+            # 开局**阻塞**等待后端配置，等完才继续往下走到 run_production_mode()。
+            # 以前这里一律丢后台线程：覆盖层还是空的，检测就已经开跑了，
+            # 开头那几秒实际用的是 config.yaml —— 和"开局以数据库为准"相反。
+            #
+            # 等待有**硬上限**（timeout_sec + 3s，由 refresh_once 内部的
+            # join 保证），后端没起来也绝不会把开机流程挂死；那种情况会明确
+            # 打出"开局配置来源：config.yaml 本地配置"，不会让人误以为在用
+            # 数据库那份。
+            if _mc_wait:
+                info(f"[材质配置] 开局等待后端配置，最多 {_mc_timeout + 3:.0f}s"
+                     f"（在此之前不启动检测）…")
+                _mc_fetch("启动")
+                info(f"[材质配置] 开局检测/停机配置来源：{material_config_source()}")
+            else:
+                # wait_on_start=false 时回到旧行为：不等网络，先用本地 yaml
+                # 开机，后端配置拉到了再热切过去。
+                threading.Thread(target=_mc_fetch, args=("启动",),
+                                 name="material-config-init",
+                                 daemon=True).start()
 
             if _mc_on_start:
                 # 新布卷可能换了材质/规格，必须重新拉

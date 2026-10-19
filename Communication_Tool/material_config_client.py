@@ -660,6 +660,26 @@ def _log_source(reason: str) -> None:
                     f"[材质配置] 变更未生效（{reason}）")
 
 
+def active_source() -> str:
+    """当前**实际生效**的检测/停机配置来自哪一份，给人看的一句话。
+
+    开局必须能一眼看出检测按哪套阈值在跑 —— 只写"拉取成功"是不够的，
+    拉到了空数据、或某几类被跳过退回本地，都属于"部分不是后端的"。
+    """
+    from AnomalyDetection_Tool.config.remote_config_store import (
+        get_remote_config_store)
+    try:
+        st = get_remote_config_store()
+        if st.is_empty():
+            return "config.yaml 本地配置（后端数据库从未成功下发）"
+        snap = st.snapshot()
+        return ("后端数据库（阈值 %d 条 / 停机规则 %d 条，%ss 前应用）"
+                % (snap["threshold_count"], snap["stop_rule_count"],
+                   snap["age_sec"]))
+    except Exception as e:
+        return "无法确定（读取覆盖层异常: %s）" % e
+
+
 def refresh_once(timeout: float = 5.0) -> bool:
     """同步入口：拉一次并应用。供启动、「开始」回调、定时线程调用。
 
