@@ -27,13 +27,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from Communication_Tool.material_config_client import (  # noqa: E402
     parse_config, apply_config, _is_ok, API_PATH)
 from AnomalyDetection_Tool.config import remote_config_store as RCS  # noqa: E402
+import Communication_Tool.material_config_client as MCM  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _clean_store():
+    """重置覆盖层 + 日志去重状态。
+
+    去重表是模块级的，不清就会跨用例泄漏：上一个用例打过的那条，
+    下一个用例期望它出现时会被静默吞掉，测试结果取决于执行顺序。
+    """
     RCS.reset_remote_config_store()
+    MCM._LOG_SEEN.clear()
+    MCM._LABEL_WARNED.clear()
     yield
     RCS.reset_remote_config_store()
+    MCM._LOG_SEEN.clear()
+    MCM._LABEL_WARNED.clear()
 
 
 def _store():
@@ -673,16 +683,26 @@ class TestChangeReporting:
         assert "多股线 阈值" in out and "->0.1" in out
         assert "[原:config.yaml]" in out
 
-    def test_no_change_does_not_repeat_details(self, monkeypatch):
-        """同样的配置再拉一次，不能再打一遍明细（否则 2s 一轮会刷屏）。"""
+    def test_no_change_prints_nothing_by_default(self, monkeypatch):
+        """同样的配置再拉一次，**一行都不打**（现场要求：只在出错/变更时打）。"""
         import Communication_Tool.material_config_client as M
         M.apply_config(self._cams(0.10))
         logs = self._collect(monkeypatch)
         assert M.apply_config(self._cams(0.10)) is True
-        out = "\n".join(logs["info"])
-        assert "变化 0 项" in out
-        assert "无需改动" in out
-        assert "变更明细" not in out
+        assert logs["info"] == [] and logs["warning"] == [] and logs["error"] == []
+
+    def test_no_change_can_still_be_shown(self, monkeypatch):
+        """想确认轮询还活着：quiet_when_unchanged 设 false 即可。"""
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        monkeypatch.setitem(MATERIAL_CONFIG, "quiet_when_unchanged", False)
+        M.apply_config(self._cams(0.10))
+        logs = self._collect(monkeypatch)
+        assert M.apply_config(self._cams(0.10)) is True
+        assert len(logs["info"]) == 1, logs
+        assert "变化 0 项" in logs["info"][0]
+        assert "无需改动" in logs["info"][0]
+        assert "变更明细" not in logs["info"][0]
 
     def test_changed_value_shows_old_and_new(self, monkeypatch):
         import Communication_Tool.material_config_client as M
@@ -899,13 +919,14 @@ class TestAllCamerasChange:
         out = "\n".join(logs)
         assert "未变化相机（1 台）：camera5" in out
 
-    def test_all_cameras_unchanged_stays_one_line(self, monkeypatch):
+    def test_all_cameras_unchanged_is_silent(self, monkeypatch):
+        """8 台都没变 -> 完全不打。2s 一轮下这是每轮都会走到的路径。"""
         import Communication_Tool.material_config_client as M
         M.apply_config(self.payload(0.30))
         logs = self._collect(monkeypatch)
-        M.apply_config(self.payload(0.30))
-        assert len(logs) == 1, logs
-        assert "变化 0 项" in logs[0] and "涉及 0 台相机" in logs[0]
+        for _ in range(5):                       # 模拟连续 5 轮轮询
+            M.apply_config(self.payload(0.30))
+        assert logs == [], logs
 
     def test_max_diff_lines_can_still_cap(self, monkeypatch):
         """真要限制行数：material_config.max_diff_lines > 0 时生效。"""
@@ -1034,7 +1055,6 @@ class TestDetectionActuallyApplies:
 
     def test_no_backend_means_yaml_still_drives_detection(self, monkeypatch):
         """后端从没下发过 -> 检测用的必须是 config.yaml 的值。"""
-        import Communication_Tool.material_config_client as M
         from AnomalyDetection_Tool.config.settings import (
             _camera_det_threshold)
         RCS.reset_remote_config_store()
@@ -1043,3 +1063,166 @@ class TestDetectionActuallyApplies:
         got = tc.get_threshold(multi, 0, "camera1")
         assert abs(got - 0.65) < 1e-9, got          # config.yaml 里的值
         assert abs(_camera_det_threshold("camera1", multi) - got) < 1e-9
+
+
+class TestPollingQuietness:
+    """现场 refresh_interval_sec=2，即每 2 秒轮询一次数据库。
+
+    要求：只在**出错**或**真的发生变更**时打日志。后端的稳定状态
+    （哪些类 status=0、拉取失败的原因、当前生效的是哪一份）每轮重打一遍
+    会把变更明细彻底淹掉。
+    """
+
+    @staticmethod
+    def _collect(monkeypatch):
+        import Communication_Tool.material_config_client as M
+        logs = []
+        for lvl in ("info", "warning", "error"):
+            monkeypatch.setattr(M, lvl,
+                                (lambda L: lambda m: L.append(m))(logs))
+        monkeypatch.setattr(M, "_warn_model_mismatch", lambda meta: None)
+        return logs
+
+    @staticmethod
+    def _cams(disabled=None):
+        """disabled = {相机: [类别...]} 这些 (相机,类) 的 status=0。"""
+        disabled = disabled or {}
+        out = []
+        for i in range(1, 9):
+            cid = "camera%d" % i
+            ths = [{"defectName": c, "defectLabel": c,
+                    "status": 0 if c in disabled.get(cid, ()) else 1,
+                    "thresholdValue": 0.30}
+                   for c in ("多股线", "包边不良")]
+            out.append({"cameraId": cid, "thresholds": ths, "stopSetting": []})
+        return {"clothNumber": "C1", "roller": "R1", "material": "1500D/2",
+                "specification": "100145", "cameras": out}
+
+    def test_skip_warning_prints_once_across_polls(self, monkeypatch):
+        """status=0 是后端的稳定状态，不是每轮的新事件。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        dis = {"camera%d" % i: ("包边不良",) for i in (1, 3, 4, 5, 6, 7, 8)}
+        for _ in range(10):                       # 10 轮轮询 = 现场 20 秒
+            M.apply_config(self._cams(dis))
+        skips = [m for m in logs if "跳过" in m and "status=0" in m]
+        assert len(skips) == 1, "跳过告警重复了 %d 次" % len(skips)
+        assert "camera1/包边不良" in skips[0]
+
+    def test_skip_warning_reprints_when_it_changes(self, monkeypatch):
+        """跳过内容变了必须重新打出来，否则后端的改动看不见。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        M.apply_config(self._cams({"camera1": ("包边不良",)}))
+        M.apply_config(self._cams({"camera1": ("包边不良",)}))
+        M.apply_config(self._cams({"camera1": ("包边不良",),
+                                   "camera2": ("多股线",)}))
+        skips = [m for m in logs if "跳过" in m]
+        assert len(skips) == 2, skips
+        assert "跳过 1 条阈值" in skips[0]
+        assert "跳过 2 条阈值" in skips[1]
+
+    def test_two_kinds_of_skip_are_deduped_independently(self, monkeypatch):
+        """阈值跳过和停机规则跳过必须各用各的去重键。
+
+        共用一个键的话，两条消息会互相顶掉：每轮轮询都判定"内容变了"，
+        于是两条都重打一遍 —— 去重形同虚设。
+        """
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        cfg = self._cams({"camera1": ("包边不良",)})
+        # 再制造一条停机规则的跳过（stopSetting 不是数组）
+        cfg["cameras"][0]["stopSetting"] = "not-a-list"
+        for _ in range(6):
+            M.apply_config(cfg)
+        skips = [m for m in logs if "跳过" in m]
+        assert len(skips) == 2, "应各打一次，实际 %d 条：%s" % (len(skips), skips)
+        assert any("跳过 1 条阈值" in m for m in skips), skips
+        assert any("跳过 1 条停机规则" in m for m in skips), skips
+
+    def test_repeated_polling_with_no_change_is_silent(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        cfg = self._cams()
+        M.apply_config(cfg)
+        logs = self._collect(monkeypatch)
+        for _ in range(30):                       # 30 轮 = 现场 60 秒
+            M.apply_config(cfg)
+        assert logs == [], "30 轮无变化打了 %d 行" % len(logs)
+
+    def test_source_log_dedups_even_though_age_changes(self, monkeypatch):
+        """_log_source 的消息里带「Ns 前应用」，每秒都在变。
+
+        去重签名必须单独构造，否则这条永远去重不掉 —— 这正是当初的坑。
+        """
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.remote_config_store import (
+            get_remote_config_store)
+        M.apply_config(self._cams())
+        assert not get_remote_config_store().is_empty()
+        logs = self._collect(monkeypatch)
+        # 必须真的让 age_sec 变化才算测到：它精度 0.1s，连续快速调用时
+        # 值根本不变，那样即使去重签名写错也照样"通过"，等于没测。
+        st = get_remote_config_store()
+        for back in (1.0, 2.0, 3.0, 4.0, 5.0):
+            import time as _t
+            st._applied_at = _t.time() - back
+            M._log_source("后端未返回可用配置")
+        ages = {round(1.0 * i, 1) for i in range(1, 6)}
+        assert len(ages) == 5                      # 确认 age 确实在变
+        assert len(logs) == 1, "同一原因因 age_sec 变化重复了 %d 次" % len(logs)
+        assert "上一次成功下发的配置" in logs[0]
+
+    def test_source_log_reprints_when_reason_changes(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        M.apply_config(self._cams())
+        logs = self._collect(monkeypatch)
+        M._log_source("拉取超时")
+        M._log_source("拉取超时")
+        M._log_source("网络错误: connection refused")
+        assert len(logs) == 2, logs
+        assert "拉取超时" in logs[0] and "connection refused" in logs[1]
+
+    def test_failure_reprints_after_recovery(self, monkeypatch):
+        """安全性质：故障恢复后再次失败，必须重新报出来。
+
+        去重表里那条失败记录如果不清，第二次同样的故障就会被静默吞掉 ——
+        那是漏报，比刷屏严重得多。
+        """
+        import Communication_Tool.material_config_client as M
+        cfg = self._cams()
+        M.apply_config(cfg)                       # 先建立基线（会打变更明细）
+        logs = self._collect(monkeypatch)
+        M._log_source("拉取超时")
+        assert len(logs) == 1
+        M._log_source("拉取超时")
+        assert len(logs) == 1, "同一原因重复了"
+        logs.clear()
+        M.apply_config(cfg)                       # 恢复正常 -> 清失败去重
+        assert logs == [], "无变化的恢复轮不该打日志"
+        M._log_source("拉取超时")                 # 又挂
+        assert len(logs) == 1, "恢复后再次失败被去重吞掉了 —— 漏报故障"
+
+    def test_every_real_change_still_prints(self, monkeypatch):
+        """静音只针对"没变化"；真有变更时每一轮都要完整打。"""
+        import Communication_Tool.material_config_client as M
+        logs = self._collect(monkeypatch)
+        for v in (0.30, 0.28, 0.26, 0.24):
+            cfg = self._cams()
+            for c in cfg["cameras"]:
+                for t in c["thresholds"]:
+                    t["thresholdValue"] = v
+            M.apply_config(cfg)
+        changes = [m for m in logs if "变更成功" in m]
+        assert len(changes) == 4, "4 次真实变更只打了 %d 行" % len(changes)
+        for m in changes:
+            assert "变更明细" in m
+        # 首次那批 defectLabel 告警只该出现一轮，不跟着 4 次变更重复
+        lbl = [m for m in logs if "defectLabel" in m]
+        assert len({m for m in lbl}) == len(lbl), "label 告警重复了"
+
+    def test_quiet_defaults_to_true(self, monkeypatch):
+        import Communication_Tool.material_config_client as M
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        monkeypatch.delitem(MATERIAL_CONFIG, "quiet_when_unchanged",
+                            raising=False)
+        assert M._quiet_when_unchanged() is True

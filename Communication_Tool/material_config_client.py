@@ -206,15 +206,63 @@ def parse_config(data: Any) -> Tuple[Dict[Tuple[str, str], float],
         meta["modelVersion"] = model.get("modelVersion")
         meta["modelStatus"] = model.get("status")
 
+    # status=0 / 字段缺失这类跳过是后端的稳定状态，不是每轮的新事件。
+    # 每 2 秒重打一遍毫无信息量，只在跳过内容**变化**时打。
     if skipped_threshold:
-        warning(f"[材质配置] 跳过 {len(skipped_threshold)} 条阈值："
-                + "；".join(skipped_threshold[:12])
-                + ("…" if len(skipped_threshold) > 12 else ""))
+        _log_stable("cfg:skip_thr", "warning",
+                    f"[材质配置] 跳过 {len(skipped_threshold)} 条阈值："
+                    + "；".join(skipped_threshold[:12])
+                    + ("…" if len(skipped_threshold) > 12 else "")
+                    + "（内容变化前不再重复）")
     if skipped_stop:
-        warning(f"[材质配置] 跳过 {len(skipped_stop)} 条停机规则："
-                + "；".join(skipped_stop[:12])
-                + ("…" if len(skipped_stop) > 12 else ""))
+        _log_stable("cfg:skip_stop", "warning",
+                    f"[材质配置] 跳过 {len(skipped_stop)} 条停机规则："
+                    + "；".join(skipped_stop[:12])
+                    + ("…" if len(skipped_stop) > 12 else "")
+                    + "（内容变化前不再重复）")
     return thresholds, stop_rules, meta
+
+
+_LOG_SEEN: Dict[str, str] = {}
+
+
+def _log_stable(key: str, level: str, msg: str, sig: Optional[str] = None) -> None:
+    """「稳定状态」类日志：内容没变就不再重复打。
+
+    本模块是被定时轮询驱动的（现场 refresh_interval_sec=2，即每 2 秒一轮）。
+    后端的配置状态往往几十分钟都不变 —— 哪几台的哪个类 status=0、拉取失败的
+    原因、当前生效的是哪一份配置。这些每轮重打一遍，会把真正有用的
+    「变更明细」彻底淹掉。所以只在**内容发生变化**时打。
+
+    :param sig: 去重用的签名。默认取 msg 本身；消息里含每次都变的字段
+                （如「Ns 前应用」）时必须单独传签名，否则去重永远不生效。
+    """
+    sig = msg if sig is None else sig
+    if _LOG_SEEN.get(key) == sig:
+        return
+    _LOG_SEEN[key] = sig
+    fn = error if level == "error" else (warning if level == "warning" else info)
+    fn(msg)
+
+
+def _log_reset(prefix: str) -> None:
+    """清掉某一类去重记录，让同样的问题下次重新打出来。
+
+    拉取恢复正常之后，去重表里那条失败记录必须清掉 —— 否则之后再次以同样
+    原因失败时会被当成"已经打过"而静默，那就漏报故障了。
+    """
+    for k in [k for k in list(_LOG_SEEN) if k.startswith(prefix)]:
+        _LOG_SEEN.pop(k, None)
+
+
+def _quiet_when_unchanged() -> bool:
+    """没有变更时是否完全不打日志。默认 True（现场要求：只在出错或变更时打）。"""
+    try:
+        from AnomalyDetection_Tool.config.settings import MATERIAL_CONFIG
+        v = MATERIAL_CONFIG.get("quiet_when_unchanged", True)
+        return True if v is None else bool(v)
+    except Exception:
+        return True
 
 
 # 已经告警过的 (相机, 类, label)。同一个不一致每次刷新都会命中，
@@ -283,32 +331,36 @@ async def fetch_current_config(timeout: float = 5.0) -> Optional[dict]:
                     url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                 text = await resp.text()
                 if resp.status != 200:
-                    info(f"[材质配置] HTTP {resp.status}: {text[:200]}")
+                    _log_stable("fail:http", "info",
+                                f"[材质配置] HTTP {resp.status}: {text[:200]}")
                     return None
                 try:
                     import json as _json
                     result = _json.loads(text)
                 except Exception:
-                    info(f"[材质配置] 响应不是 JSON: {text[:200]}")
+                    _log_stable("fail:json", "info",
+                                f"[材质配置] 响应不是 JSON: {text[:200]}")
                     return None
                 if not _is_ok(result):
-                    info(f"[材质配置] 业务错误 code="
-                         f"{result.get('code')!r} msg={result.get('message')!r}"
-                         f"（没有运行/暂停中的白布等情况属正常）")
+                    _log_stable("fail:biz", "info",
+                            f"[材质配置] 业务错误 code="
+                            f"{result.get('code')!r} msg={result.get('message')!r}"
+                            f"（没有运行/暂停中的白布等情况属正常）")
                     return None
                 data = result.get("data")
                 if not isinstance(data, dict):
-                    info(f"[材质配置] data 不是对象: {type(data).__name__}")
+                    _log_stable("fail:data", "info",
+                            f"[材质配置] data 不是对象: {type(data).__name__}")
                     return None
                 return data
     except asyncio.TimeoutError:
-        info("[材质配置] 拉取超时")
+        _log_stable("fail:timeout", "info", "[材质配置] 拉取超时")
         return None
     except aiohttp.ClientError as e:
-        info(f"[材质配置] 网络错误: {e}")
+        _log_stable("fail:net", "info", f"[材质配置] 网络错误: {e}")
         return None
     except Exception as e:
-        info(f"[材质配置] 拉取异常: {e}")
+        _log_stable("fail:exc", "info", f"[材质配置] 拉取异常: {e}")
         return None
 
 
@@ -460,12 +512,14 @@ def apply_config(data: dict) -> bool:
     try:
         thresholds, stop_rules, meta = parse_config(data)
     except Exception as e:
-        error(f"[材质配置] 变更失败：解析异常 {e}；当前仍沿用 {cur_src}")
+        _log_stable("fail:parse", "error",
+                    f"[材质配置] 变更失败：解析异常 {e}；当前仍沿用 {cur_src}")
         return False
 
     if not thresholds and not stop_rules:
-        warning(f"[材质配置] 变更失败：后端返回为空/无法解析，"
-                f"**不会**用空配置覆盖；当前仍沿用 {cur_src}")
+        _log_stable("fail:empty", "warning",
+                    f"[材质配置] 变更失败：后端返回为空/无法解析，"
+                    f"**不会**用空配置覆盖；当前仍沿用 {cur_src}")
         return False
 
     prev_thr, prev_stop, src, was_empty = _collect_previous(
@@ -510,8 +564,16 @@ def apply_config(data: dict) -> bool:
     if was_empty:
         head += "（首次下发，此前生效的是 config.yaml）"
 
+    # 成功拿到并应用了配置 -> 清掉失败/来源类的去重记录，
+    # 之后再次失败时才能重新打出来（否则漏报故障）。
+    _log_reset("fail:")
+    _log_reset("src:")
+
     if not by_cam:
-        info(head + " —— 与当前生效值一致，无需改动")
+        # 现场要求：只在**出错**或**发生变更**时打日志。2s 一轮的轮询下，
+        # "无需改动"每分钟会重复 30 次，没有任何信息量。
+        if not _quiet_when_unchanged():
+            info(head + " —— 与当前生效值一致，无需改动")
     else:
         out = [head]
         # ① 哪台相机变了 —— 这一行永远打全，不受行数上限影响。
@@ -558,10 +620,12 @@ def _warn_model_mismatch(meta: dict) -> None:
     except Exception:
         return
     if local and str(remote) != str(local):
-        warning(f"[材质配置] 后端指定模型 {remote!r} 与本地 "
-                f"yolo.model_path={local!r} 不一致。"
-                f"**不会在运行中热切模型**（需重建各 worker 的 TensorRT "
-                f"engine），请人工确认后改配置重启。")
+        _log_stable("cfg:model", "warning",
+                    f"[材质配置] 后端指定模型 {remote!r} 与本地 "
+                    f"yolo.model_path={local!r} 不一致。"
+                    f"**不会在运行中热切模型**（需重建各 worker 的 TensorRT "
+                    f"engine），请人工确认后改配置重启。"
+                    f"（内容变化前不再重复）")
 
 
 def _log_source(reason: str) -> None:
@@ -575,17 +639,25 @@ def _log_source(reason: str) -> None:
     try:
         st = get_remote_config_store()
         if st.is_empty():
-            info(f"[材质配置] 变更未生效（{reason}）——后端数据库为空，"
-                 f"**当前使用 config.yaml 本地配置**")
+            _log_stable("src:empty", "info",
+                        f"[材质配置] 变更未生效（{reason}）——后端数据库为空，"
+                        f"**当前使用 config.yaml 本地配置**"
+                        f"（原因变化前不再重复）")
         else:
             snap = st.snapshot()
-            info(f"[材质配置] 变更未生效（{reason}）——继续使用"
-                 f"**后端数据库上一次成功下发的配置**"
-                 f"（阈值 {snap['threshold_count']} 条 / "
-                 f"停机规则 {snap['stop_rule_count']} 条，"
-                 f"{snap['age_sec']}s 前应用）")
+            # 签名**不含 age_sec** —— 它每秒都在变，带上就永远去重不掉。
+            _log_stable("src:stale", "info",
+                        f"[材质配置] 变更未生效（{reason}）——继续使用"
+                        f"**后端数据库上一次成功下发的配置**"
+                        f"（阈值 {snap['threshold_count']} 条 / "
+                        f"停机规则 {snap['stop_rule_count']} 条，"
+                        f"{snap['age_sec']}s 前应用）"
+                        f"（原因变化前不再重复）",
+                        sig=f"{reason}|{snap['threshold_count']}|"
+                            f"{snap['stop_rule_count']}")
     except Exception:
-        info(f"[材质配置] 变更未生效（{reason}）")
+        _log_stable("src:err", "info",
+                    f"[材质配置] 变更未生效（{reason}）")
 
 
 def refresh_once(timeout: float = 5.0) -> bool:
