@@ -588,7 +588,7 @@ class TestRefreshOnceRobustness:
     就等于配置永远刷不动了。这两条都要钉住。
     """
 
-    def test_callable_from_inside_a_running_loop(self):
+    def test_callable_from_inside_a_running_loop(self, monkeypatch):
         import asyncio
         import http.server, socketserver, threading as _th
         payload = {"code": 0, "data": {"cameras": _cams()}}
@@ -610,7 +610,10 @@ class TestRefreshOnceRobustness:
         _th.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             import Communication_Tool.material_config_client as M
-            M._get_base_url = lambda: f"http://127.0.0.1:{port}/api"
+            # 必须走 monkeypatch：直接赋值不还原的话，_get_base_url 会永久
+            # 指向这个用完就关掉的端口，污染同进程里后续所有测试。
+            monkeypatch.setattr(
+                M, "_get_base_url", lambda: f"http://127.0.0.1:{port}/api")
 
             async def caller():
                 # 关键：refresh_once 是在一个正在运行的事件循环里被调的

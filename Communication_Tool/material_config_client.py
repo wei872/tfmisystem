@@ -58,6 +58,24 @@ API_PATH = "/v1/defect/material/current-config"
 
 
 # 视为成功的 code。后端各接口的约定不完全一致，这里从宽。
+# 拉取用的是 GET（见 fetch_current_config 里的 session.get）。
+# 别写成 POST —— 那是**另一个**接口 /api/image/upload（图片上报）的方法。
+HTTP_METHOD = "GET"
+
+
+def _endpoint() -> str:
+    """本次配置来自哪个接口：请求方法 + 完整地址。
+
+    变更日志里带上它，是为了对账时一眼看出"这份阈值是从哪拉的"。
+    地址由 _get_base_url() + API_PATH 现算，跟着 config.yaml 走、不写死 ——
+    万一后端挪了端口，日志不会继续报旧地址。
+    """
+    try:
+        return f"{HTTP_METHOD} {_get_base_url()}{API_PATH}"
+    except Exception as e:
+        return f"{HTTP_METHOD} <地址解析失败: {e}>"
+
+
 _OK_CODES = {0, 200, "0", "200", "SUCCESS", "success", "OK", "ok"}
 
 
@@ -513,13 +531,15 @@ def apply_config(data: dict) -> bool:
         thresholds, stop_rules, meta = parse_config(data)
     except Exception as e:
         _log_stable("fail:parse", "error",
-                    f"[材质配置] 变更失败：解析异常 {e}；当前仍沿用 {cur_src}")
+                    f"[材质配置] 变更失败：解析异常 {e}；当前仍沿用 {cur_src}"
+                    f"（来源接口 {_endpoint()}）")
         return False
 
     if not thresholds and not stop_rules:
         _log_stable("fail:empty", "warning",
                     f"[材质配置] 变更失败：后端返回为空/无法解析，"
-                    f"**不会**用空配置覆盖；当前仍沿用 {cur_src}")
+                    f"**不会**用空配置覆盖；当前仍沿用 {cur_src}"
+                    f"（来源接口 {_endpoint()}）")
         return False
 
     prev_thr, prev_stop, src, was_empty = _collect_previous(
@@ -575,7 +595,7 @@ def apply_config(data: dict) -> bool:
         if not _quiet_when_unchanged():
             info(head + " —— 与当前生效值一致，无需改动")
     else:
-        out = [head]
+        out = [head, "  来源接口：" + _endpoint()]
         # ① 哪台相机变了 —— 这一行永远打全，不受行数上限影响。
         #    前端「全部相机」一改就是 8 台一起动，明细被截断时至少这里看得见。
         out.append("  变化相机（%d 台）：%s" % (
@@ -642,7 +662,7 @@ def _log_source(reason: str) -> None:
             _log_stable("src:empty", "info",
                         f"[材质配置] 变更未生效（{reason}）——后端数据库为空，"
                         f"**当前使用 config.yaml 本地配置**"
-                        f"（原因变化前不再重复）")
+                        f"（来源接口 {_endpoint()}；原因变化前不再重复）")
         else:
             snap = st.snapshot()
             # 签名**不含 age_sec** —— 它每秒都在变，带上就永远去重不掉。
@@ -652,7 +672,7 @@ def _log_source(reason: str) -> None:
                         f"（阈值 {snap['threshold_count']} 条 / "
                         f"停机规则 {snap['stop_rule_count']} 条，"
                         f"{snap['age_sec']}s 前应用）"
-                        f"（原因变化前不再重复）",
+                        f"（来源接口 {_endpoint()}；原因变化前不再重复）",
                         sig=f"{reason}|{snap['threshold_count']}|"
                             f"{snap['stop_rule_count']}")
     except Exception:
