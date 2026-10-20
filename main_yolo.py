@@ -1398,14 +1398,16 @@ def main() -> int:
                     lambda: _el.end_roll("前端停止"))
                 _el.begin_window("程序启动")
                 info(f"[边缘区学习] 已就绪：学习阈值 "
-                     f"{_el.learning_threshold}，学习区 {_el.targets}")
-                # 每个类别的学习长度/采样门槛可能不同（多股线 5 m / >5 个，
-                # 短废纱线 50 m / >3 个），必须逐类打出来 —— 现场要靠这行
-                # 确认配置真的读进去了。
+                     f"{_el.learning_threshold}，全局学习区 {_el.targets}")
+                # 每个类别的学习长度/采样门槛/学习区都可能不同
+                # （多股线 5 m / >5 个，短废纱线 50 m / >3 个 + 自己的边带），
+                # 必须逐类打出来 —— 现场要靠这几行确认配置真的读进去了。
                 for _c in _el.target_classes:
                     info(f"[边缘区学习]   {_c}：学习长度 "
                          f"{_el.window_length_for(_c) / 1000:.1f} m，"
                          f"采样数 > {_el.count_threshold_for(_c)} 生成生效区")
+                    info(f"[边缘区学习]   {_c}：学习区 "
+                         f"{_el.targets_for(_c)}")
         else:
             info("[边缘区学习] 已在 config.yaml 关闭"
                  "（multiline_edge_learning.enabled=false）")

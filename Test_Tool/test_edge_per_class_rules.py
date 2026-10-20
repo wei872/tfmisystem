@@ -275,6 +275,165 @@ class TestLearningPeriodIsPerClass:
 
 
 # ======================================================================
+# §3.6  每个类别自己的学习区（targets 也可按类别调）
+# ======================================================================
+class TestPerClassTargets:
+    """不同类别的学习区宽度/相机可以不同。
+
+    合并语义是**按相机**的：某类的 targets 只覆盖它写了的相机，
+    没写的相机回落到全局那份。
+    """
+
+    @staticmethod
+    def _mk(dist=None, rules=None, classes=None, gtargets=None):
+        return EdgeRegionLearner(
+            targets=dict(gtargets or TARGETS),
+            target_classes=list(classes or CLASSES),
+            window_length_mm=5000, count_threshold=5,
+            region_padding_px=50, image_width_px=W,
+            class_rules=rules or {}, distance_provider=dist or _Dist())
+
+    def test_class_uses_its_own_band_width(self):
+        narrow = {"短废纱线": {"targets": {
+            "camera2": {"side": "right", "band_px": 200},
+            "camera7": {"side": "left", "band_px": 200}}}}
+        m = self._mk(rules=narrow)
+        # 短废纱线 的学习区左界是 2440-200=2240，多股线 仍是 2440-500=1940
+        x = W - 300                      # 落在多股线区内、短废纱线区外
+        assert m.in_learning_zone("camera2", x, x + 10, "多股线") is True
+        assert m.in_learning_zone("camera2", x, x + 10, "短废纱线") is False
+
+        x2 = W - 100                     # 两个类的区内
+        assert m.in_learning_zone("camera2", x2, x2 + 10, "多股线") is True
+        assert m.in_learning_zone("camera2", x2, x2 + 10, "短废纱线") is True
+
+    def test_unnamed_camera_falls_back_to_global(self):
+        """只写了 camera2 => camera7 回落全局，不能被弄丢。"""
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": {"side": "right", "band_px": 200}}}})
+        assert m.targets_for("短废纱线")["camera2"]["band_px"] == 200
+        assert m.targets_for("短废纱线")["camera7"] == TARGETS["camera7"]
+        # camera7 左带 500 px 仍然生效
+        assert m.in_learning_zone("camera7", 10, 50, "短废纱线") is True
+
+    def test_class_can_learn_on_a_camera_the_global_lacks(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera3": {"side": "left", "band_px": 300}}}})
+        assert "camera3" in m.targets_for("短废纱线")
+        assert m.in_learning_zone("camera3", 10, 50, "短废纱线") is True
+        # 别的类别没这台相机的学习区
+        assert m.in_learning_zone("camera3", 10, 50, "多股线") is False
+
+    def test_omitting_a_camera_falls_back_not_drops(self):
+        """合并语义：不写就是回落全局，**不是**去掉。想去掉要写 null。"""
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera7": {"side": "left", "band_px": 500}}}})
+        m.begin_window()
+        assert "camera2" in m.targets_for("短废纱线"), \
+            "省略 camera2 应该回落到全局，而不是把它去掉"
+        assert m.observe("camera2", "短废纱线", W - 100, W - 60) is True
+
+    def test_explicit_null_drops_that_camera(self):
+        """要把某类从某台相机上摘掉，显式写 null。"""
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": None,
+            "camera7": {"side": "left", "band_px": 500}}}})
+        m.begin_window()
+        t = m.targets_for("短废纱线")
+        assert "camera2" not in t
+        assert "camera7" in t
+        # camera2 上不再采样（照常按正常阈值报出）
+        assert m.observe("camera2", "短废纱线", W - 100, W - 60) is False
+        assert m.observe("camera7", "短废纱线", 10, 50) is True
+        # 别的类别不受影响
+        assert m.observe("camera2", "多股线", W - 100, W - 60) is True
+
+    def test_dropping_every_camera_leaves_the_class_without_a_zone(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": None, "camera7": None}}})
+        assert m.targets_for("短废纱线") == {}
+        assert m.is_learning("camera2", "短废纱线") is False
+        assert m.observe("camera2", "短废纱线", W - 100, W - 60) is False
+
+    def test_class_without_targets_uses_global(self):
+        m = self._mk(rules={"短废纱线": {"count_threshold": 3}})
+        assert m.targets_for("短废纱线") == m.targets
+        assert m.targets_for("多股线") == m.targets
+
+    def test_side_can_differ_per_class(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": {"side": "left", "band_px": 400}}}})
+        assert m.in_learning_zone("camera2", 10, 50, "短废纱线") is True
+        assert m.in_learning_zone("camera2", 10, 50, "多股线") is False
+        assert m.in_learning_zone("camera2", W - 100, W - 60, "短废纱线") is False
+
+    def test_bad_per_class_targets_are_rejected(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": {"side": "up", "band_px": 200},     # side 非法
+            "camera7": {"side": "left", "band_px": 0}}}})  # band 非法
+        t = m.targets_for("短废纱线")
+        # 两条都无效 -> 合并后退回全局那两台
+        assert t["camera2"] == TARGETS["camera2"]
+        assert t["camera7"] == TARGETS["camera7"]
+
+    def test_is_learning_respects_per_class_targets(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera3": {"side": "left", "band_px": 300}}}})
+        m.begin_window()
+        assert m.is_learning("camera2", "多股线") is True
+        # 加了 camera3，但 camera2 仍从全局回落 => 两台都在学
+        assert m.is_learning("camera2", "短废纱线") is True
+        assert m.is_learning("camera3", "短废纱线") is True
+
+    def test_is_learning_false_when_camera_dropped_by_null(self):
+        m = self._mk(rules={"短废纱线": {"targets": {"camera2": None}}})
+        m.begin_window()
+        assert m.is_learning("camera2", "短废纱线") is False
+        assert m.is_learning("camera7", "短废纱线") is True
+
+    def test_learning_threshold_follows_per_class_zone(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": {"side": "right", "band_px": 200},
+            "camera7": {"side": "left", "band_px": 200}}}})
+        m.begin_window()
+        x = W - 300
+        assert m.learning_threshold_for("camera2", "多股线", x, x + 10) == 0.1
+        assert m.learning_threshold_for("camera2", "短废纱线", x, x + 10) is None
+
+    def test_each_class_generates_its_own_region_from_its_own_zone(self):
+        d = _Dist(0.0)
+        m = self._mk(dist=d, rules={"短废纱线": {
+            "count_threshold": 3,
+            "targets": {"camera2": {"side": "right", "band_px": 200},
+                        "camera7": {"side": "left", "band_px": 200}}}})
+        m.begin_window()
+        # 多股线：在 500 px 带的内侧（短废纱线区外）
+        _feed(m, "camera2", 6, "多股线", x1=W - 400, x2=W - 360)
+        # 短废纱线：在 200 px 带内
+        _feed(m, "camera2", 4, "短废纱线", x1=W - 150, x2=W - 110)
+        d.mm = 5000.0
+        m.check_distance()
+        r1 = m.region_of("camera2", "多股线")
+        assert r1 is not None
+        d.mm = 50000.0
+        m.check_distance()
+        r2 = m.region_of("camera2", "短废纱线")
+        assert r2 is not None
+        # 两个生效区来自不同的采样带，不该重合
+        assert r1 != r2
+        # 多股线的生效区滤不掉短废纱线
+        assert m.should_filter("camera2", "多股线", r1[0] + 5, r1[0] + 15) is True
+        assert m.should_filter("camera2", "短废纱线", r1[0] + 5, r1[0] + 15) is False
+
+    def test_snapshot_exposes_per_class_targets(self):
+        m = self._mk(rules={"短废纱线": {"targets": {
+            "camera2": {"side": "right", "band_px": 200}}}})
+        snap = m.snapshot()
+        assert snap["per_class"]["短废纱线"]["targets"]["camera2"]["band_px"] == 200
+        assert snap["per_class"]["多股线"]["targets"]["camera2"]["band_px"] == BAND
+
+
+# ======================================================================
 # §3.5  学习期采样的框不保存、不上传（对 target_classes 里任何类别都成立）
 # ======================================================================
 class TestLearningSamplesAreNotUploaded:

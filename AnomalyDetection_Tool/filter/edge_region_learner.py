@@ -105,24 +105,8 @@ class EdgeRegionLearner:
         #   {}    = 显式配成空的，**等于禁用**，绝不能回落默认
         #   {...} = 用配的那份
         # （T33 的白名单踩过同一个坑。）
-        self.targets: Dict[str, Dict] = {}
         source = DEFAULT_TARGETS if targets is None else targets
-        for cam, spec in source.items():
-            side = str(spec.get("side", "")).lower()
-            if side not in ("left", "right"):
-                warning(f"[边缘区学习] {cam} 的 side={spec.get('side')!r} "
-                        f"不是 left/right，已忽略这台相机")
-                continue
-            try:
-                band = int(spec.get("band_px", 0))
-            except (TypeError, ValueError):
-                warning(f"[边缘区学习] {cam} 的 band_px="
-                        f"{spec.get('band_px')!r} 不是整数，已忽略")
-                continue
-            if band <= 0:
-                warning(f"[边缘区学习] {cam} 的 band_px={band} <= 0，已忽略")
-                continue
-            self.targets[cam] = {"side": side, "band_px": band}
+        self.targets: Dict[str, Dict] = self._parse_targets(source, "targets")
 
         if target_classes is None:
             classes = list(DEFAULT_TARGET_CLASSES)
@@ -164,6 +148,38 @@ class EdgeRegionLearner:
                             f".count_threshold={spec['count_threshold']!r} "
                             f"不是整数，该项忽略（用全局 "
                             f"{self.count_threshold}）")
+            if "targets" in spec:
+                raw = spec["targets"]
+                # 显式写成 null 的相机 = **该类别在这台相机上不学习**。
+                # 必须有这个语法：合并语义下"不写就回落全局"，
+                # 否则根本没法把某个类从某台相机上摘掉。
+                removals = set()
+                kept = {}
+                if isinstance(raw, dict):
+                    for cam, sp in raw.items():
+                        if sp is None:
+                            removals.add(str(cam))
+                        else:
+                            kept[str(cam)] = sp
+                else:
+                    kept = raw
+                parsed = self._parse_targets(
+                    kept, f"class_rules[{cls_name}].targets")
+                # **按相机合并**：只覆盖写了的相机，没写的回落到全局那份。
+                # 这和 window_length_mm / count_threshold 的按字段回落一致 ——
+                # 现场最常见的用法是"只把某一类的边带调窄一点"，
+                # 不该因此把另一台相机的学习区弄丢。
+                merged = {c: dict(v) for c, v in self.targets.items()
+                          if c not in removals}
+                merged.update(parsed)
+                # 必须**无条件**赋值：merged 为空是一个合法结果（该类别
+                # 在这批相机上都不学）。第一版写成 `if merged:` 才赋值，
+                # 结果全部移除后这里不写，targets_for 就回落全局 ——
+                # 想摘掉反而摘不掉。
+                entry["targets"] = merged
+                if not merged:
+                    warning(f"[边缘区学习] class_rules[{cls_name}].targets "
+                            f"解析后为空，该类别没有学习区（不会学习）")
             if not entry:
                 continue
             self.class_rules[cls_name] = entry
@@ -195,6 +211,40 @@ class EdgeRegionLearner:
         self._reset_samples_locked()
 
     # ------------------------------------------------------------------
+    #  targets 解析（全局和按类别共用同一套校验）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_targets(source, label: str) -> Dict[str, Dict]:
+        """把 ``{相机: {side, band_px}}`` 校验成干净的一份。坏的跳过并告警。"""
+        out: Dict[str, Dict] = {}
+        if not isinstance(source, dict):
+            warning(f"[边缘区学习] {label}={source!r} 不是字典，已忽略")
+            return out
+        for cam, spec in source.items():
+            cam = str(cam)
+            if not isinstance(spec, dict):
+                warning(f"[边缘区学习] {label}.{cam}={spec!r} 不是字典，"
+                        f"已忽略这台相机")
+                continue
+            side = str(spec.get("side", "")).lower()
+            if side not in ("left", "right"):
+                warning(f"[边缘区学习] {label}.{cam} 的 side="
+                        f"{spec.get('side')!r} 不是 left/right，已忽略这台相机")
+                continue
+            try:
+                band = int(spec.get("band_px", 0))
+            except (TypeError, ValueError):
+                warning(f"[边缘区学习] {label}.{cam} 的 band_px="
+                        f"{spec.get('band_px')!r} 不是整数，已忽略")
+                continue
+            if band <= 0:
+                warning(f"[边缘区学习] {label}.{cam} 的 band_px={band} <= 0，"
+                        f"已忽略")
+                continue
+            out[cam] = {"side": side, "band_px": band}
+        return out
+
+    # ------------------------------------------------------------------
     #  按类别取参数（没覆盖的走全局值）
     # ------------------------------------------------------------------
     def window_length_for(self, class_name: str) -> float:
@@ -202,6 +252,13 @@ class EdgeRegionLearner:
         if r and "window_length_mm" in r:
             return r["window_length_mm"]
         return self.window_length_mm
+
+    def targets_for(self, class_name: str) -> Dict[str, Dict]:
+        """这个类别生效的学习区。没单独配就是全局那份。"""
+        r = self.class_rules.get(class_name)
+        if r and "targets" in r:
+            return r["targets"]
+        return self.targets
 
     def count_threshold_for(self, class_name: str) -> int:
         r = self.class_rules.get(class_name)
@@ -214,7 +271,8 @@ class EdgeRegionLearner:
     # ------------------------------------------------------------------
     def _reset_samples_locked(self) -> None:
         self._samples = {(c, cls): []
-                         for c in self.targets for cls in self.target_classes}
+                         for cls in self.target_classes
+                         for c in self.targets_for(cls)}
 
     def begin_window(self, reason: str = "") -> None:
         """开一个新布卷的学习窗口（前端「开始」/ 程序启动）。
@@ -335,7 +393,9 @@ class EdgeRegionLearner:
         学习期是**按类别**的：多股线 5 m 就学完了，短废纱线还在学。
         不传 class_name 时返回"还有任何一个类别在学"。
         """
-        if camera_name not in self.targets:
+        # 该类别在这台相机上没有学习区，就谈不上"在学习"
+        if camera_name not in (self.targets_for(class_name) if class_name
+                               else self.targets):
             return False
         with self._lock:
             if not self._window_open:
@@ -344,9 +404,15 @@ class EdgeRegionLearner:
                 return any(c not in self._settled for c in self.target_classes)
             return class_name not in self._settled
 
-    def in_learning_zone(self, camera_name: str, x1: int, x2: int) -> bool:
-        """框是否落在这台相机的学习区（固定宽度的边带，取 targets.band_px）内。"""
-        spec = self.targets.get(camera_name)
+    def in_learning_zone(self, camera_name: str, x1: int, x2: int,
+                         class_name: Optional[str] = None) -> bool:
+        """框是否落在学习区（固定宽度的边带）内。
+
+        传 class_name 时用**该类别**的学习区 —— 不同类别的边带宽度/相机
+        可以不同。不传则用全局那份（保持旧调用方语义）。
+        """
+        spec = self.targets_for(class_name).get(camera_name) if class_name \
+            else self.targets.get(camera_name)
         if not spec:
             return False
         if spec["side"] == "right":
@@ -362,7 +428,7 @@ class EdgeRegionLearner:
         """
         if class_name not in self.target_classes:
             return None
-        if not self.in_learning_zone(camera_name, x1, x2):
+        if not self.in_learning_zone(camera_name, x1, x2, class_name):
             return None
         # 必须带上类别：多股线 5 m 学完之后就不该再对它降阈值，
         # 否则区外噪声会被一直捞进来。
@@ -392,6 +458,8 @@ class EdgeRegionLearner:
                     c: {
                         "window_length_mm": self.window_length_for(c),
                         "count_threshold": self.count_threshold_for(c),
+                        "targets": {k: dict(v)
+                                    for k, v in self.targets_for(c).items()},
                         "settled": c in self._settled,
                     } for c in self.target_classes
                 },
@@ -434,9 +502,9 @@ class EdgeRegionLearner:
         """
         if class_name not in self.target_classes:
             return False
-        if camera_name not in self.targets:
+        if camera_name not in self.targets_for(class_name):
             return False
-        if not self.in_learning_zone(camera_name, x1, x2):
+        if not self.in_learning_zone(camera_name, x1, x2, class_name):
             return False                     # 区外：正常阈值下的真检出，放行
         with self._lock:
             if not self._window_open:
@@ -445,8 +513,8 @@ class EdgeRegionLearner:
             # 而且会让下一卷之前的 snapshot 显示误导性数字。
             if class_name in self._settled:
                 return False
-            self._samples[(camera_name, class_name)].append(
-                (int(x1), int(x2)))
+            self._samples.setdefault(
+                (camera_name, class_name), []).append((int(x1), int(x2)))
             self._stats["recorded"] += 1
             return True
 

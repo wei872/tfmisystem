@@ -607,6 +607,15 @@ class TestWiring:
         assert int(r["短废纱线"]["count_threshold"]) < \
             int(cfg["multiline_edge_learning"]["count_threshold"])
 
+    def test_class_rules_can_carry_targets(self, cfg):
+        """短废纱线 带自己的学习区，结构必须和全局 targets 一致。"""
+        m = cfg["multiline_edge_learning"]
+        t = m["class_rules"]["短废纱线"]["targets"]
+        assert set(t) == set(m["targets"])
+        for cam, spec in t.items():
+            assert spec["side"] in ("left", "right"), cam
+            assert int(spec["band_px"]) > 0, cam
+
     def test_image_width_matches_size_conversion(self, cfg):
         assert int(cfg["multiline_edge_learning"]["image_width_px"]) == \
             int(cfg["size_conversion"]["image_width_px"])
