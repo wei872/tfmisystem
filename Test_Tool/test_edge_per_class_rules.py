@@ -275,6 +275,75 @@ class TestLearningPeriodIsPerClass:
 
 
 # ======================================================================
+# §3.55  不分全局：没有顶层 targets 时不能掉进 DEFAULT_TARGETS
+# ======================================================================
+class TestNoGlobalTargets:
+    """现场要求不分全局。顶层 targets 键去掉后，绝不能静默回落到
+    DEFAULT_TARGETS 的 350 px —— 现场配的是 500 px。
+    """
+
+    @staticmethod
+    def _mk(rules, classes=None):
+        return EdgeRegionLearner(
+            targets={},                      # 顶层不配全局
+            target_classes=list(classes or CLASSES),
+            window_length_mm=5000, count_threshold=5,
+            region_padding_px=50, image_width_px=W,
+            class_rules=rules, distance_provider=_Dist())
+
+    def test_per_class_targets_take_effect_without_a_global(self):
+        rules = {c: {"targets": {k: dict(v) for k, v in TARGETS.items()}}
+                 for c in CLASSES}
+        m = self._mk(rules)
+        for c in CLASSES:
+            assert m.targets_for(c)["camera2"]["band_px"] == BAND
+        # 并集只用于日志/粗判断
+        assert set(m.targets) == {"camera2", "camera7"}
+        m.begin_window()
+        x = RIGHT_EDGE + 10
+        for c in CLASSES:
+            assert m.observe("camera2", c, x, x + 40) is True
+
+    def test_class_without_targets_has_no_zone_and_warns(self):
+        """没配 targets 的类别没有学习区，但照常按正常阈值报出。"""
+        m = self._mk({"多股线": {"targets": {
+            k: dict(v) for k, v in TARGETS.items()}}})
+        assert m.targets_for("短废纱线") == {}
+        m.begin_window()
+        assert m.observe("camera2", "短废纱线", W - 100, W - 60) is False
+        assert m.learning_threshold_for(
+            "camera2", "短废纱线", W - 100, W - 60) is None
+        assert m.is_learning("camera2", "短废纱线") is False
+        # 有 targets 的那类不受影响
+        assert m.observe("camera2", "多股线", W - 100, W - 60) is True
+
+    def test_union_covers_only_cameras_some_class_declares(self):
+        m = self._mk({
+            "多股线": {"targets": {"camera2": {"side": "right", "band_px": 500}}},
+            "短废纱线": {"targets": {"camera7": {"side": "left", "band_px": 300}}},
+        })
+        assert set(m.targets) == {"camera2", "camera7"}
+        assert m.targets_for("多股线") == {
+            "camera2": {"side": "right", "band_px": 500}}
+        assert m.targets_for("短废纱线") == {
+            "camera7": {"side": "left", "band_px": 300}}
+
+    def test_default_targets_are_not_silently_used(self):
+        """targets={} 是"明确不配全局"，不等于 targets=None（用默认）。"""
+        from AnomalyDetection_Tool.filter.edge_region_learner import (
+            DEFAULT_TARGETS)
+        explicit_empty = EdgeRegionLearner(
+            targets={}, target_classes=list(CLASSES),
+            class_rules={}, distance_provider=_Dist())
+        assert explicit_empty.targets_for("多股线") == {}
+        # 对照：不传 targets 才是用默认那份
+        defaulted = EdgeRegionLearner(
+            target_classes=list(CLASSES), distance_provider=_Dist())
+        assert defaulted.targets_for("多股线") == DEFAULT_TARGETS
+        assert defaulted.targets_for("多股线") != {}
+
+
+# ======================================================================
 # §3.6  每个类别自己的学习区（targets 也可按类别调）
 # ======================================================================
 class TestPerClassTargets:

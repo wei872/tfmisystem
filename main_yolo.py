@@ -1349,11 +1349,19 @@ def main() -> int:
             # 三态：键不存在=用默认 camera2/camera7；配成空的 {}=显式禁用。
             # 不能写 `_er_cfg.get("targets") or None` —— 那会把"显式禁用"
             # 变成"回落到默认"，现场想关掉这个功能反而关不掉。
-            _targets = _er_cfg.get("targets", None)
-            if _targets is not None and not isinstance(_targets, dict):
-                warning(f"[边缘区学习] targets={_targets!r} 不是字典，"
-                        f"已按未配置处理（用默认）")
-                _targets = None
+            # 键**不存在** 和 配成 null 是两回事，不能都用 get(..., None)：
+            # 学习器把 None 当"用 DEFAULT_TARGETS"，那会静默回落到硬编码的
+            # 350 px，而现场配的是 500 px。
+            # 现在 targets 全部下放到 class_rules.*.targets（不分全局），
+            # 所以键不存在时传 {}（没有全局基准），而不是 None。
+            if "targets" not in _er_cfg:
+                _targets = {}
+            else:
+                _targets = _er_cfg.get("targets", None)
+                if _targets is not None and not isinstance(_targets, dict):
+                    warning(f"[边缘区学习] targets={_targets!r} 不是字典，"
+                            f"已按未配置处理（用默认）")
+                    _targets = None
             # 类别也走三态；配置里是列表，以后加类别只改配置不改代码。
             _classes = _er_cfg.get("target_classes", None)
             if _classes is not None and not isinstance(_classes, (list, tuple)):
@@ -1398,7 +1406,8 @@ def main() -> int:
                     lambda: _el.end_roll("前端停止"))
                 _el.begin_window("程序启动")
                 info(f"[边缘区学习] 已就绪：学习阈值 "
-                     f"{_el.learning_threshold}，全局学习区 {_el.targets}")
+                     f"{_el.learning_threshold}，涉及相机 "
+                     f"{list(_el.targets)}（学习区按类别各自配置）")
                 # 每个类别的学习长度/采样门槛/学习区都可能不同
                 # （多股线 5 m / >5 个，短废纱线 50 m / >3 个 + 自己的边带），
                 # 必须逐类打出来 —— 现场要靠这几行确认配置真的读进去了。

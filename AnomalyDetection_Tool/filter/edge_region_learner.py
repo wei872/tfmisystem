@@ -106,7 +106,10 @@ class EdgeRegionLearner:
         #   {...} = 用配的那份
         # （T33 的白名单踩过同一个坑。）
         source = DEFAULT_TARGETS if targets is None else targets
-        self.targets: Dict[str, Dict] = self._parse_targets(source, "targets")
+        # 全局那份只是**合并基准**。现场已经把 targets 全部下放到
+        # class_rules.*.targets（不分全局），此时这里就是 {}。
+        self._global_targets: Dict[str, Dict] = self._parse_targets(
+            source, "targets")
 
         if target_classes is None:
             classes = list(DEFAULT_TARGET_CLASSES)
@@ -169,7 +172,7 @@ class EdgeRegionLearner:
                 # 这和 window_length_mm / count_threshold 的按字段回落一致 ——
                 # 现场最常见的用法是"只把某一类的边带调窄一点"，
                 # 不该因此把另一台相机的学习区弄丢。
-                merged = {c: dict(v) for c, v in self.targets.items()
+                merged = {c: dict(v) for c, v in self._global_targets.items()
                           if c not in removals}
                 merged.update(parsed)
                 # 必须**无条件**赋值：merged 为空是一个合法结果（该类别
@@ -191,6 +194,20 @@ class EdgeRegionLearner:
         self.region_padding_px = max(0, int(region_padding_px))
         self.image_width_px = max(1, int(image_width_px))
         self._distance_provider = distance_provider
+
+        # self.targets = **各类生效学习区的并集**，只用于日志、
+        # "这台相机在不在名单里"的粗判断和 snapshot。真正的区域判定一律走
+        # targets_for(cls)。这样顶层不配全局 targets 也不会掉进
+        # DEFAULT_TARGETS 的 350 px —— 现场配的是 500 px，静默改掉是事故。
+        self.targets: Dict[str, Dict] = {}
+        for _cls in self.target_classes:
+            for _cam, _spec in self.targets_for(_cls).items():
+                self.targets[_cam] = dict(_spec)
+        for _cls in self.target_classes:
+            if not self.targets_for(_cls):
+                warning(f"[边缘区学习] {_cls} 没有学习区（class_rules 里没配 "
+                        f"targets，顶层也没有全局 targets），该类别不会学习，"
+                        f"照常按正常阈值报出")
 
         self._lock = threading.RLock()
         self._window_open = False
@@ -258,7 +275,7 @@ class EdgeRegionLearner:
         r = self.class_rules.get(class_name)
         if r and "targets" in r:
             return r["targets"]
-        return self.targets
+        return self._global_targets
 
     def count_threshold_for(self, class_name: str) -> int:
         r = self.class_rules.get(class_name)
@@ -295,7 +312,8 @@ class EdgeRegionLearner:
                      for c in self.target_classes}
         info(f"[边缘区学习] 新布卷窗口开启"
              f"{'（' + reason + '）' if reason else ''}："
-             f"起始米长 {start / 1000:.3f} m，目标 {list(self.targets)}")
+             f"起始米长 {start / 1000:.3f} m，涉及相机 "
+             f"{list(self.targets)}")
         for c, b in brief.items():
             info(f"[边缘区学习]   {c}：学习长度 {b}")
 

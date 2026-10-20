@@ -584,13 +584,25 @@ class TestWiring:
         assert isinstance(tc, list)
         assert tc == ["多股线", "短废纱线"]
 
-    def test_config_targets(self, cfg):
-        t = cfg["multiline_edge_learning"]["targets"]
-        assert set(t) == {"camera2", "camera7"}
-        assert t["camera2"]["side"] == "right"
-        assert t["camera7"]["side"] == "left"
-        assert t["camera2"]["band_px"] == 500
-        assert t["camera7"]["band_px"] == 500
+    def test_config_has_no_global_targets(self, cfg):
+        """不分全局：学习区只写在每个类别自己的 targets 里。
+
+        顶层那个键一旦还在，就会变成所有类别的隐式回落基准 ——
+        现场明确要求不分全局。
+        """
+        assert "targets" not in cfg["multiline_edge_learning"]
+
+    def test_every_class_declares_its_own_targets(self, cfg):
+        """没有全局兜底了，所以每个类别都必须自己写 targets。"""
+        m = cfg["multiline_edge_learning"]
+        for cls in m["target_classes"]:
+            t = m["class_rules"][cls].get("targets")
+            assert t, f"{cls} 没配 targets，将没有学习区"
+            assert set(t) == {"camera2", "camera7"}, cls
+            assert t["camera2"]["side"] == "right", cls
+            assert t["camera7"]["side"] == "left", cls
+            assert int(t["camera2"]["band_px"]) == 500, cls
+            assert int(t["camera7"]["band_px"]) == 500, cls
 
     def test_class_rules_matches_site_requirement(self, cfg):
         """短废纱线：50 m 内、超过 3 个（即 ≥4）触发永久过滤。"""
@@ -611,7 +623,7 @@ class TestWiring:
         """短废纱线 带自己的学习区，结构必须和全局 targets 一致。"""
         m = cfg["multiline_edge_learning"]
         t = m["class_rules"]["短废纱线"]["targets"]
-        assert set(t) == set(m["targets"])
+        assert set(t) == {"camera2", "camera7"}
         for cam, spec in t.items():
             assert spec["side"] in ("left", "right"), cam
             assert int(spec["band_px"]) > 0, cam
@@ -629,6 +641,27 @@ class TestWiring:
         from AnomalyDetection_Tool.config.settings import MULTILINE_EDGE_LEARNING
         assert MULTILINE_EDGE_LEARNING.get("target_classes") == [
             "多股线", "短废纱线"]
+
+    def test_main_yolo_does_not_fall_back_to_default_targets(self):
+        """接线：顶层 targets 键不存在时必须传 {}，不能传 None。
+
+        学习器把 None 当"用 DEFAULT_TARGETS"（硬编码 350 px），而现场配的
+        是 500 px —— 传 None 会让学习区静默从 500 缩到 350，
+        而且是配置里看不出来的那种缩。
+        """
+        # 直接读源码文本，不 import main_yolo —— 这个测试文件没装
+        # fake_galaxy_sdk，单独跑时 import main_yolo 会在真实 gxipy 上炸，
+        # 只有跟在全量里（别的文件先装了桩）才侥幸通过。测试不该依赖
+        # 执行顺序。
+        with open(os.path.join(ROOT, "main_yolo.py"), encoding="utf-8") as f:
+            src = f.read()
+        anchor = 'if "targets" not in _er_cfg:'
+        assert src.count(anchor) == 1, "锚点必须唯一，否则断言会指错地方"
+        i = src.index(anchor)
+        # 锚定到这一分支紧接着的赋值，别整文件搜子串
+        branch = src[i:i + 120]
+        assert "_targets = {}" in branch, branch
+        assert "_targets = None" not in branch, branch
 
     def test_pipeline_scopes_threshold_to_zone(self):
         with open(os.path.join(ROOT, "AnomalyDetection_Tool", "core",

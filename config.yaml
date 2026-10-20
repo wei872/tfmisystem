@@ -1571,34 +1571,32 @@ multiline_edge_learning:
   # 规则：
   #   - 类别必须**同时**出现在上面的 target_classes 里，否则这条覆盖不生效
   #     （配错会打 warning，不会静默）
-  #   - 三个字段（window_length_mm / count_threshold / targets）都可以只写
-  #     其中几个，没写的走全局默认
-  #   - 完全不列的类别 = 全部用全局默认
+  #   - window_length_mm / count_threshold 不写就用上面的全局默认
+  #   - **targets 没有全局默认**：每个类别必须自己写，没写的类别不会有
+  #     学习区（会打 warning，照常按正常阈值报出，不会静默）
   #   - count_threshold 是**严格大于**：写 5 表示采到 6 个才生成生效区
-  #   - targets 是**按相机合并**：只覆盖写了的相机，没写的相机回落到全局
-  #     那份。所以"只把某一类的边带调窄一点"不会把另一台相机的学习区弄丢。
+  #   - targets 里把某台相机写成 null = 该类别在这台相机上不学习
   #
-  # 新增类别两步：① 加进 target_classes ② 需要不同参数就在下面补一段
+  # 新增类别两步：① 加进 target_classes ② 在下面补一段（targets 必写）
   #   例：  小尾巴:
-  #           window_length_mm: 20000     # 只改窗口，门槛/学习区走全局
-  #           targets:                    # 只改 camera2 的边带宽度，
-  #             camera2: {side: right, band_px: 300}   # camera7 仍走全局
+  #           window_length_mm: 20000     # 只改窗口，门槛走全局 5
+  #           targets:
+  #             camera2: {side: right, band_px: 300}
   #
+  # 学习区不设全局，全部写在下面每个类别自己的 targets 里。
   class_rules:
-    多股线:                      # 与全局默认相同，写出来是为了让配置自解释
+    多股线:
       window_length_mm: 5000     # 5 m
       count_threshold: 5         # **超过** 5 个，即采到 6 个才生成生效区
-    短废纱线:
-      window_length_mm: 50000    # 50 m
-      count_threshold: 3         # **超过** 3 个，即采到 4 个才生成生效区
-      # 该类自己的学习区。不写就用全局 targets。
-      # 现场要调宽窄只改这里的 band_px；要换相机就改这里的键。
       targets:
         camera2: {side: right, band_px: 500}
         camera7: {side: left,  band_px: 500}
-  targets:                     # 学习区（固定边带）
-    camera2: {side: right, band_px: 500}
-    camera7: {side: left,  band_px: 500}
+    短废纱线:
+      window_length_mm: 50000    # 50 m
+      count_threshold: 3         # **超过** 3 个，即采到 4 个才生成生效区
+      targets:
+        camera2: {side: right, band_px: 500}
+        camera7: {side: left,  band_px: 500}
 # ==================================================================
 # 【七】后端下发的材质检测配置（阈值 + 停机规则）
 # ==================================================================
