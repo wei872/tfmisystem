@@ -1557,15 +1557,22 @@ speed_guard:
 #
 multiline_edge_learning:
   enabled: true
-  target_classes: [多股线]      # 列表；后续可加其他类别
+  target_classes: [多股线, 短废纱线]   # 列表；后续可加其他类别
   learning_threshold: 0.1      # 学习期临时阈值（正常 0.65），只在学习区内生效
-  window_length_mm: 10000      # 学习长度：米长增长 10 m
+  window_length_mm: 5000       # 学习长度（全局默认）：米长增长 5 m
   count_threshold: 5           # 采样数**超过** 5 个才生成生效区
   region_padding_px: 50        # 生效区左右各外扩
   image_width_px: 2440         # 与 size_conversion.image_width_px 一致
+  # 按类别覆盖上面两个值。没列在这里的类别用全局默认。
+  # 每个类别的窗口各算各的：多股线 5 m 就结算，短废纱线要等到 50 m，
+  # 互不干扰（旧实现只有一个全局窗口，谁短谁先到点还会把别的类一起结算）。
+  class_rules:
+    短废纱线:
+      window_length_mm: 50000  # 50 m
+      count_threshold: 3       # **超过** 3 个，即采到 4 个才生成生效区
   targets:                     # 学习区（固定边带）
-    camera2: {side: right, band_px: 350}
-    camera7: {side: left,  band_px: 350}
+    camera2: {side: right, band_px: 500}
+    camera7: {side: left,  band_px: 500}
 # ==================================================================
 # 【七】后端下发的材质检测配置（阈值 + 停机规则）
 # ==================================================================

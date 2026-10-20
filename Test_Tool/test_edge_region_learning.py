@@ -574,7 +574,7 @@ class TestWiring:
         c = cfg["multiline_edge_learning"]
         assert c["enabled"] is True
         assert float(c["learning_threshold"]) == 0.1
-        assert float(c["window_length_mm"]) == 10000
+        assert float(c["window_length_mm"]) == 5000
         assert int(c["count_threshold"]) == 5
         assert int(c["region_padding_px"]) == 50
 
@@ -582,15 +582,25 @@ class TestWiring:
         """必须可扩展：以后加类别只改配置。"""
         tc = cfg["multiline_edge_learning"]["target_classes"]
         assert isinstance(tc, list)
-        assert tc == ["多股线"]
+        assert tc == ["多股线", "短废纱线"]
 
     def test_config_targets(self, cfg):
         t = cfg["multiline_edge_learning"]["targets"]
         assert set(t) == {"camera2", "camera7"}
         assert t["camera2"]["side"] == "right"
         assert t["camera7"]["side"] == "left"
-        assert t["camera2"]["band_px"] == 350
-        assert t["camera7"]["band_px"] == 350
+        assert t["camera2"]["band_px"] == 500
+        assert t["camera7"]["band_px"] == 500
+
+    def test_class_rules_matches_site_requirement(self, cfg):
+        """短废纱线：50 m 内、超过 3 个（即 ≥4）触发永久过滤。"""
+        r = cfg["multiline_edge_learning"]["class_rules"]
+        assert set(r) == {"短废纱线"}
+        assert float(r["短废纱线"]["window_length_mm"]) == 50000
+        assert int(r["短废纱线"]["count_threshold"]) == 3
+        # 语义是"超过"，和全局 count_threshold: 5 即 ≥6 保持一致
+        assert int(r["短废纱线"]["count_threshold"]) < \
+            int(cfg["multiline_edge_learning"]["count_threshold"])
 
     def test_image_width_matches_size_conversion(self, cfg):
         assert int(cfg["multiline_edge_learning"]["image_width_px"]) == \
@@ -603,7 +613,8 @@ class TestWiring:
 
     def test_settings_exports_it(self):
         from AnomalyDetection_Tool.config.settings import MULTILINE_EDGE_LEARNING
-        assert MULTILINE_EDGE_LEARNING.get("target_classes") == ["多股线"]
+        assert MULTILINE_EDGE_LEARNING.get("target_classes") == [
+            "多股线", "短废纱线"]
 
     def test_pipeline_scopes_threshold_to_zone(self):
         with open(os.path.join(ROOT, "AnomalyDetection_Tool", "core",

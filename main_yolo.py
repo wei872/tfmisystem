@@ -1360,6 +1360,13 @@ def main() -> int:
                 warning(f"[边缘区学习] target_classes={_classes!r} 不是列表，"
                         f"已按未配置处理（用默认）")
                 _classes = None
+            # 按类别覆盖学习长度/采样门槛。同样走三态：
+            # 键不存在=全部用全局值；非字典=配错了，告警后按未配置处理。
+            _class_rules = _er_cfg.get("class_rules", None)
+            if _class_rules is not None and not isinstance(_class_rules, dict):
+                warning(f"[边缘区学习] class_rules={_class_rules!r} 不是字典，"
+                        f"已按未配置处理（全部类别用全局值）")
+                _class_rules = None
             _el = init_edge_learner(
                 targets=_targets,
                 target_classes=_classes,
@@ -1371,6 +1378,7 @@ def main() -> int:
                 region_padding_px=int(
                     _er_cfg.get("region_padding_px", 50)),
                 image_width_px=int(_er_cfg.get("image_width_px", 2440)),
+                class_rules=_class_rules,
                 distance_provider=lambda: get_encoder_state().cumulative_distance,
             )
             if not _el.targets or not _el.target_classes:
@@ -1389,11 +1397,15 @@ def main() -> int:
                 Communication_Tool.ThriftControl.register_on_stop(
                     lambda: _el.end_roll("前端停止"))
                 _el.begin_window("程序启动")
-                info(f"[边缘区学习] 已就绪：类别 {list(_el.target_classes)}，"
-                     f"学习阈值 {_el.learning_threshold}，学习长度 "
-                     f"{_el.window_length_mm / 1000:.1f} m，"
-                     f"采样数 > {_el.count_threshold} 生成生效区，"
-                     f"学习区 {_el.targets}")
+                info(f"[边缘区学习] 已就绪：学习阈值 "
+                     f"{_el.learning_threshold}，学习区 {_el.targets}")
+                # 每个类别的学习长度/采样门槛可能不同（多股线 5 m / >5 个，
+                # 短废纱线 50 m / >3 个），必须逐类打出来 —— 现场要靠这行
+                # 确认配置真的读进去了。
+                for _c in _el.target_classes:
+                    info(f"[边缘区学习]   {_c}：学习长度 "
+                         f"{_el.window_length_for(_c) / 1000:.1f} m，"
+                         f"采样数 > {_el.count_threshold_for(_c)} 生成生效区")
         else:
             info("[边缘区学习] 已在 config.yaml 关闭"
                  "（multiline_edge_learning.enabled=false）")

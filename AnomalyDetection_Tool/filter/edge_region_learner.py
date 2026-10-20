@@ -85,12 +85,17 @@ class EdgeRegionLearner:
                  count_threshold: int = 5,
                  region_padding_px: int = 50,
                  image_width_px: int = 2440,
+                 class_rules=None,
                  distance_provider=None):
         """
         :param targets: ``{camera_name: {"side": "left"|"right", "band_px": int}}``
                         None = 用默认；``{}`` = 显式禁用（**不**回落默认）
         :param target_classes: 类别列表；None = 用默认（多股线）
         :param count_threshold: 记录数**超过**这个值才生成生效区（>5 即 ≥6）
+        :param class_rules: ``{类别: {"window_length_mm":…, "count_threshold":…}}``
+                        按类别覆盖上面两个全局值。没覆盖的类别用全局值。
+                        现场需求就是靠它：多股线 5 m / >5 个，
+                        短废纱线 50 m / >3 个，两类各学各的。
         :param distance_provider: 无参可调用，返回当前累计米长(mm)
         """
         # 三态，别写 `targets or DEFAULT_TARGETS`：
@@ -128,6 +133,43 @@ class EdgeRegionLearner:
         self.learning_threshold = float(learning_threshold)
         self.window_length_mm = max(0.0, float(window_length_mm))
         self.count_threshold = int(count_threshold)
+        self.class_rules: Dict[str, Dict] = {}
+        rules = {} if class_rules is None else class_rules
+        if not isinstance(rules, dict):
+            warning(f"[边缘区学习] class_rules={rules!r} 不是字典，已忽略")
+            rules = {}
+        for cls_name, spec in rules.items():
+            cls_name = str(cls_name)
+            if not isinstance(spec, dict):
+                warning(f"[边缘区学习] class_rules[{cls_name}]={spec!r} "
+                        f"不是字典，已忽略")
+                continue
+            entry: Dict[str, float] = {}
+            if "window_length_mm" in spec:
+                try:
+                    entry["window_length_mm"] = max(
+                        0.0, float(spec["window_length_mm"]))
+                except (TypeError, ValueError):
+                    warning(f"[边缘区学习] class_rules[{cls_name}]"
+                            f".window_length_mm={spec['window_length_mm']!r} "
+                            f"不是数字，该项忽略（用全局 "
+                            f"{self.window_length_mm}）")
+            if "count_threshold" in spec:
+                try:
+                    entry["count_threshold"] = int(spec["count_threshold"])
+                except (TypeError, ValueError):
+                    warning(f"[边缘区学习] class_rules[{cls_name}]"
+                            f".count_threshold={spec['count_threshold']!r} "
+                            f"不是整数，该项忽略（用全局 "
+                            f"{self.count_threshold}）")
+            if not entry:
+                continue
+            self.class_rules[cls_name] = entry
+            # 写了覆盖但类别没进 target_classes，多半是拼错，得喊一声
+            if cls_name not in self.target_classes:
+                warning(f"[边缘区学习] class_rules 里有 {cls_name}，但它不在 "
+                        f"target_classes {list(self.target_classes)} 里，"
+                        f"这条覆盖不会生效")
         self.region_padding_px = max(0, int(region_padding_px))
         self.image_width_px = max(1, int(image_width_px))
         self._distance_provider = distance_provider
@@ -137,6 +179,10 @@ class EdgeRegionLearner:
         self._start_distance = 0.0
         # 学习期采样：{(camera, class): [(x1, x2), ...]}
         self._samples: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+        # 已结算的类别。每个类别的学习长度可以不同（多股线 5 m /
+        # 短废纱线 50 m），所以"学习期结束"是**按类别**的，不再是一个
+        # 全局布尔。窗口到点就进这个集合，之后该类不再采样也不再结算。
+        self._settled: set = set()
         # 生效区：{(camera, class): (x_left, x_right)}
         self._regions: Dict[Tuple[str, str], Tuple[int, int]] = {}
         self._stats = {
@@ -145,6 +191,21 @@ class EdgeRegionLearner:
             "rolls_ended": 0, "not_enough_samples": 0,
         }
         self._reset_samples_locked()
+
+    # ------------------------------------------------------------------
+    #  按类别取参数（没覆盖的走全局值）
+    # ------------------------------------------------------------------
+    def window_length_for(self, class_name: str) -> float:
+        r = self.class_rules.get(class_name)
+        if r and "window_length_mm" in r:
+            return r["window_length_mm"]
+        return self.window_length_mm
+
+    def count_threshold_for(self, class_name: str) -> int:
+        r = self.class_rules.get(class_name)
+        if r and "count_threshold" in r:
+            return r["count_threshold"]
+        return self.count_threshold
 
     # ------------------------------------------------------------------
     #  生命周期
@@ -166,13 +227,17 @@ class EdgeRegionLearner:
             self._window_open = True
             self._reset_samples_locked()
             self._regions = {}
+            self._settled = set()
             self._stats["windows"] += 1
             start = self._start_distance
+            brief = {c: f"{self.window_length_for(c) / 1000:.1f} m / "
+                        f">{self.count_threshold_for(c)} 个"
+                     for c in self.target_classes}
         info(f"[边缘区学习] 新布卷窗口开启"
              f"{'（' + reason + '）' if reason else ''}："
-             f"起始米长 {start / 1000:.3f} m，学习长度 "
-             f"{self.window_length_mm / 1000:.1f} m，"
-             f"类别 {list(self.target_classes)}，目标 {list(self.targets)}")
+             f"起始米长 {start / 1000:.3f} m，目标 {list(self.targets)}")
+        for c, b in brief.items():
+            info(f"[边缘区学习]   {c}：学习长度 {b}")
 
     def end_roll(self, reason: str = "") -> None:
         """前端「停止」：这批布结束了。
@@ -185,41 +250,58 @@ class EdgeRegionLearner:
             self._window_open = False
             self._regions = {}
             self._reset_samples_locked()
+            self._settled = set()
             self._stats["rolls_ended"] += 1
         info(f"[边缘区学习] 本卷结束"
              f"{'（' + reason + '）' if reason else ''}："
              f"生效区已清空，下一卷重新学习")
 
     def check_distance(self) -> None:
-        """米长到点就结算 —— 这是学习期**唯一**的终点。"""
-        if not self._window_open or self.window_length_mm <= 0:
+        """米长到点就结算 —— 这是学习期**唯一**的终点。
+
+        每个类别各算各的：多股线走全局 5 m，短废纱线走覆盖的 50 m。
+        旧实现只有一个全局窗口，谁短谁先到点，然后**连别的类一起结算**，
+        短废纱线会在 5 m 就被拿去判定 —— 而它要求 50 m 内凑够 3 个，
+        等于永远学不成。
+        """
+        if not self._window_open:
             return
         try:
             grown = self._read_distance() - self._start_distance
         except Exception:
             return
-        if grown >= self.window_length_mm:
-            self._settle(grown)
+        for cls in self.target_classes:
+            with self._lock:
+                if cls in self._settled:
+                    continue
+            w = self.window_length_for(cls)
+            if w <= 0:
+                continue
+            if grown >= w:
+                self._settle_class(cls, grown)
 
-    def _settle(self, grown: float) -> None:
+    def _settle_class(self, cls: str, grown: float) -> None:
+        """结算**单个类别**的学习期。"""
+        thr = self.count_threshold_for(cls)
+        w = self.window_length_for(cls)
+        learned = []
+        short = []
         with self._lock:
-            if not self._window_open:
+            if cls in self._settled:
                 return
-            self._window_open = False
+            self._settled.add(cls)
             self._stats["settled_by_distance"] += 1
-            learned = []
             for key, samples in self._samples.items():
+                if key[1] != cls:
+                    continue
                 n = len(samples)
-                if n <= self.count_threshold:
+                if n <= thr:
                     if n:
                         self._stats["not_enough_samples"] += 1
-                        warning(
-                            f"[边缘区学习] {key[0]}/{key[1]} 本卷只采样到 "
-                            f"{n} 个，未超过 {self.count_threshold} 个，"
-                            f"不生成生效区（该类检测恢复原阈值，照常报出）")
+                        short.append((key[0], n))
                     continue
-                x_min = min(s[0] for s in samples)
-                x_max = max(s[1] for s in samples)
+                x_min = min(x[0] for x in samples)
+                x_max = max(x[1] for x in samples)
                 left = max(0, x_min - self.region_padding_px)
                 right = min(self.image_width_px, x_max + self.region_padding_px)
                 if right <= left:
@@ -227,25 +309,38 @@ class EdgeRegionLearner:
                 self._regions[key] = (left, right)
                 self._stats["regions_learned"] += 1
                 learned.append((key, n, x_min, x_max, left, right))
-        for (cam, cls), n, x_min, x_max, left, right in learned:
+        for cam, n in short:
+            warning(f"[边缘区学习] {cam}/{cls} 本卷只采样到 {n} 个，"
+                    f"未超过 {thr} 个，不生成生效区"
+                    f"（该类检测恢复原阈值，照常报出）")
+        for (cam, _cls), n, x_min, x_max, left, right in learned:
             warning(
                 f"[边缘区学习] {cam}/{cls} 本卷采样到 {n} 个"
-                f"（> {self.count_threshold}），学习区统计出生效区："
+                f"（> {thr}），学习区统计出生效区："
                 f"原始 x∈[{x_min}, {x_max}] 外扩 {self.region_padding_px} px "
                 f"=> x∈[{left}, {right}]。本卷内落在该区的 {cls} 不再报出。")
         if not learned:
-            info(f"[边缘区学习] 学习期结束（走了 {grown / 1000:.2f} m），"
-                 f"未生成任何生效区")
+            info(f"[边缘区学习] {cls} 学习期结束（学习长度 {w / 1000:.1f} m，"
+                 f"本卷实走 {grown / 1000:.2f} m），未生成任何生效区")
 
     # ------------------------------------------------------------------
     #  查询
     # ------------------------------------------------------------------
-    def is_learning(self, camera_name: str) -> bool:
-        """这台相机当前是否处于学习期。"""
+    def is_learning(self, camera_name: str,
+                    class_name: Optional[str] = None) -> bool:
+        """这台相机（对这个类别）当前是否处于学习期。
+
+        学习期是**按类别**的：多股线 5 m 就学完了，短废纱线还在学。
+        不传 class_name 时返回"还有任何一个类别在学"。
+        """
         if camera_name not in self.targets:
             return False
         with self._lock:
-            return self._window_open
+            if not self._window_open:
+                return False
+            if class_name is None:
+                return any(c not in self._settled for c in self.target_classes)
+            return class_name not in self._settled
 
     def in_learning_zone(self, camera_name: str, x1: int, x2: int) -> bool:
         """框是否落在这台相机的学习区（固定的 350 px 边带）内。"""
@@ -267,7 +362,9 @@ class EdgeRegionLearner:
             return None
         if not self.in_learning_zone(camera_name, x1, x2):
             return None
-        if not self.is_learning(camera_name):
+        # 必须带上类别：多股线 5 m 学完之后就不该再对它降阈值，
+        # 否则区外噪声会被一直捞进来。
+        if not self.is_learning(camera_name, class_name):
             return None
         return self.learning_threshold
 
@@ -287,6 +384,15 @@ class EdgeRegionLearner:
                 "target_classes": list(self.target_classes),
                 "learning_threshold": self.learning_threshold,
                 "count_threshold": self.count_threshold,
+                "class_rules": {c: dict(v)
+                                for c, v in self.class_rules.items()},
+                "per_class": {
+                    c: {
+                        "window_length_mm": self.window_length_for(c),
+                        "count_threshold": self.count_threshold_for(c),
+                        "settled": c in self._settled,
+                    } for c in self.target_classes
+                },
                 "samples": {f"{c}/{cls}": len(v)
                             for (c, cls), v in self._samples.items()},
                 "regions": {f"{c}/{cls}": list(v)
@@ -332,6 +438,10 @@ class EdgeRegionLearner:
             return False                     # 区外：正常阈值下的真检出，放行
         with self._lock:
             if not self._window_open:
+                return False
+            # 这个类别已经结算过了：生效区已定，再攒样本没意义，
+            # 而且会让下一卷之前的 snapshot 显示误导性数字。
+            if class_name in self._settled:
                 return False
             self._samples[(camera_name, class_name)].append(
                 (int(x1), int(x2)))
