@@ -98,6 +98,58 @@ class TestPerClassParams:
         assert m.window_length_for("短废纱线") == 5000    # 坏的那项回落
         assert m.count_threshold_for("短废纱线") == 3     # 好的那项生效
 
+    def test_explicit_override_equal_to_global_changes_nothing(self):
+        """把类别显式列进 class_rules、但值和全局一样 => 行为必须完全不变。
+
+        config.yaml 现在就是这么写 多股线 的，图的是配置自解释。
+        """
+        plain = _mk(class_rules=None)
+        listed = _mk(class_rules={"多股线": {"window_length_mm": 5000,
+                                             "count_threshold": 5}})
+        for m in (plain, listed):
+            assert m.window_length_for("多股线") == 5000
+            assert m.count_threshold_for("多股线") == 5
+
+        for m in (plain, listed):
+            d = m._distance_provider
+            d.mm = 0.0
+            m.begin_window()
+            _feed(m, "camera2", 6, "多股线")
+            d.mm = 5000.0
+            m.check_distance()
+        assert plain.region_of("camera2", "多股线") == \
+            listed.region_of("camera2", "多股线")
+
+    def test_many_classes_can_each_have_their_own_rule(self):
+        """现场以后加类别，直接往 class_rules 里补一段就行。"""
+        d = _Dist(0.0)
+        m = EdgeRegionLearner(
+            targets=dict(TARGETS),
+            target_classes=["多股线", "短废纱线", "小尾巴"],
+            window_length_mm=5000, count_threshold=5,
+            region_padding_px=50, image_width_px=W,
+            class_rules={"多股线": {"window_length_mm": 8000,
+                                    "count_threshold": 7},
+                         "短废纱线": {"window_length_mm": 50000,
+                                      "count_threshold": 3},
+                         "小尾巴": {"window_length_mm": 20000}},
+            distance_provider=d)
+        assert (m.window_length_for("多股线"), m.count_threshold_for("多股线")) == (8000, 7)
+        assert (m.window_length_for("短废纱线"), m.count_threshold_for("短废纱线")) == (50000, 3)
+        # 只覆盖窗口，门槛走全局
+        assert (m.window_length_for("小尾巴"), m.count_threshold_for("小尾巴")) == (20000, 5)
+
+        m.begin_window()
+        _feed(m, "camera2", 8, "多股线")
+        _feed(m, "camera2", 4, "短废纱线")
+        d.mm = 8000.0
+        m.check_distance()
+        assert m.region_of("camera2", "多股线") is not None
+        assert m.region_of("camera2", "短废纱线") is None
+        d.mm = 50000.0
+        m.check_distance()
+        assert m.region_of("camera2", "短废纱线") is not None
+
     def test_rule_for_class_not_in_target_classes_is_kept_but_inert(self):
         """写了覆盖但类别没进 target_classes：留着不生效，别炸。"""
         m = _mk(class_rules={"手工接头": {"count_threshold": 2}})

@@ -1563,13 +1563,29 @@ multiline_edge_learning:
   count_threshold: 5           # 采样数**超过** 5 个才生成生效区
   region_padding_px: 50        # 生效区左右各外扩
   image_width_px: 2440         # 与 size_conversion.image_width_px 一致
-  # 按类别覆盖上面两个值。没列在这里的类别用全局默认。
+  # 按类别覆盖上面两个值（window_length_mm / count_threshold）。
+  #
   # 每个类别的窗口各算各的：多股线 5 m 就结算，短废纱线要等到 50 m，
   # 互不干扰（旧实现只有一个全局窗口，谁短谁先到点还会把别的类一起结算）。
+  #
+  # 规则：
+  #   - 类别必须**同时**出现在上面的 target_classes 里，否则这条覆盖不生效
+  #     （配错会打 warning，不会静默）
+  #   - 两个字段都可以只写一个，没写的那个走全局默认
+  #   - 完全不列的类别 = 两个值都用全局默认
+  #   - count_threshold 是**严格大于**：写 5 表示采到 6 个才生成生效区
+  #
+  # 新增类别两步：① 加进 target_classes ② 需要不同参数就在下面补一段
+  #   例：  小尾巴:
+  #           window_length_mm: 20000   # 只改窗口，门槛仍走全局 5
+  #
   class_rules:
+    多股线:                      # 与全局默认相同，写出来是为了让配置自解释
+      window_length_mm: 5000     # 5 m
+      count_threshold: 5         # **超过** 5 个，即采到 6 个才生成生效区
     短废纱线:
-      window_length_mm: 50000  # 50 m
-      count_threshold: 3       # **超过** 3 个，即采到 4 个才生成生效区
+      window_length_mm: 50000    # 50 m
+      count_threshold: 3         # **超过** 3 个，即采到 4 个才生成生效区
   targets:                     # 学习区（固定边带）
     camera2: {side: right, band_px: 500}
     camera7: {side: left,  band_px: 500}

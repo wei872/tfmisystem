@@ -595,7 +595,12 @@ class TestWiring:
     def test_class_rules_matches_site_requirement(self, cfg):
         """短废纱线：50 m 内、超过 3 个（即 ≥4）触发永久过滤。"""
         r = cfg["multiline_edge_learning"]["class_rules"]
-        assert set(r) == {"短废纱线"}
+        assert set(r) == {"多股线", "短废纱线"}
+        # 多股线显式写出来，但值必须和全局默认一致 —— 纯自解释，不改行为
+        assert float(r["多股线"]["window_length_mm"]) == \
+            float(cfg["multiline_edge_learning"]["window_length_mm"])
+        assert int(r["多股线"]["count_threshold"]) == \
+            int(cfg["multiline_edge_learning"]["count_threshold"])
         assert float(r["短废纱线"]["window_length_mm"]) == 50000
         assert int(r["短废纱线"]["count_threshold"]) == 3
         # 语义是"超过"，和全局 count_threshold: 5 即 ≥6 保持一致
