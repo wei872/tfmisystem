@@ -11,7 +11,9 @@
 两个区，别混
 ------------
 **学习区（learning zone）** —— 固定的，配置写死：
-    camera2 图像右侧 350 px，camera7 图像左侧 350 px。
+    camera2 图像右侧、camera7 图像左侧各一条固定边带
+（宽度取配置 multiline_edge_learning.targets.*.band_px，现场当前 500 px；
+DEFAULT_TARGETS 里的 350 只是配置缺失时的兜底）。
     只有落在这里的框才会被降阈值、被采样。
 
 **生效区（effective zone）** —— 算出来的，每卷不同：
@@ -19,8 +21,8 @@
     左右各外扩 ``region_padding_px``，夹到图像边界内。
     这才是真正用来过滤的区域。
 
-生效区由学习区统计而来，但**不等于**学习区：它可能比 350 px 窄
-（布边实际只占一小段），也可能因为外扩而略微越出 350 px。
+生效区由学习区统计而来，但**不等于**学习区：它可能比边带窄
+（布边实际只占一小段），也可能因为外扩而略微越出边带。
 
 阈值只在学习区内降低（关键）
 ---------------------------
@@ -343,7 +345,7 @@ class EdgeRegionLearner:
             return class_name not in self._settled
 
     def in_learning_zone(self, camera_name: str, x1: int, x2: int) -> bool:
-        """框是否落在这台相机的学习区（固定的 350 px 边带）内。"""
+        """框是否落在这台相机的学习区（固定宽度的边带，取 targets.band_px）内。"""
         spec = self.targets.get(camera_name)
         if not spec:
             return False

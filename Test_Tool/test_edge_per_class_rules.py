@@ -275,6 +275,112 @@ class TestLearningPeriodIsPerClass:
 
 
 # ======================================================================
+# §3.5  学习期采样的框不保存、不上传（对 target_classes 里任何类别都成立）
+# ======================================================================
+class TestLearningSamplesAreNotUploaded:
+    """detection_manager 在面积分析**之前**丢掉 observe() 返回 True 的框，
+    所以它们不进停机判定、不存图、不上传。
+
+    判定完全由 target_classes 驱动，没有任何硬编码类别 ——
+    往 target_classes 加新类别，它自动享有同样待遇。这条必须锁住。
+    """
+
+    @staticmethod
+    def _mk_multi(dist, classes):
+        return EdgeRegionLearner(
+            targets=dict(TARGETS), target_classes=list(classes),
+            window_length_mm=5000, count_threshold=5,
+            region_padding_px=50, image_width_px=W,
+            class_rules={"短废纱线": {"window_length_mm": 50000,
+                                      "count_threshold": 3}},
+            distance_provider=dist)
+
+    def test_every_target_class_is_suppressed_in_the_zone(self):
+        """含一个配置里还没有的新类别 —— 证明不是硬编码。"""
+        d = _Dist(0.0)
+        m = self._mk_multi(d, ["多股线", "短废纱线", "小尾巴"])
+        m.begin_window()
+        x = RIGHT_EDGE + 10
+        for cls in ("多股线", "短废纱线", "小尾巴"):
+            assert m.observe("camera2", cls, x, x + 40) is True, cls
+
+    def test_non_target_class_is_never_suppressed(self):
+        d = _Dist(0.0)
+        m = self._mk_multi(d, ["多股线", "短废纱线"])
+        m.begin_window()
+        x = RIGHT_EDGE + 10
+        for cls in ("棉团", "蚊虫小黑点", "油点线"):
+            assert m.observe("camera2", cls, x, x + 40) is False, cls
+
+    def test_target_class_outside_the_zone_is_never_suppressed(self):
+        d = _Dist(0.0)
+        m = self._mk_multi(d, ["多股线", "短废纱线"])
+        m.begin_window()
+        for cls in ("多股线", "短废纱线"):
+            assert m.observe("camera2", cls, 100, 140) is False, cls
+
+    def test_both_learning_bands_are_suppressed(self):
+        d = _Dist(0.0)
+        m = self._mk_multi(d, ["短废纱线"])
+        m.begin_window()
+        assert m.observe("camera2", "短废纱线", W - BAND + 10, W - BAND + 50) is True
+        assert m.observe("camera7", "短废纱线", 10, 50) is True
+        # camera2 的左边不是学习区
+        assert m.observe("camera2", "短废纱线", 10, 50) is False
+
+    def test_suppression_follows_the_class_own_window(self):
+        """学习期抑制的时长 = 该类自己的窗口，不是全局窗口。
+
+        多股线 5 m 就恢复上报；短废纱线要等到 50 m。
+        """
+        d = _Dist(0.0)
+        m = self._mk_multi(d, ["多股线", "短废纱线"])
+        m.begin_window()
+        x = RIGHT_EDGE + 10
+
+        d.mm = 0.0
+        assert m.observe("camera2", "多股线", x, x + 40) is True
+        assert m.observe("camera2", "短废纱线", x, x + 40) is True
+
+        d.mm = 5000.0
+        m.check_distance()
+        assert m.observe("camera2", "多股线", x, x + 40) is False, \
+            "多股线学完了就该恢复上报"
+        assert m.observe("camera2", "短废纱线", x, x + 40) is True, \
+            "短废纱线的窗口是 50 m，还在攒样本"
+
+        d.mm = 50000.0
+        m.check_distance()
+        assert m.observe("camera2", "短废纱线", x, x + 40) is False
+
+    def test_manager_drops_them_before_area_analysis(self):
+        """接线：observe/should_filter 必须在"面积分析"之前，
+        否则被滤掉的框会进停机判定、会存图、会上传。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "AnomalyDetection_Tool", "core",
+                               "detection_manager.py"), encoding="utf-8") as f:
+            src = f.read()
+        i_filter = src.index("_el.should_filter(")
+        i_observe = src.index("_el.observe(")
+        i_area = src.index("# 面积分析")
+        assert i_filter < i_area and i_observe < i_area
+        # 被丢掉的框不能留在 result.boxes 里
+        i_keep = src.index("result.boxes = keep")
+        assert i_keep < i_area
+        # 丢掉后 total_boxes / has_detection 必须在**同一处**跟着改，
+        # 否则下游仍按"有检出"处理。
+        #
+        # 这里必须锚定到 result.boxes = keep 之后的一小段，不能整文件搜
+        # 子串：`result.has_detection = result.total_boxes > 0` 在本文件
+        # 里出现两次（:548 和 :580），整文件搜的话改掉 :580 也照样通过，
+        # 断言等于空跑。
+        tail = src[i_keep:i_keep + 400]
+        assert "result.total_boxes = len(keep)" in tail, tail
+        assert "result.has_detection = result.total_boxes > 0" in tail, tail
+
+
+# ======================================================================
 # §4  换卷重新学
 # ======================================================================
 class TestPerRollReset:
