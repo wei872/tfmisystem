@@ -607,16 +607,21 @@ class MotionController:
         info(f"[MotionController] 累计基准恢复为 {self.base_cumulative_distance:.2f}mm "
              f"(本会话累计起算: {self.cumulative_distance:.2f}mm)")
 
-    def resync_hc0(self, hc0: int):
+    def resync_hc0(self, hc0: int, quiet: bool = False):
         """重新同步HC0基准值，不重置距离状态（PLC复位后调用）
 
         PLC复位可能将HC0清零，若不同步会导致下一周期pulse_delta巨大，
         被误判为反转并产生异常距离偏移。
+
+        :param quiet: True 时不打日志。**每次硬触发后都要同步一次**
+            （见 TriggerControlSystem 主循环里的 send_reset），约 1.5 次/秒，
+            不静默会把日志刷爆。前端「开始」那种低频路径仍打日志。
         """
         self.last_hc0 = hc0
         self.last_time = time.perf_counter() * 1000
-        info(f"[MotionController] HC0基准同步为 {hc0}，距离状态不变 "
-             f"(累计: {self.cumulative_distance:.2f}mm, 触发: {self.trigger_count}次)")
+        if not quiet:
+            info(f"[MotionController] HC0基准同步为 {hc0}，距离状态不变 "
+                 f"(累计: {self.cumulative_distance:.2f}mm, 触发: {self.trigger_count}次)")
 
     def reset_trigger_count(self):
         """重置触发计数及距离（兼容旧调用，内部改用 reset_all）"""
@@ -988,6 +993,24 @@ class TriggerControlSystem:
                         self.display.display_trigger(status['trigger_count'])
                         if not self.modbus.send_reset():
                             self.display.display_error("发送重置命令失败")
+                        else:
+                            #  send_reset() 会让 PLC 把 HC0 计数器清零。
+                            #  不同步基准的话，下一拍 pulse_delta = 新HC0 - 旧HC0
+                            #  是一个约 -3700 脉冲的大负数（现场实测 -86 ~ -90 mm），
+                            #  会被判成「反转」，于是这一整拍的行进距离被丢掉，
+                            #  accumulated_distance 也被打断 —— 触发节拍因此被拉长。
+                            #
+                            #  现场实测（2026-10-22 04:23 那段日志）：
+                            #      触发间隔 654.7 ms，而 80.224 mm 阈值本该是 493 ms。
+                            #      9.9 m/min 下 654.7 ms = 布面走了 108.0 mm，
+                            #      帧高只有 105 mm => **每帧漏 3.0 mm**。
+                            #
+                            #  注意 T43 把反转分支从 max(0, ...) 改成「下界
+                            #  -trigger_distance」，在这个场景下反而更糟：累加值
+                            #  被压到 -80.22，下一次触发要先把它爬回来，触发间隔
+                            #  会翻倍到 ~1152 ms（盲区 85 mm）。真正的修法是在
+                            #  这里同步基准，让清零这件事根本不进入距离账。
+                            self.motion.resync_hc0(0, quiet=True)
                     else:
                         self.display.display_error("发送触发命令失败")
 
