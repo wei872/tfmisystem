@@ -63,19 +63,26 @@ class TestCapMath:
         expect = float(plc["trigger_distance_mm"]) * float(plc["scaling_factor"])
         assert DEFAULT_TRIGGER_DISTANCE_MM == pytest.approx(expect, abs=1e-6)
 
-    def test_frame_height_default_matches_pixel_math(self):
-        """2048 px × (23 cm / 2440 px) × 10 = 193.05 mm。"""
-        assert DEFAULT_FRAME_HEIGHT_MM == pytest.approx(
-            2048 * (23 / 2440) * 10, abs=1e-6)
-        assert DEFAULT_FRAME_HEIGHT_MM == pytest.approx(193.05, abs=0.01)
+    def test_frame_height_is_measured_not_derived_from_pixels(self):
+        """帧高是**实测**的 105 mm，不是从分辨率推出来的。
+
+        旧写法 `2048 * (23/2440) * 10` = 193.05 是拿**横向**像素尺寸去乘
+        **纵向**像素数，等于假设像素是方的。现场实测：230 mm 对应 2048 px
+        是宽，布走行方向一帧只有 105 mm。
+
+        反向断言很重要 —— 不然哪天有人"顺手把它改回像素推导"，
+        临界车速会从 10 m/min 虚高回 20 m/min，超速保护形同失效。
+        """
+        assert DEFAULT_FRAME_HEIGHT_MM == pytest.approx(105.0, abs=0.01)
+        assert DEFAULT_FRAME_HEIGHT_MM != pytest.approx(
+            2048 * (23 / 2440) * 10, abs=1.0)
 
     def test_blind_spot_speed_accounts_for_trigger_quantisation(self):
-        """临界车速 = floor(帧高/触发距离) × cap_speed = 2 × 10 = 20.0。
+        """临界车速 = floor(帧高/触发距离) × cap_speed = 1 × 10 = 10.0。
 
-        **不是** 帧高/cap_interval（那会算出 24.06，是错的）。钳帧只能落在
-        触发栅格上，实际接受间隔被量化成 k × 触发距离（k 为整数），
-        间距 = k × 触发距离与车速无关；完整覆盖要求
-        k <= floor(193.05/80.224) = 2。
+        **不是** 帧高/cap_interval（那是错的）。钳帧只能落在触发栅格上，
+        实际接受间隔被量化成 k × 触发距离（k 为整数），间距 = k × 触发距离
+        与车速无关；完整覆盖要求 k <= floor(105/80.224) = 1。
         """
         g = _g(cap_speed_mpm=10.0, trigger_distance_mm=80.224,
                frame_height_mm=193.05)
@@ -537,15 +544,22 @@ class TestConfigAndWiring:
         assert warn == pytest.approx(cap * 1.5), \
             "warn_mpm 是设计速度的 1.5 倍容差带，不是任意阈值"
 
-    def test_blind_spot_needs_double_the_design_speed(self, cfg):
-        """盲区临界 = 2 x 设计速度。正常运行不该到，到了说明速度异常。"""
+    def test_blind_spot_equals_design_speed_no_margin(self, cfg):
+        """帧高 105 mm 后，盲区临界 = 1 x 设计速度 —— **零余量**。
+
+        旧帧高 193.05 时临界是 2 x 设计速度（20 m/min），正常运行碰不到；
+        现在临界正好等于 10 m/min 的运行速度，意味着一帧都不能丢，
+        速度只要上去一点就必然出盲区。这条测试就是把这个事实钉住。
+        """
         sg = cfg["speed_guard"]
         g = SpeedGuard(cap_speed_mpm=float(sg["cap_speed_mpm"]),
                        trigger_distance_mm=float(sg["trigger_distance_mm"]),
                        frame_height_mm=float(sg["frame_height_mm"]),
                        window=1, min_samples=1)
         assert g.blind_spot_mpm == pytest.approx(
-            2 * float(sg["cap_speed_mpm"]), abs=1e-6)
+            float(sg["cap_speed_mpm"]), abs=1e-6)
+        # 零余量的直接后果：帧高装不下两个触发间距
+        assert float(sg["frame_height_mm"]) < 2 * float(sg["trigger_distance_mm"])
 
     def test_config_trigger_distance_matches_plc(self, cfg):
         """两处触发距离必须一致，否则钳出来的帧率是错的。"""
@@ -554,13 +568,26 @@ class TestConfigAndWiring:
         expect = float(plc["trigger_distance_mm"]) * float(plc["scaling_factor"])
         assert float(sg["trigger_distance_mm"]) == pytest.approx(expect, abs=0.01)
 
-    def test_config_frame_height_matches_pixel_math(self, cfg):
-        sz = cfg.get("size", {})
+    def test_config_frame_height_is_the_measured_105(self, cfg):
+        """配置里的帧高必须是实测的 105，且**不能**等于像素推导值。"""
+        fh = float(cfg["speed_guard"]["frame_height_mm"])
+        assert fh == pytest.approx(105.0, abs=0.01)
+        sz = cfg.get("size_conversion", {}) or cfg.get("size", {})
         real_cm = float(sz.get("real_width_cm", 23))
         width_px = float(sz.get("image_width_px", 2440))
-        expect = 2048 * (real_cm / width_px) * 10
-        assert float(cfg["speed_guard"]["frame_height_mm"]) == \
-            pytest.approx(expect, abs=0.05)
+        assert fh != pytest.approx(2048 * (real_cm / width_px) * 10, abs=1.0)
+
+    def test_config_frame_height_leaves_no_frame_drop_margin(self, cfg):
+        """把"一帧都不能丢"这个事实钉进配置断言。
+
+        容忍连续丢帧数 = floor(帧高 / 触发距离) - 1。现在等于 0。
+        """
+        sg = cfg["speed_guard"]
+        fh = float(sg["frame_height_mm"])
+        td = float(sg["trigger_distance_mm"])
+        assert int(fh // td) - 1 == 0
+        # 但只要丢 1 帧，间距就变 2 个触发距离 -> 超帧高 -> 盲区
+        assert 2 * td > fh
 
     def test_settings_exports_the_section(self):
         from AnomalyDetection_Tool.config.settings import SPEED_GUARD

@@ -1321,7 +1321,7 @@ def main() -> int:
                 cap_speed_mpm=float(_sg_cfg.get("cap_speed_mpm", 10.0)),
                 trigger_distance_mm=float(
                     _sg_cfg.get("trigger_distance_mm", 80.224)),
-                frame_height_mm=float(_sg_cfg.get("frame_height_mm", 193.05)),
+                frame_height_mm=float(_sg_cfg.get("frame_height_mm", 105.0)),
                 window=int(_sg_cfg.get("window", 5)),
                 hysteresis=float(_sg_cfg.get("hysteresis", 0.9)),
             )
