@@ -1492,7 +1492,7 @@ def main() -> int:
                  "（material_config.enabled=false），使用本地阈值/停机规则")
     except Exception as e:
         error(f"[材质配置] 初始化失败，使用本地配置（不影响检测）: {e}")
-    # —— 【四】正常图片定时保存：只待命，等前端下发窗口 ——
+    # —— 【四】正常图片定时保存：默认常开，存满 max_per_camera 即自然停 ——
     try:
         _nis = NORMAL_IMAGE_SAVE
         if bool(_nis.get("enabled", False)):
@@ -1504,6 +1504,7 @@ def main() -> int:
                 max_per_camera=int(_nis.get("max_per_camera", 10)),
                 png_compression=int(_nis.get("png_compression", 1)),
                 save_subdir=str(_nis.get("save_subdir", "NormalSave")),
+                always_on=bool(_nis.get("always_on", True)),
             )
         else:
             info("[正常图保存] 已在 config.yaml 关闭（normal_image_save.enabled=false）")

@@ -1428,13 +1428,24 @@ repeat_stop_rules:
 # 落盘在独立线程，不占检测节拍。
 #
 normal_image_save:
-  enabled: true            # 总开关。关掉后前端下发窗口也不生效
+  enabled: true            # 总开关。关掉后整条路径不初始化
+  # 常开：程序一跑就开始存，**不等前端下发窗口**。
+  # 之前必须前端调 setNormalSaveWindow 才会开始存，而现场从没调过，
+  # 结果 NormalSave 目录一次都没出现过（目录是懒创建的，没存过图就不建）。
+  # 常开是有界的：每台存满 max_per_camera 就自然停，8 台 x 10 = 80 张封顶。
+  # 前端那两个 Thrift 方法仍然可用：setNormalSaveWindow 会重新开始计数，
+  # stopNormalSave 会显式停掉（显式动作优先于这里的配置）。
+  always_on: true
   interval_sec: 5.0        # 同一台相机两次保存的最小间隔（秒）
-  max_per_camera: 10       # 每台相机每个窗口的硬上限
+  max_per_camera: 10       # 每台相机的硬上限（8 台合计 80 张）
   # PNG 压缩级别 0-9。实测对布面这种高频纹理几乎没用：
   #   c1 = 13.02 MB / 488 ms，c9 = 12.99 MB / 509 ms（多花 20 ms 只省 0.03 MB）
   # 磁盘 I/O 是瓶颈时可降到 0：143 ms / 14.32 MB，快 3.4 倍，每张只大 1.3 MB。
   png_compression: 1
+  # 目录和各相机文件夹**同级**，不是嵌在相机目录里：
+  #   D:/yolo_detection_results/<launch_tag>/NormalSave/     <- 这里
+  #   D:/yolo_detection_results/<launch_tag>/camera1/Normal/...
+  # 文件名里带了 camera_name，8 台放同一个目录不会撞名。
   save_subdir: NormalSave
 
 # ==================================================================

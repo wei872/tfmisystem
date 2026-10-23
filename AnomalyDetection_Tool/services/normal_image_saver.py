@@ -58,6 +58,7 @@ class NormalImageSaver:
                  max_per_camera: int = DEFAULT_MAX_PER_CAMERA,
                  png_compression: int = DEFAULT_PNG_COMPRESSION,
                  save_subdir: str = "NormalSave",
+                 always_on: bool = True,
                  clock=time.time):
         self.base_path = base_path
         self.launch_tag = launch_tag or ""
@@ -66,11 +67,18 @@ class NormalImageSaver:
         # 0-9 夹住：越界值 cv2 会当成别的压缩策略，行为不可预期
         self.png_compression = min(9, max(0, int(png_compression)))
         self.save_subdir = save_subdir or "NormalSave"
+        # 常开模式：不等前端下发窗口，程序一跑就开始存。
+        # 现场要求「一直开着」—— 每台相机存满 max_per_camera 张就自然停，
+        # 8 台 x 10 张 = 80 张封顶，本来就有界，不需要窗口来兜。
+        self.always_on = bool(always_on)
         self._clock = clock
 
         self._lock = threading.Lock()
         self._win_start: Optional[float] = None      # epoch 秒
         self._win_end: Optional[float] = None
+        # 常开模式下前端显式调 stopNormalSave 才置 True；start_window 会清掉。
+        # 显式动作优先于配置，否则前端那个按钮就成摆设了。
+        self._manual_stop = False
         self._counts = {}        # camera -> 本窗口已存张数
         self._last_at = {}       # camera -> 上次保存的 epoch 秒
         self._ended_logged = False
@@ -109,6 +117,7 @@ class NormalImageSaver:
         with self._lock:
             self._win_start = start_ts
             self._win_end = start_ts + dur
+            self._manual_stop = False
             self._counts.clear()
             self._last_at.clear()
             self._ended_logged = False
@@ -128,6 +137,7 @@ class NormalImageSaver:
             had = self._win_start is not None
             self._win_start = None
             self._win_end = None
+            self._manual_stop = True
         if had:
             info(f"[正常图保存] 窗口已手动结束，共保存 "
                  f"{self._stats['saved']} 张")
@@ -189,8 +199,13 @@ class NormalImageSaver:
         with self._lock:
             idx = self._counts.get(camera_name, 0)
         try:
+            # 和各相机文件夹**同级**，不是嵌在相机目录里面：
+            #     <save_path>/<launch_tag>/NormalSave/          <- 这里
+            #     <save_path>/<launch_tag>/camera1/Normal/...
+            #     <save_path>/<launch_tag>/camera2/Normal/...
+            # 文件名里已经带了 camera_name，8 台放同一个目录不会撞名。
             d = os.path.join(self.base_path, self.launch_tag,
-                             camera_name, self.save_subdir)
+                             self.save_subdir)
             os.makedirs(d, exist_ok=True)
             ts = datetime.fromtimestamp(now).strftime("%Y%m%d_%H%M%S_%f")[:-3]
             path = os.path.join(d, f"{ts}_{camera_name}_{idx:02d}.png")
@@ -238,6 +253,10 @@ class NormalImageSaver:
 
     # ------------------------------------------------------------------
     def _is_active_locked(self, now: float) -> bool:
+        if self._manual_stop:
+            return False
+        if self.always_on:
+            return True
         return (self._win_start is not None and self._win_end is not None
                 and self._win_start <= now < self._win_end)
 
@@ -287,16 +306,20 @@ def init_normal_saver(base_path: str, launch_tag: str = "",
                       interval_sec: float = DEFAULT_INTERVAL_SEC,
                       max_per_camera: int = DEFAULT_MAX_PER_CAMERA,
                       png_compression: int = DEFAULT_PNG_COMPRESSION,
-                      save_subdir: str = "NormalSave") -> NormalImageSaver:
+                      save_subdir: str = "NormalSave",
+                      always_on: bool = True) -> NormalImageSaver:
     global _saver
     with _saver_lock:
         _saver = NormalImageSaver(
             base_path=base_path, launch_tag=launch_tag,
             interval_sec=interval_sec, max_per_camera=max_per_camera,
-            png_compression=png_compression, save_subdir=save_subdir)
+            png_compression=png_compression, save_subdir=save_subdir,
+            always_on=always_on)
+    _mode = ("**常开**（不等前端下发窗口，存满即停）" if always_on
+             else "等待前端下发窗口")
     info(f"[正常图保存] 已就绪：每台最多 {max_per_camera} 张，"
          f"间隔 {interval_sec:.1f} 秒，目录 <save_path>/<launch_tag>/"
-         f"<相机>/{save_subdir}/。等待前端下发窗口。")
+         f"{save_subdir}/（与各相机文件夹同级）。{_mode}。")
     return _saver
 
 

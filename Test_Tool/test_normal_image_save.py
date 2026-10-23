@@ -32,6 +32,9 @@ from AnomalyDetection_Tool.services.normal_image_saver import (  # noqa: E402
 class TestWindow:
 
     def _s(self, tmp_path, **kw):
+        # 这一类专测**窗口语义**，所以默认关掉常开。
+        # 常开是现场要求的默认行为，另见 TestAlwaysOn。
+        kw.setdefault("always_on", False)
         return NormalImageSaver(base_path=str(tmp_path), launch_tag="T", **kw)
 
     def test_no_window_saves_nothing(self, tmp_path):
@@ -144,7 +147,8 @@ class TestStartParsing:
             assert NormalImageSaver._parse_start(bad, 1_000_000.0) is None, bad
 
     def test_unparseable_start_does_not_open_a_window(self, tmp_path):
-        s = NormalImageSaver(str(tmp_path), clock=lambda: 1_000_000.0)
+        s = NormalImageSaver(str(tmp_path), clock=lambda: 1_000_000.0,
+                             always_on=False)
         s.start_window(start="不是时间", duration_sec=60.0)
         assert s.get_status()["active"] is False
 
@@ -286,7 +290,9 @@ class TestSave:
         assert s.should_save("camera3") is True
         path = s.save("camera3", self._img())
         assert path.endswith(".png")
-        assert os.path.join("L1", "camera3", "NormalSave") in path
+        # 与相机文件夹**同级**：<launch_tag>/NormalSave/，不再嵌在 <相机>/ 里
+        assert os.path.join("L1", "NormalSave") in path
+        assert os.path.join("L1", "camera3", "NormalSave") not in path
         assert path.endswith("_camera3_01.png")     # 序号来自 should_save
         for _ in range(100):
             if os.path.exists(path):
@@ -416,7 +422,7 @@ class TestSave:
             if s.get_status()["stats"]["save_failed"]:
                 break
             time.sleep(0.02)
-        d = os.path.join(str(tmp_path), "L", "camera1", "NormalSave")
+        d = os.path.join(str(tmp_path), "L", "NormalSave")
         assert os.path.isdir(d)
         assert os.listdir(d) == [], f"失败后目录里还有东西: {os.listdir(d)}"
 
@@ -583,7 +589,7 @@ class TestHook:
         assert called == []
 
     def test_no_window_means_no_save(self, tmp_path, monkeypatch):
-        saver = nis.init_normal_saver(str(tmp_path))
+        saver = nis.init_normal_saver(str(tmp_path), always_on=False)
         called = []
         monkeypatch.setattr(saver, "save",
                             lambda c, i, **k: called.append(c))
@@ -718,7 +724,7 @@ class TestThrift:
         assert saver.get_status()["active"] is True
 
     def test_handler_rejects_bad_duration(self, tmp_path, monkeypatch):
-        saver = nis.init_normal_saver(str(tmp_path))
+        saver = nis.init_normal_saver(str(tmp_path), always_on=False)
         monkeypatch.setattr(saver, "_clock", lambda: 1_700_000_000.0)
         self._handler().setNormalSaveWindow("", 0.0)
         assert saver.get_status()["active"] is False
@@ -776,3 +782,127 @@ class TestThrift:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ======================================================================
+# §8  常开模式 + 与相机同级的目录（现场要求）
+# ======================================================================
+class TestAlwaysOn:
+    """现场要求：一直开着、每台 10 张、目录和各相机文件夹同级（8 台共 80 张）。
+
+    之前的行为是「必须前端调 setNormalSaveWindow 才开始存」，而现场从没调过，
+    结果 NormalSave 目录一次都没出现（目录是懒创建的，没存过图就不建）。
+    """
+
+    def _img(self):
+        return np.zeros((8, 8, 3), dtype=np.uint8)
+
+    def test_default_is_always_on(self):
+        """不传参数就是常开 —— 这是现场要的默认值。"""
+        assert NormalImageSaver("x").always_on is True
+
+    def test_saves_without_any_window(self, tmp_path):
+        """不下发窗口也要能存。这条就是原来的 bug。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: t[0])
+        assert s.get_status()["active"] is True      # 没开窗也是 active
+        assert s.should_save("camera1") is True
+
+    def test_directory_is_sibling_of_camera_folders(self, tmp_path):
+        """目录是 <launch_tag>/NormalSave/，与 <launch_tag>/cameraN/ 同级。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: t[0])
+        assert s.should_save("camera3") is True
+        path = s.save("camera3", self._img())
+        rel = os.path.relpath(path, str(tmp_path))
+        assert rel.split(os.sep)[:2] == ["L", "NormalSave"], rel
+        # 绝不能嵌回相机目录里
+        assert os.path.join("camera3", "NormalSave") not in rel
+
+    def test_all_cameras_share_one_folder_without_name_clash(self, tmp_path):
+        """8 台写进同一个目录，靠文件名里的 camera_name 区分，不许撞名。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: t[0])
+        paths = []
+        for i in range(1, 9):
+            cam = f"camera{i}"
+            assert s.should_save(cam) is True
+            paths.append(s.save(cam, self._img()))
+        assert len(set(paths)) == 8, "8 台的路径必须互不相同"
+        dirs = {os.path.dirname(p) for p in paths}
+        assert len(dirs) == 1, f"8 台必须落在同一个目录: {dirs}"
+
+    def test_eight_cameras_cap_at_eighty(self, tmp_path):
+        """每台 10 张 -> 8 台合计 80 张封顶，之后全部拒存。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             interval_sec=0.1, max_per_camera=10,
+                             clock=lambda: t[0])
+        saved = 0
+        for round_idx in range(15):          # 15 轮 x 8 台 = 120 次机会
+            t[0] += 1.0                       # 每轮跨过节流间隔
+            for i in range(1, 9):
+                if s.should_save(f"camera{i}"):
+                    saved += 1
+        assert saved == 80, f"应为 8x10=80 张，实际 {saved}"
+        st = s.get_status()
+        assert st["per_camera"] == {f"camera{i}": 10 for i in range(1, 9)}
+        assert st["stats"]["skipped_capped"] == 120 - 80
+
+    def test_stop_window_still_stops_it(self, tmp_path):
+        """常开模式下前端显式 stopNormalSave 仍然有效（显式动作优先）。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: t[0])
+        assert s.should_save("camera1") is True
+        s.stop_window()
+        assert s.get_status()["active"] is False
+        assert s.should_save("camera2") is False
+
+    def test_start_window_rearms_after_stop(self, tmp_path):
+        """停了之后前端再下发窗口要能重新开始（并清空计数）。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             clock=lambda: t[0])
+        s.stop_window()
+        assert s.should_save("camera1") is False
+        s.start_window(start=1_700_000_000.0, duration_sec=100.0)
+        assert s.get_status()["active"] is True
+        assert s.should_save("camera1") is True
+
+    def test_always_on_false_restores_window_semantics(self, tmp_path):
+        """显式关掉常开就回到旧的窗口语义，不能一刀切。"""
+        t = [1_700_000_000.0]
+        s = NormalImageSaver(str(tmp_path), launch_tag="L",
+                             always_on=False, clock=lambda: t[0])
+        assert s.get_status()["active"] is False
+        assert s.should_save("camera1") is False
+
+    def test_config_enables_always_on(self):
+        """config.yaml 里必须是 always_on: true，否则现场又回到老样子。"""
+        import yaml
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "config.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        nis_cfg = cfg["normal_image_save"]
+        assert nis_cfg["enabled"] is True
+        assert nis_cfg["always_on"] is True
+        assert int(nis_cfg["max_per_camera"]) == 10
+        assert str(nis_cfg["save_subdir"]) == "NormalSave"
+
+    def test_main_yolo_passes_always_on_from_config(self):
+        """接线断言：main_yolo 必须把 always_on 从配置传进去。
+
+        读源码文本而不是 import —— 这个测试文件不装 fake_galaxy_sdk 时
+        import main_yolo 会在真实 gxipy 上炸。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "main_yolo.py"), encoding="utf-8") as f:
+            src = f.read()
+        i = src.index("init_normal_saver(")
+        window = src[i:i + 900]
+        assert 'always_on=bool(_nis.get("always_on", True))' in window, (
+            "main_yolo 没把 always_on 传给 init_normal_saver，常开不会生效")
